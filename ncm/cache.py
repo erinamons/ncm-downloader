@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -166,3 +167,32 @@ def decode(src: Path, dest: Path) -> str:
             fo.write(plain)
     os.replace(tmp, dest)
     return ext
+
+
+def player_cache_dir() -> Path:
+    """播放时从客户端缓存解密出来的临时文件都放这儿。"""
+    return Path(tempfile.gettempdir()) / "ncm-player"
+
+
+def clear_player_cache() -> tuple[int, int]:
+    """清掉播放缓存，返回 (文件数, 释放字节数)。
+
+    之所以需要它：未登录时听 VIP 歌曲，客户端只会缓存 30 秒试听片段，
+    登录后这段缓存仍然是 30 秒。清掉后重新取，才能拿到完整版。
+    """
+    root = player_cache_dir()
+    if not root.is_dir():
+        return (0, 0)
+    count = 0
+    total = 0
+    for path in root.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            size = path.stat().st_size
+            path.unlink()
+        except OSError:
+            continue
+        count += 1
+        total += size
+    return (count, total)

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import os
-import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -257,6 +256,22 @@ class SettingsDialog(RoundDialog):
         cache_row.addWidget(btn_cache)
         form.addRow("缓存目录", cache_row)
 
+        # 未登录时听 VIP 歌会缓存成试听片段，登录后仍是残片；给个入口清掉
+        play_row = QHBoxLayout()
+        play_row.setSpacing(8)
+        self.play_cache_state = QLabel("播放时解密出的临时文件")
+        self.play_cache_state.setObjectName("muted")
+        play_row.addWidget(self.play_cache_state, 1)
+        btn_play_cache = QPushButton("清理")
+        btn_play_cache.setFixedHeight(30)
+        btn_play_cache.setMinimumWidth(58)
+        btn_play_cache.setToolTip(
+            "清掉播放缓存。若某首歌还停在试听片段，清完重新播放会取完整版"
+        )
+        btn_play_cache.clicked.connect(self._clear_play_cache)
+        play_row.addWidget(btn_play_cache)
+        form.addRow("播放缓存", play_row)
+
         self.startup_view = QComboBox()
         self.startup_view.addItem("标准窗口", "full")
         self.startup_view.addItem("紧凑模式", "mini")
@@ -405,6 +420,20 @@ class SettingsDialog(RoundDialog):
                 f"{path}\n这个目录里没有 .uc 缓存文件，可能选错了"
             )
 
+    def _clear_play_cache(self) -> None:
+        from ncm import cache as cache_mod
+
+        count, total = cache_mod.clear_player_cache()
+        if count:
+            self.play_cache_state.setText(
+                f"已清理 {count} 个文件，释放 {total / 1048576:.1f} MB"
+            )
+            self.play_cache_state.setStyleSheet("color:#4caf7d;")
+        else:
+            self.play_cache_state.setText("没有可清理的播放缓存")
+            self.play_cache_state.setStyleSheet("")
+        self.changed = True
+
     def _detect_cache(self) -> None:
         self.cache_dir = cache_mod.default_cache_dir()
         self._refresh_cache_text()
@@ -442,6 +471,9 @@ class MainWindow(QMainWindow):
         self._search_keyword = ""
         self._search_offset = 0
         self._has_more = False
+        # 缓存扫描状态：用于表里那句「正在扫描…」以及失败后停掉自动刷新
+        self._scanning_cache = False
+        self._cache_scan_failed = False
         self._mini = False
         self._full_geometry = None
         self._shadow_px = 12
@@ -746,6 +778,7 @@ class MainWindow(QMainWindow):
         bar.volume_changed.connect(self._on_volume_changed)
         bar.repeat_changed.connect(self._on_repeat_changed)
         bar.toggle_mini.connect(self.toggle_mini)
+        bar.stop_requested.connect(self._stop_playback)
 
         volume = self.settings.value("volume", 70, type=int)
         bar.set_volume(volume)
@@ -774,6 +807,8 @@ class MainWindow(QMainWindow):
         """缓存目录变了就静默重扫，但不打断用户正在做的事。"""
         if self.task is not None or self._current_source() != "cache":
             return
+        if self._cache_scan_failed:
+            return  # 上次就失败了，等用户手动点「本地缓存」再试
         if self._selected_songs():
             return  # 正勾着歌单，重排会清掉勾选，等下次
         self.on_load_cache()
@@ -821,10 +856,24 @@ class MainWindow(QMainWindow):
             return None
         from ncm import cache as cache_mod
 
-        target_dir = Path(tempfile.gettempdir()) / "ncm-player"
+        # 未登录时听 VIP 歌，客户端只缓存 30 秒试听片段；之后登录了再播，
+        # 吃的还是这段残片。用「码率 × 体积」估一下时长，明显短于歌曲时长
+        # 就当作试听片段跳过，让调用方走网络取完整版。
+        if entry.rate and entry.size and song.duration_ms:
+            cached_ms = entry.size * 8 / (entry.rate * 1000) * 1000
+            if cached_ms < song.duration_ms * 0.6:
+                return None
+
+        target_dir = cache_mod.player_cache_dir()
         target_dir.mkdir(parents=True, exist_ok=True)
         scratch = target_dir / f"{song.id}.bin"
-        ext = cache_mod.decode(entry.path, scratch)
+        try:
+            ext = cache_mod.decode(entry.path, scratch)
+        except Exception:  # noqa: BLE001
+            # 缓存文件半截、被占用、或换了客户端版本解不开——别直接失败，
+            # 交回上层走网络，用户至少还能听
+            scratch.unlink(missing_ok=True)
+            return None
         final = target_dir / f"{song.id}.{ext}"
         os.replace(scratch, final)
         return final
@@ -852,6 +901,22 @@ class MainWindow(QMainWindow):
     def _play_row(self, index) -> None:
         row = index.row() if hasattr(index, "row") else int(index)
         self._play_from_list(self.songs, row)
+
+    def _stop_playback(self) -> None:
+        """停止当前播放，回到「没有在播」的干净状态。"""
+        player = getattr(self, "player", None)
+        if player is None:
+            return
+        previous = self._playing_id
+        player.stop()
+        self._playing_id = None
+        self.playlist = []
+        self.play_index = 0
+        self.topbar.set_song(None)
+        self.topbar.set_state("stopped")
+        self.topbar.set_position(0, 0)
+        self._refresh_playing_rows(previous)
+        self.status_label.setText("已停止播放")
 
     def _play_next(self) -> None:
         if not self.playlist:
@@ -1532,15 +1597,25 @@ class MainWindow(QMainWindow):
         self._update_download_button()
 
     def _update_empty_hint(self) -> None:
+        if self._scanning_cache:
+            self.empty_hint.setText("正在扫描本地缓存…")
+            self.empty_hint.show()
+            return
         if self.songs:
             self.empty_hint.hide()
             return
         keyword = self.input.text().strip()
         if self._is_cache_view():
-            self.empty_hint.setText(
-                "客户端里还没有可用的缓存\n"
-                "在网易云播放几首，这里会自动出现"
-            )
+            if self._cache_scan_failed:
+                self.empty_hint.setText(
+                    "没能读到本地缓存\n"
+                    "到「设置 → 缓存目录」确认路径是否正确"
+                )
+            else:
+                self.empty_hint.setText(
+                    "客户端里还没有可用的缓存\n"
+                    "在网易云播放几首，这里会自动出现"
+                )
         elif keyword and not self._looks_like_link(keyword):
             self.empty_hint.setText(
                 f"没搜到「{keyword}」\n换个关键词，或者换个音源试试"
@@ -1682,22 +1757,51 @@ class MainWindow(QMainWindow):
             self.result_info.setText("没有结果")
 
     def on_load_cache(self) -> None:
-        """把客户端缓存里已有的曲目列出来，代替逐个搜索。"""
+        """扫描客户端缓存并列出结果。
+
+        这里自己负责把音源切到「仅缓存」，并且屏蔽信号——否则 setCurrentIndex
+        会再触发一次 _on_source_changed → on_load_cache，变成一次点击跑两个
+        扫描任务，看起来就是「一直在扫缓存」。
+        """
         if self.task is not None:
+            if self._scanning_cache:
+                # 已经在扫了：把旧结果清掉、保持扫描态就行，别让用户以为没反应
+                self._pools.pop("cache", None)
+                self.songs = []
+                self._fill_result_table()
+                self.status_label.setText("正在扫描本地缓存…")
+                self._update_empty_hint()
+                self._update_download_button()
+                return
+            self.status_label.setText("上一个任务还没结束，稍等一下再扫描")
             return
-        # 列表本身来自缓存，把音源切到「仅缓存」，避免勾选后又去请求接口
+
         idx = GUI_SOURCES.index("cache")
         if self.source_box.currentIndex() != idx:
+            self.source_box.blockSignals(True)
             self.source_box.setCurrentIndex(idx)
+            self.source_box.blockSignals(False)
+            self.settings.setValue("source", "cache")
+
+        # 先把上一个音源的结果清干净，再进扫描态，避免旧结果和「扫描中」同屏
+        self._pools.pop("cache", None)
+        self.songs = []
+        self._fill_result_table()
+        self._scanning_cache = True
+        self._cache_scan_failed = False
+        self._update_empty_hint()
+        self._update_download_button()
+
         self._set_busy(True, "扫描本地缓存…")
         self.task = Task(self._scan_cache)
         self.task.ok.connect(self._on_cache_loaded)
-        self.task.fail.connect(self._on_task_error)
+        self.task.fail.connect(self._on_cache_failed)
         self.task.finished.connect(lambda: self._set_busy(False, None))
         self.task.start()
 
     def _on_cache_loaded(self, payload: tuple[str, list[Song]]) -> None:
         title, songs = payload
+        self._scanning_cache = False
         self._pools["cache"] = (list(songs), title, True)
         self._has_more = False
         self.btn_more.hide()
@@ -1707,6 +1811,15 @@ class MainWindow(QMainWindow):
             self.status_label.setText(
                 f"已载入本地缓存 {len(songs)} 首，搜索框只会在缓存内筛选"
             )
+        else:
+            self.status_label.setText("本地缓存里没有可用的曲目")
+
+    def _on_cache_failed(self, message: str) -> None:
+        # 扫描失败后停掉自动刷新，否则缓存目录一有写入就重试，变成刷屏
+        self._scanning_cache = False
+        self._cache_scan_failed = True
+        self._update_empty_hint()
+        self._on_task_error(message)
 
     def _scan_cache(self) -> tuple[str, list[Song]]:
         root = self.cache_dir
@@ -1859,6 +1972,9 @@ class MainWindow(QMainWindow):
             action.setData(key)
             action.setEnabled(enabled)
 
+        if self._playing_id is not None:
+            menu.addAction("停止播放").setData("stop")
+
         menu.addSeparator()
         for text, key, enabled in (
             (f"下载选中（{picked} 首）", "download", picked > 0 and idle),
@@ -1903,6 +2019,8 @@ class MainWindow(QMainWindow):
             self._play_from_list(self.songs, row)
         elif key == "play_one":
             self._play_from_list([song], 0)
+        elif key == "stop":
+            self._stop_playback()
         elif key == "download":
             self.on_download()
         elif key == "one":
@@ -2225,7 +2343,16 @@ class MainWindow(QMainWindow):
     
     def _open_settings(self) -> None:
         dialog = SettingsDialog(self.settings, self.out_dir, self.cache_dir, self)
-        if dialog.exec_() == QDialog.Accepted:
+        accepted = dialog.exec_() == QDialog.Accepted
+        # 登录状态和「保存」是两件事：扫码成功就已经写进配置了，
+        # 用户点不点保存都该在状态栏立刻反映出来
+        self._refresh_account_label()
+        if not accepted:
+            if dialog.changed:
+                self.status_label.setText("登录状态已更新")
+                self._cache_entries = None  # 权限变了，缓存的可用性要重判
+            return
+        if accepted:
             self.workers = dialog.workers.value()
             self.to_mp3 = dialog.to_mp3.isChecked()
             self.name_pattern = dialog.name_box.currentData()
@@ -2290,7 +2417,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"音源：{SOURCE_LABEL.get(key, key)}")
         # 每次切到「仅本地缓存」都重扫：客户端那边可能刚缓存了新歌，
         # 或者用户清过缓存，吃旧结果会显示已经不存在的东西
-        if key == "cache" and self.task is None:
+        if key == "cache":
             self.on_load_cache()
             return
         self._apply_view()

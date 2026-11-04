@@ -336,6 +336,7 @@ class TopBar(QWidget):
     prev = pyqtSignal()
     next = pyqtSignal()
     toggle_mini = pyqtSignal()
+    stop_requested = pyqtSignal()
     seeked = pyqtSignal(int)
     volume_changed = pyqtSignal(int)
     repeat_changed = pyqtSignal(str)
@@ -646,11 +647,15 @@ class TopBar(QWidget):
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
         act_mini = menu.addAction("还原窗口" if self._compact else "紧凑模式")
+        act_stop = menu.addAction("停止播放")
+        act_stop.setEnabled(self._song is not None)
         menu.addSeparator()
         act_close = menu.addAction("关闭")
         chosen = menu.exec_(event.globalPos())
         if chosen is act_mini:
             self.toggle_mini.emit()
+        elif chosen is act_stop:
+            self.stop_requested.emit()
         elif chosen is act_close:
             self._win.close()
 
