@@ -171,13 +171,13 @@ def decode(src: Path, dest: Path) -> str:
 def player_cache_dir() -> Path:
     """播放时从客户端缓存解密出来的临时文件放这儿。
 
-    不放系统临时目录：某些机器上 TEMP 被其它软件改写成了公共目录
-    （例如 Wondershare 会指到 C:\\Users\\Public\\Documents\\...\\CreatorTemp），
-    那里没有写权限，解密完 os.replace 会直接报 WinError 5，表现为「播放失败」。
-    放在自己的配置目录下最稳。
+    跟其它数据一样放在程序目录下，不碰系统临时目录：某些机器上 TEMP 会被
+    其它软件改成公共目录（例如 Wondershare 的 CreatorTemp），那里没有写权限，
+    解密完 os.replace 会直接报 WinError 5，表现为「播放失败」。
     """
-    home = Path(os.environ.get("USERPROFILE") or Path.home())
-    return home / ".ncm-downloader" / "play-cache"
+    from ncm import paths
+
+    return paths.play_cache_dir()
 
 
 def clear_player_cache() -> tuple[int, int]:

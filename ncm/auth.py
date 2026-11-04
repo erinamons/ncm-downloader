@@ -40,8 +40,10 @@ class Account:
 
 
 def config_dir() -> Path:
-    home = Path(os.environ.get("USERPROFILE") or Path.home())
-    return home / ".ncm-downloader"
+    """配置目录：便携模式下就是程序目录本身。"""
+    from ncm import paths
+
+    return paths.data_dir()
 
 
 def config_path() -> Path:

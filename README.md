@@ -105,17 +105,21 @@ pack\网易云下载器\
 
 ## 文件存在哪
 
-程序是单个 exe，但运行时会往这几个地方写东西：
+**便携模式：所有数据都在程序自己的文件夹里**，不写注册表，不碰用户目录。
 
 | 内容 | 位置 |
 |---|---|
-| 登录状态、缓存目录等配置 | `%USERPROFILE%\.ncm-downloader\config.json` |
-| 运行日志 | `%USERPROFILE%\.ncm-downloader\app.log` |
-| 音质、并发、列宽、搜索历史 | 注册表 `HKCU\Software\ncm\downloader` |
+| 登录状态、缓存目录等配置 | `config.json` |
+| 界面偏好（音质、并发、列宽、搜索历史） | `settings.ini` |
+| 运行日志 | `app.log` |
+| 播放缓存（解密出的音频） | `play-cache\`（设置里可清理） |
+| 默认下载目录 | `downloads\`（设置里可改） |
 | 已下载索引 | `<下载目录>\.ncm-index.db` |
-| 播放缓存（解密出的音频） | `%USERPROFILE%\.ncm-downloader\play-cache\`（设置里可清理） |
 
-彻底卸载：删掉 exe，再删 `.ncm-downloader` 目录、注册表项和下载目录里的 `.ncm-index.db`。
+拷走整个文件夹就等于带走全部状态；删掉文件夹就是卸载干净。
+
+只有一处例外：程序启动时会**读取**网易云客户端的缓存目录（`缓存目录` 那一项），
+那是别人的数据，只读不改。
 
 ## 说明
 

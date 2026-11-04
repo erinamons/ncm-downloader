@@ -156,19 +156,34 @@ painter.fillRect(QRectF(w - margin, margin, margin, h - margin*2), tint)
 
 ## 二、文件都写到哪了
 
-单文件 exe 不代表「零痕迹」，运行时会往这几处写东西。排查问题、做卸载器、回答用户「为什么 C 盘少了空间」时都要用到这张表。
+**便携模式（v1.0.3 起）**：一律写在程序目录，不写注册表、不碰用户目录。
+路径统一由 `ncm/paths.py` 提供，**不要在别处拼 `Path.home()`**。
 
-| 内容 | 位置 | 说明 |
-|---|---|---|
-| 账号 cookie、缓存目录等 | `%USERPROFILE%\.ncm-downloader\config.json` | 含登录凭据，**不要外传** |
-| 运行日志 | `%USERPROFILE%\.ncm-downloader\app.log` | 滚动保留 3 份 × 1 MB |
-| 界面偏好（音质、并发、列宽、搜索历史…） | 注册表 `HKCU\Software\ncm\downloader` | 由 `QSettings("ncm","downloader")` 管理 |
-| 下载索引（已下载记录） | `<下载目录>\.ncm-index.db` | 换下载目录等于换一份索引 |
-| 播放缓存（解密出的音频） | `%USERPROFILE%\.ncm-downloader\play-cache\` | 设置里有「清理」入口 |
-| 运行时解压的单文件本体 | `%TEMP%\_MEIxxxxxx\` | PyInstaller onefile 行为，退出时自动删除；进程被强杀会残留 |
+| 内容 | 位置 |
+|---|---|
+| 账号 cookie、缓存目录等 | `<程序目录>\config.json`（含登录凭据，不要外传） |
+| 界面偏好 | `<程序目录>\settings.ini`（QSettings IniFormat） |
+| 运行日志 | `<程序目录>\app.log`，滚动 3 份 × 1 MB |
+| 播放缓存 | `<程序目录>\play-cache\` |
+| 默认下载目录 | `<程序目录>\downloads\` |
+| 下载索引 | `<下载目录>\.ncm-index.db` |
 
-彻底卸载要清四样：exe、`.ncm-downloader` 目录、注册表键、下载目录里的 `.ncm-index.db`。
-`%TEMP%\_MEI*` 残留可以直接删，不影响任何数据。
+程序目录不可写时（例如放进 Program Files），`paths.data_dir()` 会自动退回家目录
+`~\.ncm-downloader`，避免直接起不来。
+
+**升级迁移**：`_open_settings()` 首次创建 ini 时，会把注册表 `HKCU\Software\ncm\downloader`
+的键搬过来并清空；`_migrate_legacy_config()` 会把 `~\.ncm-downloader\config.json`
+复制过来。老用户升级后登录态不丢。
+
+**为什么这么改**：之前数据散在用户目录和注册表，用户看到的是一个 exe，却不知道
+东西写去了哪，换机器也带不走。便携模式让「文件夹即全部状态」。
+
+### 相关坑
+
+- 播放缓存早期用 `tempfile.gettempdir()`，某些机器上 TEMP 被其它软件改成无写权限的
+  公共目录（实测 Wondershare 的 `C:\Users\Public\Documents\Wondershare\CreatorTemp`），
+  `os.replace` 报 `WinError 5` → 表现为「播放失败」。现已固定在程序目录。
+- 打包目录里删上千个文件会被 safe-delete 拦，直接让 PyInstaller `--noconfirm` 覆盖即可。
 
 ## 三、接口相关
 

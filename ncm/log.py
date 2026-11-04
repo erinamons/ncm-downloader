@@ -21,7 +21,6 @@ _FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 def log_path() -> Path:
     return auth.config_dir() / "app.log"
 
-
 def setup_logging(level: int = logging.INFO) -> Path:
     """挂上文件日志，并把未捕获异常也记进去。重复调用无副作用。"""
     path = log_path()

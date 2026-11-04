@@ -1,5 +1,18 @@
 # 版本记录
 
+## v1.0.3 — 2026-11-04
+
+### 变更
+
+- **改为便携模式：所有数据都在程序文件夹里**
+  - `config.json`（登录态与设置）、`settings.ini`（界面偏好，原来是注册表）、
+    `app.log`、`play-cache\`、`downloads\`（默认下载目录）全部放在 exe 同级
+  - 不再写注册表，不再往用户目录塞东西；拷走文件夹即带走全部状态
+  - 路径统一由 `ncm/paths.py` 提供
+  - 程序目录不可写时（如放进 Program Files）自动退回 `~\.ncm-downloader`
+- 老用户升级自动迁移：注册表键搬进 `settings.ini` 后清空，`~\.ncm-downloader\config.json`
+  复制到程序目录，登录态不丢
+
 ## v1.0.2 — 2026-11-04
 
 ### 变更

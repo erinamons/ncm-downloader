@@ -21,12 +21,16 @@ test-out/
 tmp_test/
 test-gui/
 test-cancel*/
+play-cache/
 
 # 下载残留与索引
 *.part
 .ncm-index.db
 .ncm-index.db-*
 
-# 本地配置（可能含登录 cookie，绝不能提交）
+# 便携模式下的用户数据（含登录 cookie，绝不能提交）
 config.json
+settings.ini
+app.log
+app.log.*
 *.log

@@ -128,13 +128,53 @@ GUI_SOURCES = ("client", "web", "cache")
 PAGE_SIZE = 50
 
 
-def default_download_dir() -> Path:
-    """默认落盘位置。
+def _open_settings() -> QSettings:
+    """界面偏好写在程序目录的 settings.ini，不再进注册表。
 
-    不能拿 Path.cwd() 当基准：打包成 exe 后，cwd 可能是桌面、也可能是
-    点击快捷方式时的工作目录，文件会散落到意想不到的地方。
+    老版本用 QSettings("ncm","downloader") 存在注册表，第一次跑便携版时
+    把已有的键搬过来并清空注册表，用户感觉不到差别。
     """
-    return Path.home() / "Music" / "网易云下载"
+    from ncm import paths
+
+    ini = paths.settings_path()
+    fresh = not ini.exists()
+    settings = QSettings(str(ini), QSettings.IniFormat)
+    if fresh:
+        legacy = QSettings("ncm", "downloader")
+        keys = legacy.allKeys()
+        if keys:
+            for key in keys:
+                settings.setValue(key, legacy.value(key))
+            settings.sync()
+            legacy.clear()
+            legacy.sync()
+    return settings
+
+
+def _migrate_legacy_config() -> None:
+    """把老版本放在用户目录的 config.json（含登录态）搬到程序目录。"""
+    from ncm import paths
+
+    legacy = Path.home() / ".ncm-downloader" / "config.json"
+    target = paths.config_path()
+    if target.exists() or not legacy.exists():
+        return
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(legacy.read_bytes())
+    except OSError:
+        pass
+
+
+def default_download_dir() -> Path:
+    """默认落盘位置：程序目录下的 downloads。
+
+    便携模式的前提是所有东西都在一起，所以不再往「音乐」目录写。
+    用户可以在设置里改成任意位置。
+    """
+    from ncm import paths
+
+    return paths.downloads_dir()
 
 # 底部操作栏按钮统一高度：设置、选择器、「下载选中」共用一个值，避免一高一低
 ACTION_BTN_H = 32
@@ -453,7 +493,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.settings = QSettings("ncm", "downloader")
+        _migrate_legacy_config()
+        self.settings = _open_settings()
         # 旧版本会记住窗口几何，现在改成每次居中打开，把残留键清掉
         for dead_key in ("geometry", "mini_geometry"):
             if self.settings.contains(dead_key):
