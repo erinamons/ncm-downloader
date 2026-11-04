@@ -1,0 +1,168 @@
+"""客户端播放缓存（.uc）解码。
+
+缓存文件是对音频容器整体做单字节异或，密钥固定 0xA3，解出来就是标准
+m4a / mp3。文件名形如 <songId>-<档位>-<hash>.uc，同名 .idx 是明文 JSON，
+记录已缓存的字节区间，可以用来判断是否完整。
+
+缓存音质等于「播放时选择的档位」，不是下载音质；想要更高规格需要在
+客户端把播放音质调高再播一遍。
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+_UC_RE = re.compile(r"^(\d+)-(\d+)-([0-9a-f]+)$", re.IGNORECASE)
+_XOR_TABLE = bytes(i ^ 0xA3 for i in range(256))
+_CHUNK = 4 * 1024 * 1024
+
+# 客户端档位 -> 大致规格，仅用于展示
+RATE_LABEL = {96: "96k", 128: "128k", 192: "192k", 320: "320k", 999: "无损"}
+
+
+@dataclass(slots=True)
+class CacheEntry:
+    path: Path
+    song_id: int
+    rate: int
+    size: int
+    complete: bool
+    covered: int
+
+    @property
+    def rate_label(self) -> str:
+        return RATE_LABEL.get(self.rate, f"{self.rate}k")
+
+
+def candidate_dirs() -> list[Path]:
+    """客户端可能存放播放缓存的目录，按命中优先级排列。
+
+    默认位置是 %LOCALAPPDATA%\\Netease\\CloudMusic\\Cache\\Cache；某些版本
+    少一层 Cache，一并试一下。用户改过缓存位置时靠设置里手动指定。
+    """
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return []
+    base = Path(local) / "Netease" / "CloudMusic"
+    return [base / "Cache" / "Cache", base / "Cache"]
+
+
+def default_cache_dir() -> Path | None:
+    """自动探测 Windows 客户端的在线播放缓存目录。
+
+    优先返回真的有 .uc 文件的目录——装了客户端但从没播放过时，默认位置是
+    空目录，指过去只会让「仅缓存」列表一片空白，还以为是程序坏了。
+    """
+    found = [path for path in candidate_dirs() if path.is_dir()]
+    for path in found:
+        if looks_like_cache_dir(path):
+            return path
+    return found[0] if found else None
+
+
+def looks_like_cache_dir(path: Path | str) -> bool:
+    """目录里是否真有缓存的 .uc/.idx，用来提示用户选错了地方。"""
+    root = Path(path)
+    if not root.is_dir():
+        return False
+    try:
+        for entry in root.iterdir():
+            if entry.suffix.lower() in (".uc", ".idx"):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _read_idx(idx: Path) -> tuple[int, int]:
+    """返回 (声明大小, 已覆盖字节数)。"""
+    try:
+        data = json.loads(idx.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return 0, 0
+    size = int(data.get("size") or 0)
+    covered = 0
+    for zone in data.get("zone") or []:
+        parts = str(zone).split()
+        if len(parts) != 2:
+            continue
+        try:
+            start, end = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        covered += max(0, end - start + 1)
+    return size, covered
+
+
+def scan(cache_dir: Path | str) -> list[CacheEntry]:
+    root = Path(cache_dir)
+    entries: list[CacheEntry] = []
+    for path in root.glob("*.uc"):
+        match = _UC_RE.match(path.stem)
+        if not match:
+            continue
+        size = path.stat().st_size
+        declared, covered = _read_idx(path.with_suffix(".idx"))
+        if declared:
+            # idx 声明的是预期总长；文件实际长度和已覆盖区间都得对得上才算完整
+            expected = max(declared, size)
+            complete = covered >= expected * 0.98 and size >= expected * 0.98
+        else:
+            # 没有 idx 时按 `.uc!` 约定判断：带感叹号的表示写入未完成
+            complete = not path.name.endswith("!")
+        entries.append(
+            CacheEntry(
+                path=path,
+                song_id=int(match.group(1)),
+                rate=int(match.group(2)),
+                size=size,
+                complete=complete,
+                covered=covered,
+            )
+        )
+    entries.sort(key=lambda e: (e.song_id, -e.rate))
+    return entries
+
+
+def container_of(head: bytes) -> str:
+    """根据已解密的文件头判断容器，返回扩展名。"""
+    if len(head) >= 8 and head[4:8] == b"ftyp":
+        return "m4a"
+    if head[:3] == b"ID3":
+        return "mp3"
+    if head[:4] == b"fLaC":
+        return "flac"
+    if head[:4] == b"RIFF":
+        return "wav"
+    if head[:1] == b"\xff" and len(head) > 1 and (head[1] & 0xE0) == 0xE0:
+        return "mp3"
+    return "bin"
+
+
+def peek(path: Path) -> str:
+    with open(path, "rb") as fh:
+        head = fh.read(16).translate(_XOR_TABLE)
+    return container_of(head)
+
+
+def decode(src: Path, dest: Path) -> str:
+    """边解密边写，返回容器扩展名。"""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    ext = "bin"
+    tmp = dest.with_name(dest.name + ".part")
+    with open(src, "rb") as fi, open(tmp, "wb") as fo:
+        first = True
+        while True:
+            chunk = fi.read(_CHUNK)
+            if not chunk:
+                break
+            plain = chunk.translate(_XOR_TABLE)
+            if first:
+                ext = container_of(plain[:16])
+                first = False
+            fo.write(plain)
+    os.replace(tmp, dest)
+    return ext

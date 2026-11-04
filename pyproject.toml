@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ncm-downloader"
+version = "1.0.0"
+description = "网易云音乐下载工具（命令行 + 桌面界面）"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "pycryptodome>=3.20.0",
+    "mutagen>=1.47.0",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "qrcode>=7.4",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+gui = ["PyQt5>=5.15.10"]
+
+[project.scripts]
+ncm = "ncm.cli:main"
+
+[tool.setuptools]
+packages = ["ncm", "gui"]

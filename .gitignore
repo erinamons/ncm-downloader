@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 打包产物（体积大，不入库）
+build/
+dist/
+pack/
+pack_build*/
+pack_dbg/
+*.spec
+nuitka-crash-report.xml
+
+# 运行时产生的目录
+downloads/
+cache-out/
+test-out/
+tmp_test/
+test-gui/
+test-cancel*/
+
+# 下载残留与索引
+*.part
+.ncm-index.db
+.ncm-index.db-*
+
+# 本地配置（可能含登录 cookie，绝不能提交）
+config.json
+*.log
