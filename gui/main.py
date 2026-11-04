@@ -454,6 +454,10 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.settings = QSettings("ncm", "downloader")
+        # 旧版本会记住窗口几何，现在改成每次居中打开，把残留键清掉
+        for dead_key in ("geometry", "mini_geometry"):
+            if self.settings.contains(dead_key):
+                self.settings.remove(dead_key)
         self.backend = LocalBackend(cookie=auth.load_cookie())
         self.workers = self.settings.value("workers", 4, type=int)
         self.to_mp3 = self.settings.value("to_mp3", False, type=bool)

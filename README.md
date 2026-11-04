@@ -84,6 +84,20 @@ python -m PyInstaller --noconfirm --onefile --windowed \
 **转码失败？**
 工具内置 ffmpeg，一般不需要额外安装；失败时检查文件名是否含特殊字符。
 
+## 文件存在哪
+
+程序是单个 exe，但运行时会往这几个地方写东西：
+
+| 内容 | 位置 |
+|---|---|
+| 登录状态、缓存目录等配置 | `%USERPROFILE%\.ncm-downloader\config.json` |
+| 运行日志 | `%USERPROFILE%\.ncm-downloader\app.log` |
+| 音质、并发、列宽、搜索历史 | 注册表 `HKCU\Software\ncm\downloader` |
+| 已下载索引 | `<下载目录>\.ncm-index.db` |
+| 播放缓存（解密出的音频） | `%TEMP%\ncm-player\`（设置里可清理） |
+
+彻底卸载：删掉 exe，再删 `.ncm-downloader` 目录、注册表项和下载目录里的 `.ncm-index.db`。
+
 ## 说明
 
 本项目仅用于个人学习与技术研究。下载内容请自行确认拥有相应权限，勿用于传播或商业用途。使用本工具产生的后果由使用者承担。
