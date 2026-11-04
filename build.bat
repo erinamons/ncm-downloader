@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 echo ========================================
-echo  网易云音乐下载器 - 打包（PyInstaller）
+echo  网易云音乐下载器 - 打包（文件夹版）
 echo ========================================
 echo.
 
@@ -12,7 +12,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [1/3] 定位内置 ffmpeg...
+echo [1/4] 定位 ffmpeg...
 for /f "delims=" %%i in ('python -c "import imageio_ffmpeg;print(imageio_ffmpeg.get_ffmpeg_exe())"') do set FFMPEG=%%i
 if not exist "%FFMPEG%" (
     echo [错误] 找不到 ffmpeg，请先运行: pip install imageio-ffmpeg
@@ -21,12 +21,11 @@ if not exist "%FFMPEG%" (
 )
 echo     %FFMPEG%
 
-echo [2/3] 开始打包...
-python -m PyInstaller --noconfirm --onefile --windowed ^
+echo [2/4] 打包主程序（文件夹模式）...
+python -m PyInstaller --noconfirm --onedir --windowed ^
   --name "网易云下载器" ^
   --icon "gui/assets/app.ico" ^
   --add-data "gui/assets;gui/assets" ^
-  --add-binary "%FFMPEG%;imageio_ffmpeg/binaries" ^
   --hidden-import PyQt5.QtMultimedia ^
   --hidden-import PyQt5.QtMultimediaWidgets ^
   --distpath pack ^
@@ -39,9 +38,23 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo [3/4] 摆放 ffmpeg 与说明...
+if not exist "pack\网易云下载器\ffmpeg\binaries" mkdir "pack\网易云下载器\ffmpeg\binaries"
+copy /y "%FFMPEG%" "pack\网易云下载器\ffmpeg\binaries\" >nul
+if errorlevel 1 (
+    echo [错误] 复制 ffmpeg 失败
+    pause
+    exit /b 1
+)
+if exist "docs\使用说明.txt" copy /y "docs\使用说明.txt" "pack\网易云下载器\" >nul
+
+echo [4/4] 完成
 echo.
-echo [3/3] 完成
-for %%I in ("pack\网易云下载器.exe") do echo 输出: pack\网易云下载器.exe  %%~zI 字节
+echo 输出目录: pack\网易云下载器\
+echo   网易云下载器.exe
+echo   ffmpeg\binaries\      （转码用，可删）
+echo   _internal\            （依赖库，勿动）
+echo   使用说明.txt
 echo.
-echo 发布前请实测：启动、内置 ffmpeg、下载并转一次 mp3
+echo 分发时整个文件夹压成 zip 即可；换新版直接覆盖文件夹，用户数据不受影响。
 pause

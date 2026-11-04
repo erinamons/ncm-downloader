@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -170,8 +169,15 @@ def decode(src: Path, dest: Path) -> str:
 
 
 def player_cache_dir() -> Path:
-    """播放时从客户端缓存解密出来的临时文件都放这儿。"""
-    return Path(tempfile.gettempdir()) / "ncm-player"
+    """播放时从客户端缓存解密出来的临时文件放这儿。
+
+    不放系统临时目录：某些机器上 TEMP 被其它软件改写成了公共目录
+    （例如 Wondershare 会指到 C:\\Users\\Public\\Documents\\...\\CreatorTemp），
+    那里没有写权限，解密完 os.replace 会直接报 WinError 5，表现为「播放失败」。
+    放在自己的配置目录下最稳。
+    """
+    home = Path(os.environ.get("USERPROFILE") or Path.home())
+    return home / ".ncm-downloader" / "play-cache"
 
 
 def clear_player_cache() -> tuple[int, int]:
@@ -196,3 +202,30 @@ def clear_player_cache() -> tuple[int, int]:
         count += 1
         total += size
     return (count, total)
+
+
+def purge_legacy_player_cache() -> int:
+    """清掉旧版本留在系统临时目录的播放缓存，返回删除的文件数。
+
+    老版本用 tempfile.gettempdir()，某些机器上那是其它软件建的公共目录；
+    1.0.1 起改用配置目录，这里只负责收拾残局，失败也不影响启动。
+    """
+    import tempfile
+
+    root = Path(tempfile.gettempdir()) / "ncm-player"
+    if not root.is_dir():
+        return 0
+    removed = 0
+    for path in root.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            continue
+    try:
+        root.rmdir()
+    except OSError:
+        pass
+    return removed

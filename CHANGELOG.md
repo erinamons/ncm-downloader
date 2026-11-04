@@ -1,5 +1,22 @@
 # 版本记录
 
+## v1.0.2 — 2026-11-04
+
+### 变更
+
+- **分发包改为文件夹版**（`--onedir`）：依赖放 `_internal\`，ffmpeg 单独摆在
+  `ffmpeg\binaries\`，exe 同级可见、可替换、可删除。启动也比单文件快——不再
+  每次把 190 MB 解压到 `%TEMP%`。
+- ffmpeg 查找顺序改为：程序自带 → PATH → Python 包自带。
+
+### 修复
+
+- **播放缓存写入失败**：之前用 `tempfile.gettempdir()`，某些机器上 TEMP 被
+  其它软件改到无写权限的公共目录（实测遇到 Wondershare 的
+  `C:\Users\Public\Documents\Wondershare\CreatorTemp`），解密完 `os.replace`
+  直接报 `WinError 5`，表现为「播放失败」。现在放 `~\.ncm-downloader\play-cache`，
+  并对 `os.replace` 兜底回退网络。旧版本残留的临时缓存会在启动时清理。
+
 ## v1.0.1 — 2026-11-04
 
 ### 修复

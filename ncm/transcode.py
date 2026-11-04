@@ -29,7 +29,33 @@ def _auto_bitrate(src_br: int) -> str:
     return "320k"
 
 
+def _bundled_ffmpeg() -> str | None:
+    """找 exe 同级的 ffmpeg 目录。
+
+    文件夹版把 ffmpeg 摆在明处（`<程序目录>\\ffmpeg\\binaries\\ffmpeg*.exe`），
+    用户能直接看见、替换、删除；单文件版则退回包内自带的那份。
+    """
+    import sys
+
+    root = Path(sys.executable).parent if getattr(sys, "frozen", False) else None
+    if root is None:
+        return None
+    for candidate in (
+        root / "ffmpeg" / "binaries",
+        root / "ffmpeg",
+    ):
+        if not candidate.is_dir():
+            continue
+        for path in sorted(candidate.glob("ffmpeg*.exe")):
+            return str(path)
+    return None
+
+
 def ffmpeg_path() -> str | None:
+    # 顺序：程序自带 → PATH → Python 包自带
+    bundled = _bundled_ffmpeg()
+    if bundled:
+        return bundled
     exe = shutil.which("ffmpeg")
     if exe:
         return exe

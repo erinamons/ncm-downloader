@@ -38,16 +38,35 @@ python -m ncm --help       # 命令行
 
 ## 打包
 
+产出的是**文件夹版**，不是单文件：依赖和 ffmpeg 都摆在明处，启动也更快（不用每次解压到临时目录）。
+
 ```bash
-python -m PyInstaller --noconfirm --onefile --windowed \
+python -m PyInstaller --noconfirm --onedir --windowed \
   --name "网易云下载器" --icon "gui/assets/app.ico" \
   --add-data "gui/assets;gui/assets" \
-  --add-binary "<site-packages>/imageio_ffmpeg/binaries/ffmpeg-win-x86_64-v9.0.2.exe;imageio_ffmpeg/binaries" \
   --hidden-import PyQt5.QtMultimedia --hidden-import PyQt5.QtMultimediaWidgets \
+  --distpath pack --workpath pack_build \
   run_gui.py
+
+# 打包后把 ffmpeg 摆到 exe 同级，程序会优先用这份
+mkdir "pack\网易云下载器\ffmpeg\binaries"
+copy "<site-packages>\imageio_ffmpeg\binaries\ffmpeg-win-x86_64-v9.0.2.exe" "pack\网易云下载器\ffmpeg\binaries\"
 ```
 
-`--add-binary` 那行不能省：`--collect-all imageio_ffmpeg` 只收 Python 模块，不带 ffmpeg 二进制，漏了转码功能在别人机器上就是坏的。
+成品结构：
+
+```
+pack\网易云下载器\
+├── 网易云下载器.exe
+├── ffmpeg\binaries\ffmpeg-win-x86_64-v9.0.2.exe   转码用，可删
+├── _internal\                                     依赖库，勿动
+└── 使用说明.txt
+```
+
+`build.bat` 一条命令做完上面的事。
+
+> 也可以用 `--onefile` 打单文件，但那样每次启动都要把 190 MB 解压到 `%TEMP%`，
+> 启动慢、出问题也不容易看。目录版更适合分发与排错。
 
 > Nuitka 在当前环境不可用，原因见 [docs/MAINTENANCE.md](docs/MAINTENANCE.md#打包踩坑)。
 
@@ -94,7 +113,7 @@ python -m PyInstaller --noconfirm --onefile --windowed \
 | 运行日志 | `%USERPROFILE%\.ncm-downloader\app.log` |
 | 音质、并发、列宽、搜索历史 | 注册表 `HKCU\Software\ncm\downloader` |
 | 已下载索引 | `<下载目录>\.ncm-index.db` |
-| 播放缓存（解密出的音频） | `%TEMP%\ncm-player\`（设置里可清理） |
+| 播放缓存（解密出的音频） | `%USERPROFILE%\.ncm-downloader\play-cache\`（设置里可清理） |
 
 彻底卸载：删掉 exe，再删 `.ncm-downloader` 目录、注册表项和下载目录里的 `.ncm-index.db`。
 

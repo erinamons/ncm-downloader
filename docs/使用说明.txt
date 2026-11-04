@@ -1,0 +1,35 @@
+网易云音乐下载器 v1.0.1
+================================
+
+怎么用
+------
+双击「网易云下载器.exe」即可，不需要安装。
+
+目录说明
+--------
+网易云下载器.exe     主程序
+ffmpeg\              转码工具（转 mp3 用），不要删
+_internal\           程序依赖的库，不要动
+
+常见问题
+--------
+1. 提示找不到 ffmpeg？
+   确认 ffmpeg\binaries 下那个 100 MB 的 exe 还在。删了也能用，
+   只是「转 mp3」不可用，下载其它格式不受影响。
+
+2. 想换新版？
+   整个文件夹替换即可。你的登录状态、设置、下载记录都不在这个
+   文件夹里，不会丢：
+     %USERPROFILE%\.ncm-downloader\
+     HKCU\Software\ncm\downloader
+     <下载目录>\.ncm-index.db
+
+3. 日志在哪？
+   %USERPROFILE%\.ncm-downloader\app.log
+
+4. 播放缓存占空间？
+   设置里有「播放缓存 · 清理」，或者直接删
+   %USERPROFILE%\.ncm-downloader\play-cache\
+
+5. 彻底卸载
+   删掉本文件夹，再删上面第 2 条列的三个位置。

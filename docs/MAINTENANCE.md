@@ -32,17 +32,34 @@ Start-Sleep 10
 (Get-Process -Id $p.Id).CPU   # 10 秒后没变化 = 卡住，不是在编译
 ```
 
-#### 3. PyInstaller 不会自动收 ffmpeg
+#### 3. ffmpeg 不会自动进包
 
 `--collect-all imageio_ffmpeg` 只收 Python 模块，**100 MB 的 ffmpeg 二进制不会进包**。表现：打包版「转 mp3」不可用，设置里显示「转码引擎：未找到」。
 
-必须显式：
+文件夹版的正确做法是把 ffmpeg 摆到 exe 同级，让人能看见也能替换：
 
 ```
---add-binary "<site-packages>/imageio_ffmpeg/binaries/ffmpeg-win-x86_64-v9.0.2.exe;imageio_ffmpeg/binaries"
+打包完成后：
+mkdir "pack\网易云下载器\ffmpeg\binaries"
+copy "<site-packages>\imageio_ffmpeg\binaries\ffmpeg-win-*.exe" 到上面这个目录
 ```
 
-验证方法：启动 exe 后看 `%TEMP%\_MEI*\imageio_ffmpeg\binaries\` 下有没有 100 MB 的文件。
+`ncm/transcode.py::_bundled_ffmpeg()` 会按 `exe目录\ffmpeg\binaries\ffmpeg*.exe` 找，
+找不到再退回 PATH 和 imageio_ffmpeg。
+
+验证方法（不用真跑打包后的程序）：
+
+```python
+import sys
+from pathlib import Path
+sys.frozen = True
+sys.executable = str(Path("pack/网易云下载器/网易云下载器.exe").resolve())
+from ncm.transcode import ffmpeg_path
+print(ffmpeg_path())      # 应指向 pack\网易云下载器\ffmpeg\binaries\...
+```
+
+早期用 `--onefile --add-binary "...;imageio_ffmpeg/binaries"` 也能带上，但那样藏在解压目录里，
+用户既看不见也换不了，已弃用。
 
 #### 4. 中文文件名的 exe 不能用 bash 直接启动
 
@@ -135,6 +152,7 @@ painter.fillRect(QRectF(w - margin, margin, margin, h - margin*2), tint)
 | 点「本地缓存」一次跑两个扫描 | `on_load_cache` 里 `setCurrentIndex` 又触发 `_on_source_changed` | 切换时 `blockSignals`，并加 `_scanning_cache` 状态位 |
 | 缓存行右键无反应 | 切换瞬间表格还留着旧音源的行，而 `self.songs` 已清空 | 先清视图再扫描，保证两者始终同步 |
 | VIP 歌一直只有 30 秒 | 未登录时客户端只缓存试听片段，登录后仍吃这段缓存 | 按 `size×8/rate` 估时长，低于歌曲时长 60% 就跳过缓存走网络 |
+| 播放缓存写入报 WinError 5 | `tempfile.gettempdir()` 被其它软件改到无写权限的公共目录（如 Wondershare 的 `C:\Users\Public\Documents\...\CreatorTemp`） | 播放缓存改放 `~\.ncm-downloader\play-cache`，并对 `os.replace` 兜底回退网络 |
 
 ## 二、文件都写到哪了
 
@@ -146,7 +164,7 @@ painter.fillRect(QRectF(w - margin, margin, margin, h - margin*2), tint)
 | 运行日志 | `%USERPROFILE%\.ncm-downloader\app.log` | 滚动保留 3 份 × 1 MB |
 | 界面偏好（音质、并发、列宽、搜索历史…） | 注册表 `HKCU\Software\ncm\downloader` | 由 `QSettings("ncm","downloader")` 管理 |
 | 下载索引（已下载记录） | `<下载目录>\.ncm-index.db` | 换下载目录等于换一份索引 |
-| 播放缓存（解密出的音频） | `%TEMP%\ncm-player\` | 设置里有「清理」入口 |
+| 播放缓存（解密出的音频） | `%USERPROFILE%\.ncm-downloader\play-cache\` | 设置里有「清理」入口 |
 | 运行时解压的单文件本体 | `%TEMP%\_MEIxxxxxx\` | PyInstaller onefile 行为，退出时自动删除；进程被强杀会残留 |
 
 彻底卸载要清四样：exe、`.ncm-downloader` 目录、注册表键、下载目录里的 `.ncm-index.db`。

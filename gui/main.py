@@ -511,6 +511,12 @@ class MainWindow(QMainWindow):
         # 缓存目录：设置里指定过就用它，否则自动探测客户端默认位置
         self.cache_dir = self._load_cache_dir()
 
+        # 旧版本把播放缓存放在系统临时目录，这里顺手清一次
+        try:
+            cache_mod.purge_legacy_player_cache()
+        except Exception:  # noqa: BLE001
+            pass
+
         self.setWindowTitle("网易云音乐下载器")
         icon = Path(__file__).parent / "assets" / "app.ico"
         if icon.exists():
@@ -879,7 +885,12 @@ class MainWindow(QMainWindow):
             scratch.unlink(missing_ok=True)
             return None
         final = target_dir / f"{song.id}.{ext}"
-        os.replace(scratch, final)
+        try:
+            os.replace(scratch, final)
+        except OSError:
+            # 目录权限不够时别把播放卡死，交给上层走网络
+            scratch.unlink(missing_ok=True)
+            return None
         return final
 
     def _remote_audio(self, song: Song) -> tuple[str, str] | None:
