@@ -128,11 +128,43 @@ GUI_SOURCES = ("client", "web", "cache")
 PAGE_SIZE = 50
 
 
+def _registry_has_settings() -> bool:
+    """只读地看一眼注册表里有没有旧版遗留，绝不创建键。"""
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\ncm\downloader") as key:
+            return winreg.QueryInfoKey(key)[1] > 0
+    except OSError:
+        return False
+
+
+def _drop_legacy_registry() -> None:
+    import winreg
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, r"Software\ncm\downloader", 0, winreg.KEY_ALL_ACCESS
+        ) as key:
+            while True:
+                try:
+                    name, _, _ = winreg.EnumValue(key, 0)
+                except OSError:
+                    break
+                winreg.DeleteValue(key, name)
+    except OSError:
+        pass
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, r"Software\ncm\downloader")
+    except OSError:
+        pass
+
+
 def _open_settings() -> QSettings:
     """界面偏好写在程序目录的 settings.ini，不再进注册表。
 
     老版本用 QSettings("ncm","downloader") 存在注册表，第一次跑便携版时
-    把已有的键搬过来并清空注册表，用户感觉不到差别。
+    把已有的键搬过来，然后把注册表项整个删掉。
     """
     from ncm import paths
 
@@ -140,14 +172,18 @@ def _open_settings() -> QSettings:
     fresh = not ini.exists()
     settings = QSettings(str(ini), QSettings.IniFormat)
     if fresh:
-        legacy = QSettings("ncm", "downloader")
-        keys = legacy.allKeys()
-        if keys:
-            for key in keys:
+        if _registry_has_settings():
+            legacy = QSettings("ncm", "downloader")
+            for key in legacy.allKeys():
                 settings.setValue(key, legacy.value(key))
-            settings.sync()
             legacy.clear()
             legacy.sync()
+            _drop_legacy_registry()
+        # 写一个版本号，顺便让 settings.ini 落盘（空 QSettings 不会生成文件）
+        from ncm import __version__
+
+        settings.setValue("app_version", __version__)
+        settings.sync()
     return settings
 
 
