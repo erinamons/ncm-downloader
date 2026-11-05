@@ -717,6 +717,10 @@ class MainWindow(QMainWindow):
         self._cache_rates: dict[int, str] = {}
         # 曲目详情的内存缓存：缓存自动刷新很频繁，避免反复请求接口
         self._detail_cache: dict[int, Song] = {}
+        # 活着的后台任务：只靠 self.task 一个引用不够，旧任务的 finished
+        # 会把槽位清空，正在跑的新任务若没人引用就会被 GC，QThread 析构直接 abort
+        self._live_tasks: set = set()
+        self._pending_query = ""
         self.store: Store | None = None
         self.downloader: Downloader | None = None
         self.task: Task | None = None
@@ -1891,6 +1895,12 @@ class MainWindow(QMainWindow):
     def on_search(self) -> None:
         text = self.input.text().strip()
         if self.task is not None:
+            if self._scanning_cache:
+                # 扫描只写缓存池，不冲突；先记下这次输入，扫完自动接着办
+                self._pending_query = text
+                self.status_label.setText("正在扫描本地缓存，完成后自动解析")
+            else:
+                self.status_label.setText("正在处理上一个任务，稍等一下再回车")
             return
         if not text:
             self._apply_view()
@@ -2032,6 +2042,7 @@ class MainWindow(QMainWindow):
         self.btn_more.hide()
         self._set_busy(True, f"搜索「{keyword}」…")
         self.task = Task(lambda: ("搜索结果", self.backend.search(keyword, limit=PAGE_SIZE)))
+        self._keep_task(self.task)
         self.task.ok.connect(self._on_songs_loaded)
         self.task.fail.connect(self._on_task_error)
         self.task.finished.connect(lambda: self._set_busy(False, None))
@@ -2073,12 +2084,47 @@ class MainWindow(QMainWindow):
         self.btn_more.setEnabled(True)
         self._on_task_error(message)
 
+    def _expand_and_resolve(self, url: str) -> None:
+        """163cn.tv 短链里没有 id，得先跟一次跳转。"""
+        self._set_busy(True, "展开短链…")
+
+        def load() -> str:
+            return self.backend.expand_link(url)
+
+        task = Task(load)
+        self._keep_task(task)
+        task.ok.connect(self._on_link_expanded)
+        task.fail.connect(self._on_task_error)
+        task.finished.connect(lambda: self._set_busy(False, None))
+        self.task = task
+        task.start()
+
+    def _on_link_expanded(self, final: str) -> None:
+        self.task = None
+        if "163cn.tv" in final or "id=" not in final:
+            self.status_label.setText("短链没能展开出目标，请粘贴完整链接")
+            return
+        self.input.setText(final)
+        self._resolve(final)
+
     def _resolve(self, text: str) -> None:
+        if "163cn.tv" in text and "id=" not in text:
+            self._expand_and_resolve(text)
+            return
         try:
             kind, ident = parse_target(text)
         except ValueError as exc:
             self.status_label.setText(str(exc))
             return
+
+        # 链接来自接口，解析结果不是本地缓存：还留在「仅缓存」音源的话，
+        # 按钮会显示「导出」、音质列还会串进缓存的码率，点下去多半是 CACHE_MISS
+        if self._current_source() == "cache":
+            idx = GUI_SOURCES.index("client")
+            self.source_box.blockSignals(True)
+            self.source_box.setCurrentIndex(idx)
+            self.source_box.blockSignals(False)
+            self.settings.setValue("source", "client")
 
         # 链接/歌单解析出来的列表是完整的，没有下一页可翻
         self._search_keyword = ""
@@ -2092,6 +2138,13 @@ class MainWindow(QMainWindow):
                 return ("单曲", [song] if song else [])
 
             self._set_busy(True, "解析歌曲…")
+        elif kind == "album":
+
+            def load() -> tuple[str, list[Song]]:
+                album = self.backend.album(ident)
+                return (album.name, album.songs)
+
+            self._set_busy(True, "解析专辑…")
         else:
 
             def load() -> tuple[str, list[Song]]:
@@ -2101,6 +2154,7 @@ class MainWindow(QMainWindow):
             self._set_busy(True, "解析歌单…")
 
         self.task = Task(load)
+        self._keep_task(self.task)
         self.task.ok.connect(self._on_songs_loaded)
         self.task.fail.connect(self._on_task_error)
         self.task.finished.connect(lambda: self._set_busy(False, None))
@@ -2184,13 +2238,29 @@ class MainWindow(QMainWindow):
         self._update_empty_hint()
         self._update_download_button()
 
-        self._set_busy(True, "扫描本地缓存…")
+        self._set_busy(True, "扫描本地缓存…", lock_input=False)
         self.task = Task(self._scan_cache, wants_progress=True)
+        self._keep_task(self.task)
         self.task.progress.connect(lambda msg: self.status_label.setText(msg))
         self.task.ok.connect(self._on_cache_loaded)
         self.task.fail.connect(self._on_cache_failed)
         self.task.finished.connect(lambda: self._set_busy(False, None))
         self.task.start()
+
+    def _drain_pending(self) -> None:
+        """扫描期间排队的输入，等任务槽空出来再执行。"""
+        text = getattr(self, "_pending_query", "")
+        if not text:
+            return
+        if self.task is not None:
+            # 旧任务还在收尾，过一会儿再试，别硬抢任务槽
+            QTimer.singleShot(40, self._drain_pending)
+            return
+        self._pending_query = ""
+        if self._looks_like_link(text):
+            self._resolve(text)
+        else:
+            self._search(text)
 
     def _on_cache_loaded(self, payload: tuple[str, list[Song]]) -> None:
         title, songs = payload
@@ -2202,6 +2272,7 @@ class MainWindow(QMainWindow):
         self._has_more = False
         self.btn_more.hide()
         # 扫描是异步的：用户可能已经切回别的音源了，这时别再把缓存列表顶上来
+        QTimer.singleShot(0, self._drain_pending)
         if self._current_source() != "cache":
             return
         self._apply_view()
@@ -2336,9 +2407,21 @@ class MainWindow(QMainWindow):
             return
         self.status_label.setText(f"出错：{message}")
 
-    def _set_busy(self, busy: bool, message: str | None) -> None:
-        self.btn_search.setEnabled(not busy)
-        self.input.setEnabled(not busy)
+    def _keep_task(self, task) -> None:
+        self._live_tasks.add(task)
+        task.finished.connect(lambda: self._live_tasks.discard(task))
+
+    def _set_busy(
+        self, busy: bool, message: str | None = None, lock_input: bool = True
+    ) -> None:
+        """lock_input=False 用于后台维护类任务（扫缓存），别把搜索框一起锁了。
+
+        缓存扫描是自动触发的、每几秒可能来一次，一锁输入框用户就粘贴不了链接，
+        看起来像「按回车没反应」。
+        """
+        if lock_input:
+            self.btn_search.setEnabled(not busy)
+            self.input.setEnabled(not busy)
         if busy and message:
             self.status_label.setText(message)
         if not busy:
@@ -2350,9 +2433,9 @@ class MainWindow(QMainWindow):
         table = self.result_table
         # 音质列：缓存视图常驻（空表也留着，否则列宽会跟着有没有数据来回跳），
         # 其它音源没有码率信息，就别占一列空的
-        show_quality = self._current_source() == "cache" or any(
-            self._cache_rates.get(song.id) for song in self.songs
-        )
+        # 只看音源：缓存视图常驻（空表也留着，避免列宽跳动）；
+        # 别用「有没有码率」判断，否则解析歌单时撞上缓存里的同 id 会串味
+        show_quality = self._current_source() == "cache"
         table.setColumnHidden(5, not show_quality)
         self._ensure_audio_store()
         store = self._audio_store

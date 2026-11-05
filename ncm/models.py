@@ -46,7 +46,9 @@ class Song:
 
     @property
     def artist_text(self) -> str:
-        return " / ".join(self.artists) if self.artists else "未知艺人"
+        # 接口偶尔给出 name: null，join 会直接抛 TypeError 把界面带崩
+        names = [str(a) for a in self.artists if a]
+        return " / ".join(names) if names else "未知艺人"
 
     @property
     def duration_text(self) -> str:
@@ -64,7 +66,11 @@ class Song:
         return cls(
             id=int(raw.get("id") or 0),
             name=raw.get("name") or "未知曲目",
-            artists=[a.get("name", "") for a in artists_raw if isinstance(a, dict)],
+            artists=[
+                str(a.get("name")).strip()
+                for a in artists_raw
+                if isinstance(a, dict) and a.get("name")
+            ],
             album=album_raw.get("name") or "",
             duration_ms=int(raw.get("dt") or raw.get("duration") or 0),
             track_no=int(raw.get("no") or 0),

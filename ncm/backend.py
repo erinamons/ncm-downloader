@@ -41,6 +41,14 @@ class Backend(Protocol):
 
     def playlist(self, playlist_id: int) -> Playlist: ...
 
+    def album(self, album_id: int) -> Playlist: ...
+
+    def expand_link(self, url: str) -> str:
+        """跟随 163cn.tv 短链的跳转，拿到带 id 的完整地址。"""
+        with self._lock:
+            resp = self.session.head(url, allow_redirects=True, timeout=self.timeout)
+        return resp.url or url
+
     def song_url(self, song_id: int, level: str = "exhigh") -> AudioSource: ...
 
     def lyric(self, song_id: int) -> tuple[str, str]: ...
@@ -145,33 +153,61 @@ class LocalBackend:
         )
         raw = meta.get("playlist") or {}
         if not raw:
-            raise BackendError(f"歌单 {playlist_id} 不存在或不可见")
+            raise BackendError(
+                f"歌单 {playlist_id} 打不开：可能已删除、设成私密，或需要登录才能查看"
+            )
+
         songs = [Song.from_api(item) for item in (raw.get("tracks") or [])]
-        total = int(raw.get("trackCount") or len(songs))
-        if len(songs) < total:
-            songs = self._playlist_tracks(playlist_id, total)
+        # trackIds 才是完整曲目表：detail 的 tracks 最多给 1000 首，
+        # 而且 trackCount 经常是旧值（实测有过 53 对 54 的情况），不能拿来当准
+        ids: list[int] = []
+        for item in raw.get("trackIds") or []:
+            try:
+                ids.append(int(item.get("id")))
+            except (TypeError, ValueError):
+                continue
+        ids = list(dict.fromkeys(ids))  # 去重且保持歌单顺序
+
+        got = {song.id for song in songs}
+        missing = [ident for ident in ids if ident not in got]
+        if missing:
+            songs.extend(self._songs_by_ids(missing))
+        if ids:
+            # 按 trackIds 排序，保证和客户端里看到的顺序一致
+            by_id = {song.id: song for song in songs}
+            songs = [by_id[ident] for ident in ids if ident in by_id]
+
         creator = (raw.get("creator") or {}).get("nickname", "")
         return Playlist(
             id=playlist_id,
             name=raw.get("name") or f"歌单{playlist_id}",
             creator=creator,
             songs=songs,
-            track_count=total,
+            track_count=len(songs),
         )
 
-    def _playlist_tracks(self, playlist_id: int, total: int) -> list[Song]:
+    def album(self, album_id: int) -> Playlist:
+        """专辑：/api/v1/album 才带 songs，v6 路径是 404。"""
+        data = self._api(f"/api/v1/album/{album_id}", {})
+        raw = data.get("album") or {}
+        if not raw:
+            raise BackendError(f"专辑 {album_id} 打不开：可能已下架或需要登录")
+        songs = [Song.from_api(item) for item in (data.get("songs") or [])]
+        artist = (raw.get("artist") or {}).get("name", "")
+        return Playlist(
+            id=album_id,
+            name=raw.get("name") or f"专辑{album_id}",
+            creator=artist,
+            songs=songs,
+            track_count=len(songs),
+        )
+
+    def _songs_by_ids(self, song_ids: list[int], chunk: int = 200) -> list[Song]:
         songs: list[Song] = []
-        offset = 0
-        while offset < total:
-            data = self._api(
-                "/api/v6/playlist/track/all",
-                {"id": playlist_id, "limit": 500, "offset": offset},
-            )
-            batch = [Song.from_api(item) for item in (data.get("songs") or [])]
-            if not batch:
-                break
-            songs.extend(batch)
-            offset += len(batch)
+        for start in range(0, len(song_ids), chunk):
+            batch = song_ids[start : start + chunk]
+            data = self._api("/api/song/detail", {"ids": json.dumps(batch)})
+            songs.extend(Song.from_api(item) for item in (data.get("songs") or []))
         return songs
 
     def song_url(self, song_id: int, level: str = "exhigh") -> AudioSource:
