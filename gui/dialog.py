@@ -143,15 +143,23 @@ class RoundDialog(QDialog):
         # 「保存 / 取消」就被顶到看不见的地方，用户只能瞎点
         footer = QWidget(self._root)
         footer.setObjectName("dialogFooter")
-        # 加一条分隔线：内容滚到边缘时，没有线会分不清「被裁掉的正文」和按钮区
+        # 背景必须透明：QWidget 一旦设了 stylesheet 就会用调色板底色铺满，
+        # 铺成实色方块后会把 windowRoot 的下半部分圆角盖成直角
+        footer.setAttribute(Qt.WA_StyledBackground, True)
         footer.setStyleSheet(
-            "QWidget#dialogFooter { border-top: 1px solid #2c2c33; }"
+            "QWidget#dialogFooter { background: transparent;"
+            " border-top: 1px solid #2c2c33; }"
         )
         footer_layout = QVBoxLayout(footer)
-        footer_layout.setContentsMargins(18, 0, 18, 14)
+        # 上边留白把分隔线让开，底部多留一点，按钮别贴着圆角
+        footer_layout.setContentsMargins(18, 12, 18, 16)
         footer_layout.setSpacing(0)
         for box in self.body.findChildren(QDialogButtonBox):
             self.body_layout.removeWidget(box)
+            # 按钮统一高度、拉开间距，默认间距在深色下显得挤
+            box.layout().setSpacing(10) if box.layout() else None
+            for button in box.buttons():
+                button.setMinimumSize(78, 32)
             footer_layout.addWidget(box)
 
         stack = self._root.layout()
