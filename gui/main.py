@@ -33,6 +33,7 @@ from PyQt5.QtGui import (
 from PyQt5.QtCore import QEvent
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QSizePolicy,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -245,7 +246,7 @@ class SettingsDialog(RoundDialog):
         parent=None,
         busy: bool = False,
     ):
-        super().__init__(parent, "设置", width=548)
+        super().__init__(parent, "设置", width=620)
         self._settings = settings
         self.out_dir = Path(out_dir)
         # 批量下载进行中就锁住保存目录：这一批还在往老目录写，改了会分叉出两份索引
@@ -315,6 +316,9 @@ class SettingsDialog(RoundDialog):
         dir_row.setSpacing(8)
         self.dir_value = QLabel()
         self.dir_value.setObjectName("muted")
+        # 路径很长时允许被压缩：不然它会把整行撑宽，左边标签被挤出可视区
+        self.dir_value.setMinimumWidth(0)
+        self.dir_value.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         dir_row.addWidget(self.dir_value, 1)
         btn_pick = QPushButton("更改")
         btn_pick.setFixedHeight(30)
@@ -327,9 +331,11 @@ class SettingsDialog(RoundDialog):
         form.addRow("保存目录", dir_row)
 
         cache_row = QHBoxLayout()
-        cache_row.setSpacing(8)
+        cache_row.setSpacing(6)
         self.cache_value = QLabel()
         self.cache_value.setObjectName("muted")
+        self.cache_value.setMinimumWidth(0)
+        self.cache_value.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         cache_row.addWidget(self.cache_value, 1)
         btn_detect = QPushButton("自动检测")
         btn_detect.setFixedHeight(30)
@@ -538,8 +544,8 @@ class SettingsDialog(RoundDialog):
 
     def _refresh_dir_text(self) -> None:
         text = str(self.out_dir)
-        if len(text) > 42:
-            text = "…" + text[-41:]
+        if len(text) > 30:
+            text = "…" + text[-29:]
         self.dir_value.setText(text)
         self.dir_value.setToolTip(str(self.out_dir))
 
@@ -560,8 +566,8 @@ class SettingsDialog(RoundDialog):
             )
             return
         text = str(path)
-        if len(text) > 38:
-            text = "…" + text[-37:]
+        if len(text) > 30:
+            text = "…" + text[-29:]
         self.cache_value.setText(text)
         # 选错目录时给个提示，不然「仅缓存」一直是空的没人知道原因
         if cache_mod.looks_like_cache_dir(path):
