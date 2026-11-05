@@ -34,3 +34,6 @@ settings.ini
 app.log
 app.log.*
 *.log
+
+# 缓存存档是用户数据（含音频与歌单），绝不入库
+cache-store/

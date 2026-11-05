@@ -166,3 +166,20 @@ def clear() -> tuple[int, int]:
         count += 1
         total += size
     return (count, total)
+
+
+def touch(song_id: int, interval: int = 86400) -> bool:
+    """播放/导出命中存档时刷新访问时间，让淘汰真的按「最久未访问」。
+
+    只在超过一天没更新时写盘：常听的歌会持续续期，又不至于每播一首都写 json。
+    """
+    index = load()
+    item = index.get(song_id)
+    if not item:
+        return False
+    now = int(time.time())
+    if now - int(item.get("at", 0)) < interval:
+        return False
+    item["at"] = now
+    save(index)
+    return True

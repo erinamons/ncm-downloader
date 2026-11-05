@@ -8,7 +8,17 @@ from __future__ import annotations
 
 from PyQt5.QtCore import QPoint, QSize, Qt
 from PyQt5.QtGui import QPainter
-from PyQt5.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PyQt5.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
 
 from gui import icons
 from gui.shadow import clip_outside_window, render_shadow
@@ -113,6 +123,47 @@ class RoundDialog(QDialog):
 
         self._centered = False
         self._shadow = None
+
+    def make_scrollable(self, max_height: int = 640) -> None:
+        """内容可能超出屏幕的对话框（比如设置）套一层滚动。
+
+        小屏幕只有 768 高，设置项一多按钮就被顶出可视区，用户既看不到也点不着。
+        """
+        if getattr(self, "_scrolled", False):
+            return
+        self._scrolled = True
+        wrap = QScrollArea(self._root)
+        wrap.setWidgetResizable(True)
+        wrap.setFrameShape(QFrame.NoFrame)
+        wrap.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        wrap.viewport().setAutoFillBackground(False)
+        wrap.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+
+        # 按钮行必须留在滚动区外面：跟着内容一起滚的话，内容一长
+        # 「保存 / 取消」就被顶到看不见的地方，用户只能瞎点
+        footer = QWidget(self._root)
+        footer.setObjectName("dialogFooter")
+        # 加一条分隔线：内容滚到边缘时，没有线会分不清「被裁掉的正文」和按钮区
+        footer.setStyleSheet(
+            "QWidget#dialogFooter { border-top: 1px solid #2c2c33; }"
+        )
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(18, 0, 18, 14)
+        footer_layout.setSpacing(0)
+        for box in self.body.findChildren(QDialogButtonBox):
+            self.body_layout.removeWidget(box)
+            footer_layout.addWidget(box)
+
+        stack = self._root.layout()
+        stack.removeWidget(self.body)
+        wrap.setWidget(self.body)
+        stack.addWidget(wrap, 1)
+        stack.addWidget(footer)
+
+        # 滚动区的 sizeHint 很小，不撑一下对话框会缩成 470 那种矮条。
+        # 这里按内容高度撑开，超过上限才真的滚动。
+        content = self.body.sizeHint().height() + footer.sizeHint().height() + 60
+        self.setFixedHeight(min(content, max_height) + SHADOW * 2)
 
     # 阴影与主窗口同一套素材
     def paintEvent(self, event) -> None:

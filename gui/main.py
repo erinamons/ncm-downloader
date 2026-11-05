@@ -243,10 +243,14 @@ class SettingsDialog(RoundDialog):
         out_dir: Path,
         cache_dir: Path | None = None,
         parent=None,
+        busy: bool = False,
     ):
         super().__init__(parent, "设置", width=548)
         self._settings = settings
         self.out_dir = Path(out_dir)
+        # 批量下载进行中就锁住保存目录：这一批还在往老目录写，改了会分叉出两份索引
+        self._busy = busy
+        self.logged_out = False
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.changed = False
 
@@ -316,6 +320,9 @@ class SettingsDialog(RoundDialog):
         btn_pick.setFixedHeight(30)
         btn_pick.setMinimumWidth(58)
         btn_pick.clicked.connect(self._pick_dir)
+        if self._busy:
+            btn_pick.setEnabled(False)
+            btn_pick.setToolTip("下载进行中，完成后才能改保存目录")
         dir_row.addWidget(btn_pick)
         form.addRow("保存目录", dir_row)
 
@@ -351,6 +358,20 @@ class SettingsDialog(RoundDialog):
         btn_play_cache.clicked.connect(self._clear_play_cache)
         play_row.addWidget(btn_play_cache)
         form.addRow("播放缓存", play_row)
+
+        # 下载中断会留下 .part，默认保留是为了续传；用户想收空间得有个入口
+        part_row = QHBoxLayout()
+        part_row.setSpacing(8)
+        self.part_state = QLabel("中断下载的临时文件，保留可续传")
+        self.part_state.setObjectName("muted")
+        part_row.addWidget(self.part_state, 1)
+        btn_clear_part = QPushButton("清理")
+        btn_clear_part.setFixedHeight(30)
+        btn_clear_part.setMinimumWidth(58)
+        btn_clear_part.setToolTip("删掉保存目录下所有 .part，未下完的歌下次要从头下")
+        btn_clear_part.clicked.connect(self._clear_parts)
+        part_row.addWidget(btn_clear_part)
+        form.addRow("下载残留", part_row)
 
         # 客户端只留很有限的播放缓存，换歌可能把上一首删掉；开启后由我们自己留一份
         keep_row = QHBoxLayout()
@@ -447,6 +468,8 @@ class SettingsDialog(RoundDialog):
         layout.addWidget(buttons)
 
         self._refresh_account()
+        # 设置项越加越多，小屏幕上得能滚
+        self.make_scrollable(640)
 
     def _refresh_account(self) -> None:
         if not auth.load_cookie():
@@ -471,6 +494,8 @@ class SettingsDialog(RoundDialog):
     def _logout(self) -> None:
         auth.clear_login()
         self.changed = True
+        # 让主窗口知道登录态没了，好把上一个账号的结果清掉
+        self.logged_out = True
         self._refresh_account()
 
     def _refresh_preview(self) -> None:
@@ -567,6 +592,44 @@ class SettingsDialog(RoundDialog):
             self.cache_store_state.setText(f"{total / 1048576:.0f} MB")
         else:
             self.cache_store_state.setText("空")
+
+    def _clear_parts(self) -> None:
+        """删掉保存目录里没下完的 .part。先算清楚再问，别一声不响删。"""
+        try:
+            files = list(self.out_dir.rglob("*.part")) if self.out_dir.exists() else []
+        except OSError:
+            files = []
+        if not files:
+            self.part_state.setText("没有残留文件")
+            return
+        total = 0
+        for path in files:
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+        answer = QMessageBox.question(
+            self,
+            "清理下载残留",
+            f"找到 {len(files)} 个未完成的临时文件，共 {total / 1048576:.1f} MB。\n"
+            "删掉后这些歌下次要重新下载，确定清理吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        removed = 0
+        freed = 0
+        for path in files:
+            try:
+                size = path.stat().st_size
+                path.unlink()
+            except OSError:
+                continue
+            removed += 1
+            freed += size
+        self.part_state.setText(f"已清理 {removed} 个，释放 {freed / 1048576:.1f} MB")
+        self.part_state.setStyleSheet("color:#4caf7d;")
 
     def _clear_cache_store(self) -> None:
         from ncm import archive as archive_mod
@@ -1105,6 +1168,8 @@ class MainWindow(QMainWindow):
             if item:
                 stored = archive_mod.path_of(item)
                 if stored is not None:
+                    # 记一次访问，否则淘汰按写入时间算，常听的歌反而先被删
+                    archive_mod.touch(song.id)
                     return stored
 
         from ncm import cache as cache_mod
@@ -2289,6 +2354,8 @@ class MainWindow(QMainWindow):
             self._cache_rates.get(song.id) for song in self.songs
         )
         table.setColumnHidden(5, not show_quality)
+        self._ensure_audio_store()
+        store = self._audio_store
         table.blockSignals(True)
         table.setRowCount(len(self.songs))
         for row, song in enumerate(self.songs):
@@ -2297,8 +2364,15 @@ class MainWindow(QMainWindow):
             check.setCheckState(Qt.Checked)
             table.setItem(row, 0, check)
 
-            name = QTableWidgetItem(song.name)
-            name.setToolTip(f"{song.name}\n{song.artist_text} · {song.album}\nid {song.id}")
+            # 已落盘的加个 ✓：搜索时一眼能看出哪些不用再下
+            done_before = store is not None and store.done(song.id)
+            name = QTableWidgetItem(f"\u2713 {song.name}" if done_before else song.name)
+            name.setToolTip(
+                f"{song.name}\n{song.artist_text} · {song.album}\nid {song.id}"
+                + ("\n已下载" if done_before else "")
+            )
+            if done_before:
+                name.setForeground(QColor("#7fbf9a"))
             table.setItem(row, 1, name)
 
             artist = QTableWidgetItem(song.artist_text)
@@ -2501,15 +2575,24 @@ class MainWindow(QMainWindow):
             free = shutil.disk_usage(probe).free
         except OSError:
             return True
-        # 单曲按 12 MB 估，再留 256 MB 余量给转码临时文件
-        need = len(songs) * 12 * 1024 * 1024 + 256 * 1024 * 1024
+        # 按当前音质估单曲体积：以前统一按 12 MB，无损实际 30-50 MB，
+        # 估少一半会「检查通过但下到一半失败」，还不如按档位分开算
+        per_song = {
+            "standard": 8,
+            "higher": 12,
+            "exhigh": 16,
+            "lossless": 38,
+            "hires": 65,
+        }.get(self.level_box.currentData() or "", 16)
+        need = len(songs) * per_song * 1024 * 1024 + 256 * 1024 * 1024
         if free >= need:
             return True
         QMessageBox.warning(
             self,
             "空间不够",
-            f"目标盘剩余 {free / 1073741824:.1f} GB，本次大约需要 "
-            f"{need / 1073741824:.1f} GB。\n请清理空间或换个保存目录。",
+            f"目标盘剩余 {free / 1073741824:.1f} GB，按当前音质"
+            f"（每首约 {per_song} MB）大约需要 {need / 1073741824:.1f} GB。\n"
+            "请清理空间或换个保存目录。",
         )
         self.status_label.setText("空间不足，已取消下载")
         return False
@@ -2602,7 +2685,10 @@ class MainWindow(QMainWindow):
             self.play_index = row
             self.player.play_local(self._queue_songs[row], path)
         elif chosen is act_reveal and path:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+            try:
+                subprocess.Popen(["explorer", "/select,", str(path)])
+            except OSError:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
         elif chosen is act_copy and path:
             QApplication.clipboard().setText(str(path))
             self.status_label.setText("已复制文件路径")
@@ -2875,12 +2961,32 @@ class MainWindow(QMainWindow):
             self.out_dir = Path(chosen)
             self.settings.setValue("out_dir", str(self.out_dir))
     
+    def _drop_account_state(self) -> None:
+        """退出登录后清掉上一个账号留下的结果，避免看着还能下、点下去全失败。"""
+        self._detail_cache.clear()
+        self._pools.clear()
+        self.songs = []
+        self._list_cleared = False
+        self._fill_result_table()
+        self.result_info.setText("已退出登录，重新搜索或选择音源")
+        self._update_empty_hint()
+        self._update_download_button()
+        self.status_label.setText("已退出登录")
+
     def _open_settings(self) -> None:
-        dialog = SettingsDialog(self.settings, self.out_dir, self.cache_dir, self)
+        dialog = SettingsDialog(
+            self.settings,
+            self.out_dir,
+            self.cache_dir,
+            self,
+            busy=self.batch is not None,
+        )
         accepted = dialog.exec_() == QDialog.Accepted
         # 登录状态和「保存」是两件事：扫码成功就已经写进配置了，
         # 用户点不点保存都该在状态栏立刻反映出来
         self._refresh_account_label()
+        if dialog.logged_out:
+            self._drop_account_state()
         if not accepted:
             if dialog.changed:
                 self.status_label.setText("登录状态已更新")
@@ -2891,7 +2997,12 @@ class MainWindow(QMainWindow):
             self.to_mp3 = dialog.to_mp3.isChecked()
             self.name_pattern = dialog.name_box.currentData()
             self.folder_pattern = dialog.folder_box.currentData()
-            self.out_dir = dialog.out_dir
+            if dialog.out_dir != self.out_dir:
+                self.out_dir = dialog.out_dir
+                # 索引是按目录存的，换了目录必须换库，否则「已下载」永远查的是老地方
+                if self._audio_store is not None:
+                    self._audio_store.close()
+                    self._audio_store = None
             self.settings.setValue("workers", self.workers)
             self.settings.setValue("to_mp3", self.to_mp3)
             self.settings.setValue("name_pattern", self.name_pattern)
