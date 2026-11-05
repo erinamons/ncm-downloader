@@ -115,6 +115,7 @@ class Downloader:
         cache_dir: Path | str | None = None,
         to_mp3: bool = False,
         mp3_bitrate: str = "auto",
+        partial_fallback: bool = True,
     ):
         self.backend = backend
         self.store = store
@@ -126,6 +127,8 @@ class Downloader:
         self.with_lyric = with_lyric
         self.force = force
         self.source = source if source in SOURCES else "auto"
+        # 缓存只写了一半时怎么办：True=联网取完整版，False=跳过（不产生半截文件）
+        self.partial_fallback = partial_fallback
         self.to_mp3 = to_mp3
         self.mp3_bitrate = mp3_bitrate
         self._printed = threading.Lock()
@@ -237,11 +240,23 @@ class Downloader:
                 quality="", message="记录已存在",
             )
 
+        partial = False
         if self.source in ("auto", "cache"):
             entry = self._cache.get(song.id)
             if entry is not None:
-                return self._from_cache(song, entry)
-            if self.source == "cache":
+                if entry.complete:
+                    return self._from_cache(song, entry)
+                # 缓存只写了一半（客户端边听边写，没听完就是半截）。
+                # 直接导出会得到一首残缺的歌，所以默认联网取完整版；
+                # 明确关掉联网补齐时宁可跳过，也不产出半截文件。
+                if self.source == "cache" and not self.partial_fallback:
+                    return TaskResult(
+                        song,
+                        CACHE_MISS,
+                        message="缓存未下完，已跳过（未开启联网补齐）",
+                    )
+                partial = True
+            elif self.source == "cache":
                 return TaskResult(song, CACHE_MISS, message="本地缓存里没有这首")
 
         resolved = self._resolve(song)
@@ -283,9 +298,9 @@ class Downloader:
 
         os.replace(part, target)
 
-        note = ""
+        note = "（缓存未完整，已联网补齐）" if partial else ""
         if src.degraded:
-            note = f"（请求 {self.level}，实得 {src.br // 1000}k）"
+            note += f"（请求 {self.level}，实得 {src.br // 1000}k）"
         target, extra = self._maybe_transcode(target)
         note += extra
         if self.with_lyric or self.with_cover:

@@ -413,6 +413,21 @@ class SettingsDialog(RoundDialog):
         self.keep_cache.stateChanged.connect(lambda _=0: self._refresh_store_state())
         self._refresh_store_state()
 
+        # 客户端边听边写缓存，没听完的就是半截；导出时得决定拿它怎么办
+        partial_row = QHBoxLayout()
+        partial_row.setSpacing(8)
+        self.partial_fallback = QCheckBox("缓存未下完时联网补齐")
+        self.partial_fallback.setChecked(
+            settings.value("partial_fallback", True, type=bool)
+        )
+        self.partial_fallback.setToolTip(
+            "客户端是边听边缓存的，没听完的歌只有半截。\n"
+            "勾选：导出这些歌时自动联网取完整版（推荐）。\n"
+            "不勾：直接跳过，不会生成半截的文件。"
+        )
+        partial_row.addWidget(self.partial_fallback, 1)
+        form.addRow("未缓存完", partial_row)
+
         self.startup_view = QComboBox()
         self.startup_view.addItem("标准窗口", "full")
         self.startup_view.addItem("紧凑模式", "mini")
@@ -2778,7 +2793,22 @@ class MainWindow(QMainWindow):
             source=source,
             to_mp3=self.to_mp3,
             cache_dir=self.cache_dir,
+            partial_fallback=bool(
+                self.settings.value("partial_fallback", True, type=bool)
+            ),
         )
+
+        # 半截缓存要么联网补齐、要么跳过，先说清楚，免得用户以为歌被吞了
+        partial_count = sum(1 for song in songs if song.id in self._cache_partial)
+        if partial_count:
+            if self.settings.value("partial_fallback", True, type=bool):
+                self.status_label.setText(
+                    f"{partial_count} 首缓存未下完，正在联网补齐完整版"
+                )
+            else:
+                self.status_label.setText(
+                    f"{partial_count} 首缓存未下完，将按设置跳过"
+                )
 
         self._prepare_queue(songs)
         self._batch_songs = list(songs)
@@ -3027,6 +3057,8 @@ class MainWindow(QMainWindow):
                 buckets["磁盘空间不足"] += 1
             elif any(k in text for k in ("超时", "timeout", "connection", "网络", "中断")):
                 buckets["网络问题"] += 1
+            elif "缓存未下完" in text:
+                buckets["缓存未下完"] += 1
             elif "不完整" in text:
                 buckets["下载不完整"] += 1
             else:
@@ -3153,6 +3185,9 @@ class MainWindow(QMainWindow):
             self.to_mp3 = dialog.to_mp3.isChecked()
             self.name_pattern = dialog.name_box.currentData()
             self.folder_pattern = dialog.folder_box.currentData()
+            self.settings.setValue(
+                "partial_fallback", dialog.partial_fallback.isChecked()
+            )
             if dialog.out_dir != self.out_dir:
                 self.out_dir = dialog.out_dir
                 # 索引是按目录存的，换了目录必须换库，否则「已下载」永远查的是老地方
