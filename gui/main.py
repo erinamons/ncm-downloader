@@ -619,6 +619,10 @@ class SettingsDialog(RoundDialog):
             f"  未缓存完：{stats['partial']}（仍会列出来，导出可能只有片段）",
             f"  小于 100 KB：{stats['tiny']}（碎片，列表里会略过）",
         ]
+        if stats.get("dirs"):
+            lines.append("")
+            lines.append("按子目录分布：")
+            lines.extend(f"  {rel}：{n} 个" for rel, n in stats["dirs"][:6])
         if stats["unparsed"]:
             lines.append("")
             lines.append("文件名不符合 <id>-<档位>-<hash>.uc 的：")
@@ -2352,6 +2356,20 @@ class MainWindow(QMainWindow):
         all_entries = [e for e in cache_mod.scan(root) if e.size > 100_000]
         entries = all_entries
         self._cache_partial = {e.song_id for e in entries if not e.complete}
+        # 每次扫描都留一条记录：以后出现「有文件却不显示」时，翻日志就能看出
+        # 是文件根本没被扫到，还是被哪一步过滤掉了
+        try:
+            raw_files = len([p for p in Path(root).rglob("*.uc") if p.is_file()])
+        except OSError:
+            raw_files = -1
+        log.info(
+            "缓存扫描 %s：.uc 文件 %s 个，解析 %d，完整 %d，未完成 %d",
+            root,
+            raw_files,
+            len(entries),
+            len(entries) - len(self._cache_partial),
+            len(self._cache_partial),
+        )
         ids = [e.song_id for e in entries]
 
         # 详情走内存缓存：自动刷新每几秒就可能重扫一次，全量重请求接口太浪费，

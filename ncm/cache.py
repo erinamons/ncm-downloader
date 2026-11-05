@@ -47,7 +47,7 @@ def candidate_dirs() -> list[Path]:
     if not local:
         return []
     base = Path(local) / "Netease" / "CloudMusic"
-    return [base / "Cache" / "Cache", base / "Cache"]
+    return [base / "Cache", base / "Cache" / "Cache"]
 
 
 def default_cache_dir() -> Path | None:
@@ -69,7 +69,7 @@ def looks_like_cache_dir(path: Path | str) -> bool:
     if not root.is_dir():
         return False
     try:
-        for entry in root.iterdir():
+        for entry in root.rglob("*"):
             if entry.suffix.lower() in (".uc", ".idx"):
                 return True
     except OSError:
@@ -276,4 +276,15 @@ def report(cache_dir: Path | str) -> dict[str, object]:
     stats["unparsed"] = [p.name for p in files if p.name not in parsed_names][:5]
     recent = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[:3]
     stats["recent"] = [f"{p.name}（{p.stat().st_size / 1048576:.1f} MB）" for p in recent]
+
+    # 按子目录分组：不同客户端版本会把缓存摊到不同层，
+    # 「有文件却不显示」时先看文件到底躺在哪一层
+    groups: dict[str, int] = {}
+    for path in files:
+        try:
+            rel = str(path.parent.relative_to(root)) or "."
+        except ValueError:
+            rel = str(path.parent)
+        groups[rel] = groups.get(rel, 0) + 1
+    stats["dirs"] = sorted(groups.items(), key=lambda kv: -kv[1])
     return stats
