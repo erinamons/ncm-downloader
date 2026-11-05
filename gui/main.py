@@ -1106,6 +1106,7 @@ class MainWindow(QMainWindow):
         self.player.cover_ready.connect(self.topbar.set_cover)
         self.player.finished.connect(self._on_play_finished)
         self.player.failed.connect(self._on_play_failed)
+        self.player.notice.connect(lambda msg: self.status_label.setText(msg))
 
         bar = self.topbar
         bar.play_pause.connect(self.player.toggle)
@@ -1246,11 +1247,19 @@ class MainWindow(QMainWindow):
         if entry is None:
             return None
 
+        # 缓存可能还在写（客户端边听边缓存），扫描时的判断会过时；
+        # 半截的解出来断断续续，Qt 播几秒就「正常结束」，也不报错。
+        complete, covered, size = cache_mod.recheck(entry)
+        if not complete:
+            return None
+
         # 未登录时听 VIP 歌，客户端只缓存 30 秒试听片段；之后登录了再播，
         # 吃的还是这段残片。用「码率 × 体积」估一下时长，明显短于歌曲时长
         # 就当作试听片段跳过，让调用方走网络取完整版。
-        if entry.rate and entry.size and song.duration_ms:
-            cached_ms = entry.size * 8 / (entry.rate * 1000) * 1000
+        # 999 是无损的标记位、不是真实码率，按它估会算出离谱的时长，直接跳过判断。
+        real_size = covered or size
+        if entry.rate and entry.rate < 900 and real_size and song.duration_ms:
+            cached_ms = real_size * 8 / (entry.rate * 1000) * 1000
             if cached_ms < song.duration_ms * 0.6:
                 return None
 

@@ -1,7 +1,7 @@
 """网易云音乐下载工具核心包。"""
 from __future__ import annotations
 
-__version__ = "1.2.9"
+__version__ = "1.2.10"
 
 from .backend import Backend, BackendError, LocalBackend
 from .models import AudioSource, Playlist, Song

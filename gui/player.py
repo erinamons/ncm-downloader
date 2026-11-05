@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import os
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -144,6 +143,7 @@ class PlayerEngine(QObject):
     cover_ready = pyqtSignal(bytes)
     finished = pyqtSignal()
     failed = pyqtSignal(str)
+    notice = pyqtSignal(str)            # 给状态栏用的一句话提示
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -162,9 +162,18 @@ class PlayerEngine(QObject):
         self.local_provider: Callable[[Song], Path | None] | None = None
         self.remote_provider: Callable[[Song], tuple[str, str] | None] | None = None
 
-        self._temp = Path(tempfile.gettempdir()) / "ncm-player"
+        # 和其他缓存一样放在程序目录：系统 TEMP 可能被别的软件改成无写权限的
+        # 公共目录，那样网络播放会直接失败
+        from ncm import cache as cache_mod
+
+        self._temp = cache_mod.player_cache_dir()
         self._temp.mkdir(parents=True, exist_ok=True)
         self._clean_temp()
+        # 这一轮是否用了本地文件、是否已经试过「本地坏了改联网」
+        self._used_local = False
+        self._net_fallback = False
+        # 结束信号的瞬间 position 有时会被清零，用它兜一下
+        self._last_pos = 0
 
     # ---------------- 对外 ----------------
 
@@ -177,6 +186,9 @@ class PlayerEngine(QObject):
         self._token += 1
         token = self._token
         self._song = song
+        self._used_local = False
+        self._net_fallback = False
+        self._last_pos = 0
         self.started.emit(song)
         self.state_changed.emit(LOADING)
         threading.Thread(
@@ -248,11 +260,13 @@ class PlayerEngine(QObject):
             # 再按同样的顺序走一遍，只会得到同样的错误
             if not force_remote:
                 path = self.local_provider(song) if self.local_provider else None
+                self._used_local = path is not None
             if path is None:
                 path = self._download(song, token, fresh=force_remote)
             if path is None and force_remote and self.local_provider:
                 # 网络也没取到，退回本地：残片总比什么都没有强
                 path = self.local_provider(song)
+                self._used_local = path is not None
             if token != self._token:
                 return
             if path is None:
@@ -320,6 +334,7 @@ class PlayerEngine(QObject):
     # ---------------- 播放器信号 ----------------
 
     def _on_position(self, pos: int) -> None:
+        self._last_pos = pos
         self.position.emit(pos, self._player.duration())
 
     def _on_duration(self, dur: int) -> None:
@@ -332,8 +347,26 @@ class PlayerEngine(QObject):
             self.state_changed.emit(PAUSED)
 
     def _on_media_status(self, status) -> None:
-        if status == QMediaPlayer.EndOfMedia:
-            self.finished.emit()
+        if status != QMediaPlayer.EndOfMedia:
+            return
+        # 本地文件坏了（缓存没写完、下载中断）时，Qt 常常播几秒就当成「正常结束」，
+        # 既不报错也不提示。按已播时长判断，明显不够就联网重放一次。
+        expected = self._song.duration_ms if self._song else 0
+        played = max(self._player.position(), self._last_pos)
+        if (
+            self._used_local
+            and not self._net_fallback
+            and expected
+            and played < expected * 0.8
+        ):
+            self._net_fallback = True
+            self._used_local = False
+            self.notice.emit("本地文件不完整，已改用网络播放")
+            song = self._song
+            # 别在信号里直接重开播放器，等这次回调走完
+            QTimer.singleShot(0, lambda: self.play_song(song, force_remote=True))
+            return
+        self.finished.emit()
 
     def _on_error(self, *_args) -> None:
         message = self._player.errorString() or "播放失败"

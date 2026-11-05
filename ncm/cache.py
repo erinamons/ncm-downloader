@@ -144,6 +144,25 @@ def scan(cache_dir: Path | str, max_depth: int = 3) -> list[CacheEntry]:
     return entries
 
 
+def recheck(entry: CacheEntry) -> tuple[bool, int, int]:
+    """用之前重新读一遍 idx，返回 (是否完整, 已覆盖字节, 文件长度)。
+
+    缓存是边听边写的：扫描那一刻判成「完整」的文件，等到真的要播放时
+    可能还是半截（idx 是后写的）。播放前核一次，比信任旧快照可靠。
+    """
+    try:
+        size = entry.path.stat().st_size
+    except OSError:
+        return (False, 0, 0)
+    declared, covered = _read_idx(entry.path.with_suffix(".idx"))
+    if declared:
+        expected = max(declared, size)
+        complete = covered >= expected * 0.98 and size >= expected * 0.98
+    else:
+        complete = not entry.path.name.endswith("!")
+    return (complete, covered, size)
+
+
 def container_of(head: bytes) -> str:
     """根据已解密的文件头判断容器，返回扩展名。"""
     if len(head) >= 8 and head[4:8] == b"ftyp":
