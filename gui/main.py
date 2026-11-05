@@ -2396,8 +2396,13 @@ class MainWindow(QMainWindow):
             action.setEnabled(enabled)
 
         menu.addSeparator()
-        has_file = self._song_path(song) is not None
-        act_reveal = menu.addAction("在文件夹中显示")
+        target = self._song_path(song)
+        has_file = target is not None
+        # 缓存条目对应的是客户端那串哈希 .uc，叫「缓存目录」比「文件夹」准确
+        is_raw_cache = has_file and target.suffix.lower() == ".uc"
+        act_reveal = menu.addAction(
+            "在缓存目录中显示" if is_raw_cache else "在文件夹中显示"
+        )
         act_reveal.setData("reveal")
         act_reveal.setEnabled(has_file)
         menu.addSeparator()
@@ -2926,15 +2931,30 @@ class MainWindow(QMainWindow):
             self.account_label.setToolTip("在「设置」里扫码登录")
 
     def _song_path(self, song: Song) -> Path | None:
-        """这首歌已落盘的路径，没有就返回 None。"""
+        """这首歌在本机的文件：已下载 → 缓存存档 → 客户端缓存。
+
+        缓存列表里的歌大多只有客户端那份 .uc，之前只查下载记录，
+        右键「在文件夹中显示」永远是灰的。
+        """
         self._ensure_audio_store()
-        if self._audio_store is None:
-            return None
-        row = self._audio_store.get(song.id)
-        if not row:
-            return None
-        path = Path(row["path"])
-        return path if path.exists() else None
+        if self._audio_store is not None:
+            row = self._audio_store.get(song.id)
+            if row:
+                path = Path(row["path"])
+                if path.exists():
+                    return path
+
+        if self.settings.value("keep_cache", False, type=bool):
+            item = archive_mod.load().get(song.id)
+            if item:
+                stored = archive_mod.path_of(item)
+                if stored is not None:
+                    return stored
+
+        entry = self._cache_map().get(song.id)
+        if entry is not None and entry.path.exists():
+            return entry.path
+        return None
 
     def _reveal_song(self, song: Song) -> None:
         path = self._song_path(song)
@@ -2943,9 +2963,16 @@ class MainWindow(QMainWindow):
         # explorer /select 会把文件选中并在资源管理器里打开，比只开目录准确
         try:
             subprocess.Popen(["explorer", "/select,", str(path)])
-            self.status_label.setText(f"已在资源管理器中定位：{path.name}")
         except OSError as exc:  # noqa: BLE001
             self.status_label.setText(f"打不开资源管理器：{exc}")
+            return
+        if path.suffix.lower() == ".uc":
+            # 客户端缓存文件名是一串哈希，直接选中会让人以为找错了
+            self.status_label.setText(
+                f"已定位客户端缓存文件（{path.name}）：这是加密的缓存，不是可播放文件"
+            )
+        else:
+            self.status_label.setText(f"已在资源管理器中定位：{path.name}")
 
     def _open_dir(self) -> None:
         self.out_dir.mkdir(parents=True, exist_ok=True)
