@@ -341,6 +341,14 @@ class SettingsDialog(RoundDialog):
         btn_cache.setMinimumWidth(58)
         btn_cache.clicked.connect(self._pick_cache)
         cache_row.addWidget(btn_cache)
+        btn_report = QPushButton("诊断")
+        btn_report.setFixedHeight(30)
+        btn_report.setMinimumWidth(58)
+        btn_report.setToolTip(
+            "统计缓存目录里到底有多少 .uc、多少已下完，排查「有文件却不显示」"
+        )
+        btn_report.clicked.connect(self._show_cache_report)
+        cache_row.addWidget(btn_report)
         form.addRow("缓存目录", cache_row)
 
         # 未登录时听 VIP 歌会缓存成试听片段，登录后仍是残片；给个入口清掉
@@ -593,6 +601,34 @@ class SettingsDialog(RoundDialog):
         else:
             self.cache_store_state.setText("空")
 
+    def _show_cache_report(self) -> None:
+        from ncm import cache as cache_mod
+
+        root = self.cache_dir or cache_mod.default_cache_dir()
+        if not root:
+            QMessageBox.information(self, "缓存诊断", "还没找到缓存目录，先点「自动检测」。")
+            return
+        stats = cache_mod.report(root)
+        lines = [
+            f"目录：{stats['root']}",
+            f"是否存在：{'是' if stats['exists'] else '否'}",
+            "",
+            f".uc 文件：{stats['files']} 个",
+            f"可解析：{stats['parsed']} 个",
+            f"  已缓存完：{stats['complete']}",
+            f"  未缓存完：{stats['partial']}（仍会列出来，导出可能只有片段）",
+            f"  小于 100 KB：{stats['tiny']}（碎片，列表里会略过）",
+        ]
+        if stats["unparsed"]:
+            lines.append("")
+            lines.append("文件名不符合 <id>-<档位>-<hash>.uc 的：")
+            lines.extend(f"  {name}" for name in stats["unparsed"])
+        if stats["recent"]:
+            lines.append("")
+            lines.append("最近改动的三个文件：")
+            lines.extend(f"  {name}" for name in stats["recent"])
+        QMessageBox.information(self, "缓存诊断", "\n".join(lines))
+
     def _clear_parts(self) -> None:
         """删掉保存目录里没下完的 .part。先算清楚再问，别一声不响删。"""
         try:
@@ -715,6 +751,8 @@ class MainWindow(QMainWindow):
         self._shadow_timer.timeout.connect(self._rebuild_shadow)
         self._row_paths: dict[int, Path] = {}
         self._cache_rates: dict[int, str] = {}
+        # 缓存没下完的曲目 id，列表里要标注，免得用户以为能直接导出
+        self._cache_partial: set[int] = set()
         # 曲目详情的内存缓存：缓存自动刷新很频繁，避免反复请求接口
         self._detail_cache: dict[int, Song] = {}
         # 活着的后台任务：只靠 self.task 一个引用不够，旧任务的 finished
@@ -2308,9 +2346,12 @@ class MainWindow(QMainWindow):
                 "没找到客户端缓存目录，请在「设置 → 缓存目录」里指定"
             )
 
-        entries = [
-            e for e in cache_mod.scan(root) if e.complete and e.size > 200_000
-        ]
+        # 不完整也要列出来：客户端是边听边缓存，没听完的歌 zone 覆盖不满，
+        # 以前一律过滤，表现就是「明明有缓存文件，列表只剩一首」。
+        # 阈值只用来挡碎片文件，不用来挡没下完的歌。
+        all_entries = [e for e in cache_mod.scan(root) if e.size > 100_000]
+        entries = all_entries
+        self._cache_partial = {e.song_id for e in entries if not e.complete}
         ids = [e.song_id for e in entries]
 
         # 详情走内存缓存：自动刷新每几秒就可能重扫一次，全量重请求接口太浪费，
@@ -2337,7 +2378,8 @@ class MainWindow(QMainWindow):
         keep = self.settings.value("keep_cache", False, type=bool)
         index = archive_mod.load() if keep else {}
         if keep:
-            pending = [e for e in entries if e.song_id not in index]
+            # 只留完整的：半截缓存解出来也是半截，白占空间
+            pending = [e for e in entries if e.complete and e.song_id not in index]
             for done, entry in enumerate(pending, 1):
                 archive_mod.store(entry, details.get(entry.song_id), index)
                 if progress and (done % 3 == 0 or done == len(pending)):
@@ -2379,11 +2421,14 @@ class MainWindow(QMainWindow):
         for entry in entries:
             self._cache_rates.setdefault(entry.song_id, entry.rate_label)
 
-        live = len([e for e in entries if e.song_id in seen])
-        if keep:
-            title = f"本地缓存（存档 {len(seen)} 首 / 当前在缓存 {live} 首）"
-        else:
-            title = f"本地缓存（{len(ordered)} 首）"
+        partial = len([s for s in ordered if s.id in self._cache_partial])
+        # 数量由 _apply_view 统一追加「共 N 首」，这里只补充额外说明
+        extras = []
+        if keep and index:
+            extras.append(f"已存档 {len(index)}")
+        if partial:
+            extras.append(f"{partial} 首未缓存完")
+        title = "本地缓存" + (f" · {' · '.join(extras)}" if extras else "")
         return (title, ordered)
 
     def _song_from_archive(self, song_id: int, item: dict) -> Song:
@@ -2456,6 +2501,10 @@ class MainWindow(QMainWindow):
             )
             if done_before:
                 name.setForeground(QColor("#7fbf9a"))
+            elif song.id in self._cache_partial:
+                # 缓存没下完：还能看到，但别让用户以为能整首导出
+                name.setToolTip(name.toolTip() + "\n缓存未下完，导出可能只有片段")
+                name.setForeground(QColor("#c9a86a"))
             table.setItem(row, 1, name)
 
             artist = QTableWidgetItem(song.artist_text)

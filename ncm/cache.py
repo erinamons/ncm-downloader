@@ -246,3 +246,34 @@ def purge_legacy_player_cache() -> int:
     except OSError:
         pass
     return removed
+
+
+def report(cache_dir: Path | str) -> dict[str, object]:
+    """给「缓存诊断」用：把目录里到底有什么、为什么没进列表说清楚。"""
+    root = Path(cache_dir)
+    stats: dict[str, object] = {
+        "root": str(root),
+        "exists": root.is_dir(),
+        "files": 0,
+        "parsed": 0,
+        "complete": 0,
+        "partial": 0,
+        "tiny": 0,
+        "unparsed": [],
+        "recent": [],
+    }
+    if not root.is_dir():
+        return stats
+
+    files = [p for p in root.rglob("*.uc") if p.is_file()]
+    stats["files"] = len(files)
+    entries = scan(root)
+    stats["parsed"] = len(entries)
+    stats["complete"] = sum(1 for e in entries if e.complete)
+    stats["partial"] = sum(1 for e in entries if not e.complete)
+    stats["tiny"] = sum(1 for e in entries if e.size <= 100_000)
+    parsed_names = {e.path.name for e in entries}
+    stats["unparsed"] = [p.name for p in files if p.name not in parsed_names][:5]
+    recent = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[:3]
+    stats["recent"] = [f"{p.name}（{p.stat().st_size / 1048576:.1f} MB）" for p in recent]
+    return stats
