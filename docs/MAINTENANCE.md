@@ -156,6 +156,10 @@ painter.fillRect(QRectF(w - margin, margin, margin, h - margin*2), tint)
 | 缓存列表只有一首 | `scan()` 只 `glob("*.uc")` 扫顶层，而部分客户端版本把缓存放在子目录 | 改递归扫描，`max_depth=3` |
 | 缓存视图不自动更新 | Windows 上 `QFileSystemWatcher` 大批增删后静默失效 | 监听自愈重挂 + 8 秒指纹轮询兜底 |
 | 客户端删掉旧缓存后列表里没了 | 客户端只保留极少的播放缓存 | 「缓存存档」（设置里开启），扫描时解密留存一份，上限 2 GB |
+| 媒体键注册失败 | `RegisterHotKey` 返回 1409，网易云客户端自己也占了媒体键 | 静默跳过，托盘菜单仍可控制；不要改注册方式硬抢，会抢掉别的播放器 |
+| ctypes 调 RegisterHotKey 拿不到错误码 | 没声明 argtypes/restype，64 位下 HWND 被截断且 `get_last_error` 无效 | 用 `ctypes.WinDLL("user32", use_last_error=True)` 并显式声明 argtypes |
+| 普通 QWidget 设了 QSS 背景却不显示 | 需要 `WA_StyledBackground` | 补丁类控件记得打开 |
+| 盖住滚动条上段无效 | 滚动条容器后绘制，`raise_()` 改不了层序 | 直接改 `qt_scrollarea_vcontainer` 几何，把滚动条压到表头下方 |
 
 ## 二、文件都写到哪了
 

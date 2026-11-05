@@ -10,18 +10,27 @@ from ncm.models import Song
 
 
 class Task(QThread):
-    """跑一个可调用对象，结果通过信号回主线程。"""
+    """跑一个可调用对象，结果通过信号回主线程。
+
+    wants_progress=True 时，可调用对象会多收到一个 emit 函数，用来往状态栏
+    推「3/50」这类进度——缓存存档要从几十个文件里解密时，光转圈用户会以为卡死。
+    """
 
     ok = pyqtSignal(object)
     fail = pyqtSignal(str)
+    progress = pyqtSignal(str)
 
-    def __init__(self, fn: Callable[[], Any], parent=None):
+    def __init__(self, fn: Callable[..., Any], parent=None, wants_progress: bool = False):
         super().__init__(parent)
         self._fn = fn
+        self._wants_progress = wants_progress
 
     def run(self) -> None:
         try:
-            self.ok.emit(self._fn())
+            if self._wants_progress:
+                self.ok.emit(self._fn(lambda msg: self.progress.emit(msg)))
+            else:
+                self.ok.emit(self._fn())
         except Exception as exc:  # noqa: BLE001
             self.fail.emit(str(exc))
 

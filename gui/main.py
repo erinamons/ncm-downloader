@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import subprocess
 from collections import Counter
 from pathlib import Path
 
@@ -36,6 +38,7 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QMessageBox,
     QFileDialog,
     QFormLayout,
     QGraphicsOpacityEffect,
@@ -417,6 +420,18 @@ class SettingsDialog(RoundDialog):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
+        # 便携版的配置、日志、缓存都在程序目录，反馈问题时要能一键找到
+        link_row = QHBoxLayout()
+        link_row.setSpacing(12)
+        btn_open_data = QPushButton("打开配置目录")
+        btn_open_data.setFlat(True)
+        btn_open_data.setCursor(Qt.PointingHandCursor)
+        btn_open_data.setStyleSheet("color:#7aa7d8;text-align:left;")
+        btn_open_data.clicked.connect(self._open_data_dir)
+        link_row.addWidget(btn_open_data)
+        link_row.addStretch(1)
+        layout.addLayout(link_row)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self
         )
@@ -537,6 +552,13 @@ class SettingsDialog(RoundDialog):
             self.play_cache_state.setStyleSheet("")
         self.changed = True
 
+    def _open_data_dir(self) -> None:
+        from ncm import paths
+
+        target = paths.data_dir()
+        target.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
     def _refresh_store_state(self) -> None:
         from ncm import archive as archive_mod
 
@@ -617,6 +639,10 @@ class MainWindow(QMainWindow):
         self._queue_songs: list[Song] = []
         self._batch_done = 0
         self._batch_total = 0
+        # 暂停/继续：记住这批有哪些歌、已经跑完哪些
+        self._batch_songs: list[Song] = []
+        self._done_ids: set[int] = set()
+        self._paused = False
         self._audio_store: Store | None = None
         self._cache_entries: dict[int, object] | None = None
         self._shadow: QPixmap | None = None
@@ -626,6 +652,8 @@ class MainWindow(QMainWindow):
         self._shadow_timer.timeout.connect(self._rebuild_shadow)
         self._row_paths: dict[int, Path] = {}
         self._cache_rates: dict[int, str] = {}
+        # 曲目详情的内存缓存：缓存自动刷新很频繁，避免反复请求接口
+        self._detail_cache: dict[int, Song] = {}
         self.store: Store | None = None
         self.downloader: Downloader | None = None
         self.task: Task | None = None
@@ -647,8 +675,9 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("网易云音乐下载器")
         icon = Path(__file__).parent / "assets" / "app.ico"
+        self._app_icon = QIcon(str(icon)) if icon.exists() else QIcon()
         if icon.exists():
-            self.setWindowIcon(QIcon(str(icon)))
+            self.setWindowIcon(self._app_icon)
         # 无边框自绘：圆角、阴影、标题栏按钮都由自己控制
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -746,10 +775,48 @@ class MainWindow(QMainWindow):
         self._apply_window_frame()
         self._setup_shortcuts()
         self._init_player()
+        self._init_tray()
         # 边缘缩放靠事件冒泡到 _root 来判定，中间任何一层不开 mouseTracking，
         # 鼠标掠过时就不会产生 MouseMove，边缘带等于失效
         for child in self.findChildren(QWidget):
             child.setMouseTracking(True)
+
+    def _init_tray(self) -> None:
+        """托盘 + 媒体键。放最后初始化：winId 这时候才是有效的 HWND。"""
+        from gui.tray import Tray
+
+        self.tray = Tray(self, self._app_icon)
+        self.tray.play_pause.connect(self.player.toggle)
+        self.tray.previous.connect(self._play_prev)
+        self.tray.next.connect(self._play_next)
+        self.tray.show_window.connect(self._restore_from_tray)
+        self.tray.quit_app.connect(self._quit_from_tray)
+
+    def _restore_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self) -> None:
+        if getattr(self, "tray", None) is not None:
+            self.tray.detach()
+        QApplication.quit()
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        if event.type() == QEvent.WindowStateChange:
+            if hasattr(self, "_root"):
+                self._apply_window_frame()
+            if hasattr(self, "topbar"):
+                self.topbar.sync_window()
+            # 最小化时收进托盘，别占着任务栏；关闭仍然是退出
+            if (
+                self.isMinimized()
+                and getattr(self, "tray", None) is not None
+                and self.tray.available
+            ):
+                QTimer.singleShot(0, self.hide)
+                self.tray.notify("已收进托盘", "点托盘图标可以叫回来")
+        super().changeEvent(event)
 
     def _apply_window_frame(self) -> None:
         """最大化时去掉边距和圆角，否则四角会露出桌面。"""
@@ -762,14 +829,6 @@ class MainWindow(QMainWindow):
             f"QWidget#windowRoot {{ background: {BG};"
             f" border-radius: {radius}px; border: 1px solid {border}; }}"
         )
-
-    def changeEvent(self, event) -> None:
-        if event.type() == QEvent.WindowStateChange:
-            if hasattr(self, "_root"):
-                self._apply_window_frame()
-            if hasattr(self, "topbar"):
-                self.topbar.sync_window()
-        super().changeEvent(event)
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -1198,7 +1257,10 @@ class MainWindow(QMainWindow):
         previous = self._playing_id
         self._playing_id = None
         log.warning("播放失败：%s", message)
-        self.status_label.setText(f"播放失败：{message}")
+        self.status_label.setText(
+            f"播放失败：{message}　"
+            '<a href="retry" style="color:#7aa7d8;text-decoration:none">重试</a>'
+        )
         self._refresh_playing_rows(previous)
 
     def _on_volume_changed(self, value: int) -> None:
@@ -1695,6 +1757,8 @@ class MainWindow(QMainWindow):
     def _on_status_link(self, link: str) -> None:
         if link == "cache":
             self._open_settings()
+        elif link == "retry":
+            self._play_current()
 
     def _on_summary_link(self, link: str) -> None:
         if link == "retry":
@@ -2049,7 +2113,8 @@ class MainWindow(QMainWindow):
         self._update_download_button()
 
         self._set_busy(True, "扫描本地缓存…")
-        self.task = Task(self._scan_cache)
+        self.task = Task(self._scan_cache, wants_progress=True)
+        self.task.progress.connect(lambda msg: self.status_label.setText(msg))
         self.task.ok.connect(self._on_cache_loaded)
         self.task.fail.connect(self._on_cache_failed)
         self.task.finished.connect(lambda: self._set_busy(False, None))
@@ -2058,6 +2123,9 @@ class MainWindow(QMainWindow):
     def _on_cache_loaded(self, payload: tuple[str, list[Song]]) -> None:
         title, songs = payload
         self._scanning_cache = False
+        # 刚扫过盘，之前那份「id → 缓存文件」的快照已经过期了；
+        # 不置空的话，新缓存的歌播放时会按旧快照找不到文件，白走一趟网络
+        self._cache_entries = None
         self._pools["cache"] = (list(songs), title, True)
         self._has_more = False
         self.btn_more.hide()
@@ -2077,7 +2145,7 @@ class MainWindow(QMainWindow):
         self._update_empty_hint()
         self._on_task_error(message)
 
-    def _scan_cache(self) -> tuple[str, list[Song]]:
+    def _scan_cache(self, progress=None) -> tuple[str, list[Song]]:
         root = self.cache_dir
         if root is None or not Path(root).is_dir():
             root = cache_mod.default_cache_dir()
@@ -2099,24 +2167,36 @@ class MainWindow(QMainWindow):
         ]
         ids = [e.song_id for e in entries]
 
+        # 详情走内存缓存：自动刷新每几秒就可能重扫一次，全量重请求接口太浪费，
+        # 歌多的时候还容易被限流。只补缺失的 id。
         details: dict[int, Song] = {}
-        for start in range(0, len(ids), 50):
+        cache = self._detail_cache
+        if len(cache) > 4000:
+            cache.clear()
+        missing = [sid for sid in ids if sid not in cache]
+        for start in range(0, len(missing), 50):
+            chunk = missing[start : start + 50]
             try:
-                for song in self.backend.song_details(ids[start : start + 50]):
-                    details[song.id] = song
+                for song in self.backend.song_details(chunk):
+                    cache[song.id] = song
             except Exception:  # noqa: BLE001
                 continue
+        for sid in ids:
+            song = cache.get(sid)
+            if song is not None:
+                details[sid] = song
 
         # 客户端只保留很少的缓存，换歌就删上一首；扫到就顺手存一份，
         # 否则列表永远只剩当前在播的那一首。默认关闭，由「设置 → 缓存存档」开启。
         keep = self.settings.value("keep_cache", False, type=bool)
         index = archive_mod.load() if keep else {}
         if keep:
-            changed = False
-            for entry in entries:
-                if archive_mod.store(entry, details.get(entry.song_id), index):
-                    changed = True
-            if changed:
+            pending = [e for e in entries if e.song_id not in index]
+            for done, entry in enumerate(pending, 1):
+                archive_mod.store(entry, details.get(entry.song_id), index)
+                if progress and (done % 3 == 0 or done == len(pending)):
+                    progress(f"整理缓存 {done}/{len(pending)}")
+            if pending:
                 archive_mod.save(index)
                 archive_mod.prune()
 
@@ -2315,6 +2395,11 @@ class MainWindow(QMainWindow):
             action.setEnabled(enabled)
 
         menu.addSeparator()
+        has_file = self._song_path(song) is not None
+        act_reveal = menu.addAction("在文件夹中显示")
+        act_reveal.setData("reveal")
+        act_reveal.setEnabled(has_file)
+        menu.addSeparator()
         for text, key in (
             ("复制歌曲链接", "copy_link"),
             ("复制「歌名 - 歌手」", "copy_text"),
@@ -2355,6 +2440,8 @@ class MainWindow(QMainWindow):
             self.on_download()
         elif key == "one":
             self._download_single(row)
+        elif key == "reveal":
+            self._reveal_song(song)
         elif key == "copy_link":
             QApplication.clipboard().setText(f"https://music.163.com/song?id={song.id}")
             self.status_label.setText("已复制歌曲链接")
@@ -2389,7 +2476,31 @@ class MainWindow(QMainWindow):
             return
         self._start_batch(songs)
 
+    def _has_disk_space(self, songs: list[Song]) -> bool:
+        """粗估一下够不够放，不够就别开始，免得每首都失败一遍。"""
+        probe = self.out_dir
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        try:
+            free = shutil.disk_usage(probe).free
+        except OSError:
+            return True
+        # 单曲按 12 MB 估，再留 256 MB 余量给转码临时文件
+        need = len(songs) * 12 * 1024 * 1024 + 256 * 1024 * 1024
+        if free >= need:
+            return True
+        QMessageBox.warning(
+            self,
+            "空间不够",
+            f"目标盘剩余 {free / 1073741824:.1f} GB，本次大约需要 "
+            f"{need / 1073741824:.1f} GB。\n请清理空间或换个保存目录。",
+        )
+        self.status_label.setText("空间不足，已取消下载")
+        return False
+
     def _start_batch(self, songs: list[Song]) -> None:
+        if not self._has_disk_space(songs):
+            return
         source = self.source_box.currentData()
         log.info(
             "开始下载 %d 首：音源=%s 音质=%s 转码=%s 目录=%s",
@@ -2415,6 +2526,9 @@ class MainWindow(QMainWindow):
         )
 
         self._prepare_queue(songs)
+        self._batch_songs = list(songs)
+        self._done_ids = set()
+        self._paused = False
         self.batch = BatchTask(self.downloader, songs)
         self.batch.on_start_song.connect(self._on_song_start)
         self.batch.on_progress_song.connect(self._on_song_progress)
@@ -2454,6 +2568,13 @@ class MainWindow(QMainWindow):
         act_cancel_one.setEnabled(self.batch is not None and pending)
         act_retry = menu.addAction(f"重试失败（{len(self._failed)}）")
         act_retry.setEnabled(bool(self._failed) and self.batch is None)
+        menu.addSeparator()
+        rest = self._resume_rest()
+        act_pause = menu.addAction("暂停整批")
+        act_pause.setEnabled(self.batch is not None)
+        act_resume = menu.addAction(f"继续剩余（{len(rest)} 首）")
+        act_resume.setEnabled(self.batch is None and bool(rest))
+        menu.addSeparator()
         act_clear = menu.addAction("清空队列")
         act_clear.setEnabled(self.batch is None)
 
@@ -2475,6 +2596,10 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"已请求取消「{song.name}」，其余继续")
         elif chosen is act_retry:
             self._retry_failed()
+        elif chosen is act_pause:
+            self._pause_batch()
+        elif chosen is act_resume:
+            self._resume_batch()
         elif chosen is act_clear:
             self._clear_queue()
 
@@ -2489,6 +2614,29 @@ class MainWindow(QMainWindow):
         self.queue_info.setText("下载队列")
         self.summary_label.setText("")
         self.status_label.setText("已清空下载队列")
+
+    def _resume_rest(self) -> list[Song]:
+        """这批里还没跑完的曲目（取消掉的多半是没来得及开始的）。"""
+        done = set(self._done_ids)
+        return [song for song in self._batch_songs if song.id not in done]
+
+    def _pause_batch(self) -> None:
+        if self.batch is None:
+            return
+        self._paused = True
+        self.batch.cancel()
+        self.btn_download.setEnabled(False)
+        self.status_label.setText("正在暂停…")
+
+    def _resume_batch(self) -> None:
+        if self.batch is not None:
+            return
+        rest = self._resume_rest()
+        if not rest:
+            self.status_label.setText("没有待继续的曲目")
+            return
+        self.status_label.setText(f"继续下载剩余 {len(rest)} 首…")
+        self._start_batch(rest)
 
     def _retry_failed(self) -> None:
         if not self._failed or self.batch is not None:
@@ -2566,6 +2714,10 @@ class MainWindow(QMainWindow):
 
     def _on_song_result(self, res: TaskResult) -> None:
         self._batch_done += 1
+        # 记下已经处理完的，暂停后「继续」只补没跑完的那些；
+        # 被取消的多半是还没轮到，不能算完成，否则继续时会漏掉
+        if res.status != CANCELLED:
+            self._done_ids.add(res.song.id)
         if self._batch_total:
             self.status_label.setText(
                 f"下载中 {self._batch_done}/{self._batch_total} · {res.song.name}"
@@ -2602,6 +2754,27 @@ class MainWindow(QMainWindow):
             self._row_paths[row] = res.path
             if size:
                 size.setText(_fmt_size(res.path.stat().st_size))
+
+    @staticmethod
+    def _failure_hint(failed: list) -> str:
+        """把失败原因归个类，别让用户对着一堆「失败」自己猜。"""
+        if not failed:
+            return ""
+        buckets: Counter[str] = Counter()
+        for res in failed:
+            text = (res.message or "").lower()
+            if any(k in text for k in ("播放地址", "试听", "vip", "会员", "无版权")):
+                buckets["需会员或已下架"] += 1
+            elif any(k in text for k in ("空间", "no space")):
+                buckets["磁盘空间不足"] += 1
+            elif any(k in text for k in ("超时", "timeout", "connection", "网络", "中断")):
+                buckets["网络问题"] += 1
+            elif "不完整" in text:
+                buckets["下载不完整"] += 1
+            else:
+                buckets["其它原因"] += 1
+        detail = "、".join(f"{name} {n}" for name, n in buckets.most_common())
+        return f"失败原因：{detail}"
 
     def _on_batch_done(self, results: list[TaskResult]) -> None:
         cancelled = sum(1 for r in results if r.status == CANCELLED)
@@ -2647,14 +2820,29 @@ class MainWindow(QMainWindow):
         )
         self.summary_label.setText(" · ".join(parts) + size_text)
         self._fade_in(self.summary_label, duration=220, start=0.3)
-        self.status_label.setText(f"本批 {len(results)} 首处理完毕")
+        failed = [r for r in results if r.status == FAILED]
+        reason = self._failure_hint(failed)
+        if self._paused:
+            left = len(self._resume_rest())
+            self.status_label.setText(
+                f"已暂停 · 剩 {left} 首未完成，右键下载队列可继续"
+            )
+        else:
+            self.status_label.setText(
+                f"本批 {len(results)} 首处理完毕" + (f"　{reason}" if reason else "")
+            )
         self.queue_info.setText(f"下载队列 · 已完成 {len(results)} 首")
 
         log.info("批量完成：%s，共 %.1f MB", dict(stats), total_bytes / 1048576)
         # 窗口不在前台时闪一下任务栏，批量下歌切走了也知道结束
         if not self.isActiveWindow():
             QApplication.alert(self, 3000)
-        failed = [r for r in results if r.status == FAILED]
+            if getattr(self, "tray", None) is not None:
+                self.tray.notify(
+                    "下载完成",
+                    f"完成 {done_n} 首 · 失败 {stats.get(FAILED, 0)} 首"
+                    f" · 跳过 {stats.get(SKIPPED, 0)} 首",
+                )
         for res in failed:
             log.warning(
                 "下载失败 %s - %s：%s",
@@ -2738,6 +2926,28 @@ class MainWindow(QMainWindow):
             self.account_label.setText("未登录")
             self.account_label.setToolTip("在「设置」里扫码登录")
 
+    def _song_path(self, song: Song) -> Path | None:
+        """这首歌已落盘的路径，没有就返回 None。"""
+        self._ensure_audio_store()
+        if self._audio_store is None:
+            return None
+        row = self._audio_store.get(song.id)
+        if not row:
+            return None
+        path = Path(row["path"])
+        return path if path.exists() else None
+
+    def _reveal_song(self, song: Song) -> None:
+        path = self._song_path(song)
+        if path is None:
+            return
+        # explorer /select 会把文件选中并在资源管理器里打开，比只开目录准确
+        try:
+            subprocess.Popen(["explorer", "/select,", str(path)])
+            self.status_label.setText(f"已在资源管理器中定位：{path.name}")
+        except OSError as exc:  # noqa: BLE001
+            self.status_label.setText(f"打不开资源管理器：{exc}")
+
     def _open_dir(self) -> None:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.out_dir)))
@@ -2765,4 +2975,8 @@ class MainWindow(QMainWindow):
         player = getattr(self, "player", None)
         if player is not None:
             player.shutdown()
+        # 退出前注销全局热键，否则媒体键会被一个已经退出的进程占着
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            tray.detach()
         super().closeEvent(event)
