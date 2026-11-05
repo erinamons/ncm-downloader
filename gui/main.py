@@ -1781,8 +1781,6 @@ class MainWindow(QMainWindow):
 
     def _apply_view(self) -> None:
         """按当前关键词与排序方式，把当前音源的数据渲染到表格。"""
-        # 音质只有缓存视图知道（来自 .uc 文件名），其它视图藏起来，别留空列
-        self.result_table.setColumnHidden(5, self._current_source() != "cache")
         pool = self._pool()
         if pool is None:
             self.songs = []
@@ -1822,12 +1820,13 @@ class MainWindow(QMainWindow):
         self._update_download_button()
 
     def _update_empty_hint(self) -> None:
+        # 先看有没有数据：有行在就必须收起提示，否则会压在行上面
+        if self.songs:
+            self.empty_hint.hide()
+            return
         if self._scanning_cache:
             self.empty_hint.setText("正在扫描本地缓存…")
             self.empty_hint.show()
-            return
-        if self.songs:
-            self.empty_hint.hide()
             return
         keyword = self.input.text().strip()
         if self._list_cleared and not keyword:
@@ -2194,9 +2193,12 @@ class MainWindow(QMainWindow):
 
     def _fill_result_table(self) -> None:
         table = self.result_table
-        # 音质列只在真的有数据时显示：别的音源没有码率信息，留个空列很难看
-        has_rate = any(self._cache_rates.get(song.id) for song in self.songs)
-        table.setColumnHidden(5, not has_rate)
+        # 音质列：缓存视图常驻（空表也留着，否则列宽会跟着有没有数据来回跳），
+        # 其它音源没有码率信息，就别占一列空的
+        show_quality = self._current_source() == "cache" or any(
+            self._cache_rates.get(song.id) for song in self.songs
+        )
+        table.setColumnHidden(5, not show_quality)
         table.blockSignals(True)
         table.setRowCount(len(self.songs))
         for row, song in enumerate(self.songs):
