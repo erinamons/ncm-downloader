@@ -153,6 +153,9 @@ painter.fillRect(QRectF(w - margin, margin, margin, h - margin*2), tint)
 | 缓存行右键无反应 | 切换瞬间表格还留着旧音源的行，而 `self.songs` 已清空 | 先清视图再扫描，保证两者始终同步 |
 | VIP 歌一直只有 30 秒 | 未登录时客户端只缓存试听片段，登录后仍吃这段缓存 | 按 `size×8/rate` 估时长，低于歌曲时长 60% 就跳过缓存走网络 |
 | 播放缓存写入报 WinError 5 | `tempfile.gettempdir()` 被其它软件改到无写权限的公共目录（如 Wondershare 的 `C:\Users\Public\Documents\...\CreatorTemp`） | 播放缓存改放 `~\.ncm-downloader\play-cache`，并对 `os.replace` 兜底回退网络 |
+| 缓存列表只有一首 | `scan()` 只 `glob("*.uc")` 扫顶层，而部分客户端版本把缓存放在子目录 | 改递归扫描，`max_depth=3` |
+| 缓存视图不自动更新 | Windows 上 `QFileSystemWatcher` 大批增删后静默失效 | 监听自愈重挂 + 8 秒指纹轮询兜底 |
+| 客户端删掉旧缓存后列表里没了 | 客户端只保留极少的播放缓存 | 「缓存存档」（设置里开启），扫描时解密留存一份，上限 2 GB |
 
 ## 二、文件都写到哪了
 

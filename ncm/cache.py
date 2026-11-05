@@ -97,32 +97,49 @@ def _read_idx(idx: Path) -> tuple[int, int]:
     return size, covered
 
 
-def scan(cache_dir: Path | str) -> list[CacheEntry]:
+def scan(cache_dir: Path | str, max_depth: int = 3) -> list[CacheEntry]:
+    """扫出目录下的缓存条目。
+
+    要递归：不同版本的客户端会把缓存分层放（按日期或哈希建子目录），
+    只 glob 顶层会漏掉绝大多数文件，表现就是「缓存列表永远只有一首」。
+    深度限制在 3 层，避免误选到磁盘根目录时遍历整块盘。
+    """
     root = Path(cache_dir)
     entries: list[CacheEntry] = []
-    for path in root.glob("*.uc"):
-        match = _UC_RE.match(path.stem)
-        if not match:
-            continue
-        size = path.stat().st_size
-        declared, covered = _read_idx(path.with_suffix(".idx"))
-        if declared:
-            # idx 声明的是预期总长；文件实际长度和已覆盖区间都得对得上才算完整
-            expected = max(declared, size)
-            complete = covered >= expected * 0.98 and size >= expected * 0.98
-        else:
-            # 没有 idx 时按 `.uc!` 约定判断：带感叹号的表示写入未完成
-            complete = not path.name.endswith("!")
-        entries.append(
-            CacheEntry(
-                path=path,
-                song_id=int(match.group(1)),
-                rate=int(match.group(2)),
-                size=size,
-                complete=complete,
-                covered=covered,
+    root_depth = len(root.parts)
+    for dirpath, dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        if len(current.parts) - root_depth >= max_depth:
+            dirnames[:] = []
+        for name in filenames:
+            if not name.lower().endswith(".uc"):
+                continue
+            path = current / name
+            match = _UC_RE.match(path.stem)
+            if not match:
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            declared, covered = _read_idx(path.with_suffix(".idx"))
+            if declared:
+                # idx 声明的是预期总长；文件实际长度和已覆盖区间都得对得上才算完整
+                expected = max(declared, size)
+                complete = covered >= expected * 0.98 and size >= expected * 0.98
+            else:
+                # 没有 idx 时按 `.uc!` 约定判断：带感叹号的表示写入未完成
+                complete = not path.name.endswith("!")
+            entries.append(
+                CacheEntry(
+                    path=path,
+                    song_id=int(match.group(1)),
+                    rate=int(match.group(2)),
+                    size=size,
+                    complete=complete,
+                    covered=covered,
+                )
             )
-        )
     entries.sort(key=lambda e: (e.song_id, -e.rate))
     return entries
 

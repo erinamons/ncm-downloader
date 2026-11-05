@@ -58,6 +58,7 @@ from PyQt5.QtWidgets import (
 
 from ncm import LocalBackend, Store
 from ncm import auth
+from ncm import archive as archive_mod
 from ncm import cache as cache_mod
 from ncm.downloader import (
     CANCELLED,
@@ -348,6 +349,32 @@ class SettingsDialog(RoundDialog):
         play_row.addWidget(btn_play_cache)
         form.addRow("播放缓存", play_row)
 
+        # 客户端只留很有限的播放缓存，换歌可能把上一首删掉；开启后由我们自己留一份
+        keep_row = QHBoxLayout()
+        keep_row.setSpacing(8)
+        self.keep_cache = QCheckBox("保留缓存歌曲")
+        self.keep_cache.setChecked(
+            settings.value("keep_cache", False, type=bool)
+        )
+        self.keep_cache.setToolTip(
+            "把扫描到的缓存解密存一份到 cache-store。\n"
+            "客户端删掉旧缓存后，这些歌仍然能在「本地缓存」里看到并播放。\n"
+            "占用磁盘，上限 2 GB，超出按最久未访问淘汰。"
+        )
+        keep_row.addWidget(self.keep_cache, 1)
+        self.cache_store_state = QLabel()
+        self.cache_store_state.setObjectName("muted")
+        keep_row.addWidget(self.cache_store_state)
+        btn_clear_store = QPushButton("清理")
+        btn_clear_store.setFixedHeight(30)
+        btn_clear_store.setMinimumWidth(58)
+        btn_clear_store.setToolTip("删掉已保留的缓存歌曲")
+        btn_clear_store.clicked.connect(self._clear_cache_store)
+        keep_row.addWidget(btn_clear_store)
+        form.addRow("缓存存档", keep_row)
+        self.keep_cache.stateChanged.connect(lambda _=0: self._refresh_store_state())
+        self._refresh_store_state()
+
         self.startup_view = QComboBox()
         self.startup_view.addItem("标准窗口", "full")
         self.startup_view.addItem("紧凑模式", "mini")
@@ -510,6 +537,29 @@ class SettingsDialog(RoundDialog):
             self.play_cache_state.setStyleSheet("")
         self.changed = True
 
+    def _refresh_store_state(self) -> None:
+        from ncm import archive as archive_mod
+
+        total = archive_mod.total_bytes()
+        if total:
+            self.cache_store_state.setText(f"{total / 1048576:.0f} MB")
+        else:
+            self.cache_store_state.setText("空")
+
+    def _clear_cache_store(self) -> None:
+        from ncm import archive as archive_mod
+
+        count, total = archive_mod.clear()
+        if count:
+            self.cache_store_state.setText(
+                f"已清理 {count} 个，释放 {total / 1048576:.0f} MB"
+            )
+            self.cache_store_state.setStyleSheet("color:#4caf7d;")
+        else:
+            self.cache_store_state.setText("本来就没有")
+            self.cache_store_state.setStyleSheet("")
+        self.changed = True
+
     def _detect_cache(self) -> None:
         self.cache_dir = cache_mod.default_cache_dir()
         self._refresh_cache_text()
@@ -555,6 +605,7 @@ class MainWindow(QMainWindow):
         # 缓存扫描状态：用于表里那句「正在扫描…」以及失败后停掉自动刷新
         self._scanning_cache = False
         self._cache_scan_failed = False
+        self._list_cleared = False
         self._mini = False
         self._full_geometry = None
         self._shadow_px = 12
@@ -619,6 +670,13 @@ class MainWindow(QMainWindow):
         self._cache_timer.setInterval(2500)
         self._cache_timer.timeout.connect(self._auto_refresh_cache)
         self._watch_cache_dir(self.cache_dir)
+        # QFileSystemWatcher 在 Windows 上遇到大量增删会静默失效（缓存目录正好
+        # 是边播边写边删），所以再加一道轮询兜底：定时比一下目录指纹，变了就重扫
+        self._cache_signature: tuple[int, float] | None = None
+        self._cache_poll = QTimer(self)
+        self._cache_poll.setInterval(8000)
+        self._cache_poll.timeout.connect(self._poll_cache_dir)
+        self._cache_poll.start()
         # 启动视图为紧凑模式：先记下完整窗口的几何（Ctrl+M 要还原到这儿），
         # 再把窗口缩到紧凑尺寸，避免 show 出来先大后小闪一下。
         # 真正的状态切换放到事件循环里做，那时窗口已有的几何才是有效的。
@@ -884,10 +942,52 @@ class MainWindow(QMainWindow):
         existing = self._cache_watcher.directories()
         if existing:
             self._cache_watcher.removePaths(existing)
-        if path and Path(path).is_dir():
-            self._cache_watcher.addPath(str(path))
+        target = Path(path) if path else cache_mod.default_cache_dir()
+        if target and Path(target).is_dir():
+            self._cache_watcher.addPath(str(target))
+        self._cache_dir_path = target
+        self._cache_signature = None  # 换了目录，指纹作废
+
+    def _cache_dir_signature(self) -> tuple[int, float] | None:
+        """缓存目录的指纹：文件数 + 最新修改时间，用来判断有没有新歌进来。"""
+        root = getattr(self, "_cache_dir_path", None)
+        if not root or not Path(root).is_dir():
+            return None
+        count = 0
+        latest = 0.0
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    if not entry.name.lower().endswith(".uc"):
+                        continue
+                    try:
+                        stat = entry.stat()
+                    except OSError:
+                        continue
+                    count += 1
+                    latest = max(latest, stat.st_mtime)
+        except OSError:
+            return None
+        return (count, round(latest, 1))
+
+    def _poll_cache_dir(self) -> None:
+        """兜底轮询：只比指纹，不扫内容。"""
+        if self._current_source() != "cache" or self.task is not None:
+            return
+        signature = self._cache_dir_signature()
+        if signature is None:
+            return
+        if self._cache_signature is None:
+            self._cache_signature = signature
+            return
+        if signature != self._cache_signature:
+            self._cache_signature = signature
+            self._auto_refresh_cache()
 
     def _on_cache_dir_changed(self, _path: str) -> None:
+        # 监听器偶发失效后就再也不触发了，这里顺手重新挂一次当作自愈
+        if _path and Path(_path).is_dir() and _path not in self._cache_watcher.directories():
+            self._cache_watcher.addPath(_path)
         self._cache_timer.start()  # 防抖：连续写入只触发最后一次
 
     def _auto_refresh_cache(self) -> None:
@@ -929,7 +1029,7 @@ class MainWindow(QMainWindow):
             self._audio_store = None
 
     def _local_audio(self, song: Song) -> Path | None:
-        """按「已下载 → 客户端缓存 → 没有」的顺序找本地文件。"""
+        """按「已下载 → 缓存存档 → 客户端缓存 → 没有」的顺序找本地文件。"""
         self._ensure_audio_store()
         if self._audio_store is not None:
             row = self._audio_store.get(song.id)
@@ -938,10 +1038,19 @@ class MainWindow(QMainWindow):
                 if path.exists():
                     return path
 
+        # 客户端可能已经把这份缓存删了，先看我们自己留的那份
+        if self.settings.value("keep_cache", False, type=bool):
+            item = archive_mod.load().get(song.id)
+            if item:
+                stored = archive_mod.path_of(item)
+                if stored is not None:
+                    return stored
+
+        from ncm import cache as cache_mod
+
         entry = self._cache_map().get(song.id)
         if entry is None:
             return None
-        from ncm import cache as cache_mod
 
         # 未登录时听 VIP 歌，客户端只缓存 30 秒试听片段；之后登录了再播，
         # 吃的还是这段残片。用「码率 × 体积」估一下时长，明显短于歌曲时长
@@ -1537,6 +1646,26 @@ class MainWindow(QMainWindow):
         self.status_label.setOpenExternalLinks(False)
         self.status_label.linkActivated.connect(self._on_status_link)
 
+        self.btn_refresh = QPushButton()
+        self.btn_refresh.setObjectName("helpBtn")
+        self.btn_refresh.setIcon(icons.stateful("rotate-ccw", "#8b8b95", "#ffffff", 14))
+        self.btn_refresh.setIconSize(QSize(14, 14))
+        self.btn_refresh.setFixedSize(22, 20)
+        self.btn_refresh.setToolTip("刷新当前列表（缓存视图下重新扫描）")
+        self.btn_refresh.setFocusPolicy(Qt.NoFocus)
+        self.btn_refresh.clicked.connect(self._refresh_current)
+        bar.addWidget(self.btn_refresh)
+
+        self.btn_clear = QPushButton()
+        self.btn_clear.setObjectName("helpBtn")
+        self.btn_clear.setIcon(icons.stateful("trash-2", "#8b8b95", "#ffffff", 14))
+        self.btn_clear.setIconSize(QSize(14, 14))
+        self.btn_clear.setFixedSize(22, 20)
+        self.btn_clear.setToolTip("清空当前列表")
+        self.btn_clear.setFocusPolicy(Qt.NoFocus)
+        self.btn_clear.clicked.connect(self._clear_list)
+        bar.addWidget(self.btn_clear)
+
         self.btn_help = QPushButton()
         self.btn_help.setObjectName("helpBtn")
         self.btn_help.setIcon(icons.stateful("circle-help", "#8b8b95", "#ffffff", 14))
@@ -1661,6 +1790,7 @@ class MainWindow(QMainWindow):
             return
 
         songs, title, is_cache = pool
+        self._list_cleared = False
         kw = self.input.text().strip().lower()
         # 只有缓存视图才在本地按关键词筛：接口搜索的结果本来就是匹配过的，
         # 再筛一遍会把「搜到的但标题里没这个词」的歌误删
@@ -1697,6 +1827,10 @@ class MainWindow(QMainWindow):
             self.empty_hint.hide()
             return
         keyword = self.input.text().strip()
+        if self._list_cleared and not keyword:
+            self.empty_hint.setText("列表已清空\n点状态栏的刷新按钮重新载入")
+            self.empty_hint.show()
+            return
         if self._is_cache_view():
             if self._cache_scan_failed:
                 self.empty_hint.setText(
@@ -1848,6 +1982,34 @@ class MainWindow(QMainWindow):
         else:
             self.result_info.setText("没有结果")
 
+    def _refresh_current(self) -> None:
+        """刷新当前视图：缓存重扫，搜索结果重搜，其它情况提示。"""
+        if self.task is not None:
+            self.status_label.setText("正在处理上一个任务，稍等一下")
+            return
+        if self._current_source() == "cache":
+            self.on_load_cache()
+            return
+        keyword = self.input.text().strip()
+        if keyword:
+            self.on_search()
+        else:
+            self.status_label.setText("当前列表不是搜索来的，没有可刷新的内容")
+
+    def _clear_list(self) -> None:
+        """清空当前视图的列表，不动下载队列和磁盘文件。"""
+        key = self._current_source()
+        self._pools.pop(key, None)
+        self.songs = []
+        self._has_more = False
+        self._list_cleared = True
+        self.btn_more.hide()
+        self.result_info.setText("")
+        self._fill_result_table()
+        self._update_empty_hint()
+        self._update_download_button()
+        self.status_label.setText("列表已清空")
+
     def on_load_cache(self) -> None:
         """扫描客户端缓存并列出结果。
 
@@ -1919,6 +2081,13 @@ class MainWindow(QMainWindow):
             root = cache_mod.default_cache_dir()
             self.cache_dir = root
         if root is None or not Path(root).is_dir():
+            # 客户端目录没了也别报错，存档还在就能继续用
+            archived = archive_mod.load() if self.settings.value(
+                "keep_cache", False, type=bool
+            ) else {}
+            if archived:
+                songs = [self._song_from_archive(i, item) for i, item in archived.items()]
+                return (f"缓存存档（{len(songs)} 首，客户端目录未找到）", songs)
             raise RuntimeError(
                 "没找到客户端缓存目录，请在「设置 → 缓存目录」里指定"
             )
@@ -1926,11 +2095,8 @@ class MainWindow(QMainWindow):
         entries = [
             e for e in cache_mod.scan(root) if e.complete and e.size > 200_000
         ]
-        if not entries:
-            return ("本地缓存", [])
-
         ids = [e.song_id for e in entries]
-        self._cache_rates = {e.song_id: e.rate_label for e in entries}
+
         details: dict[int, Song] = {}
         for start in range(0, len(ids), 50):
             try:
@@ -1939,13 +2105,68 @@ class MainWindow(QMainWindow):
             except Exception:  # noqa: BLE001
                 continue
 
-        songs = [
-            details.get(sid) or Song(sid, f"未识别曲目 {sid}", [], "")
-            for sid in ids
-        ]
-        high = sum(1 for e in entries if e.rate >= 320)
-        title = f"本地缓存（{high} 首 320 档 / {len(entries) - high} 首低码率）"
-        return (title, songs)
+        # 客户端只保留很少的缓存，换歌就删上一首；扫到就顺手存一份，
+        # 否则列表永远只剩当前在播的那一首。默认关闭，由「设置 → 缓存存档」开启。
+        keep = self.settings.value("keep_cache", False, type=bool)
+        index = archive_mod.load() if keep else {}
+        if keep:
+            changed = False
+            for entry in entries:
+                if archive_mod.store(entry, details.get(entry.song_id), index):
+                    changed = True
+            if changed:
+                archive_mod.save(index)
+                archive_mod.prune()
+
+        ordered: list[Song] = []
+        seen: set[int] = set()
+        for song_id, item in sorted(
+            index.items(), key=lambda kv: kv[1].get("at", 0), reverse=True
+        ):
+            if archive_mod.path_of(item) is None:
+                continue
+            ordered.append(details.get(song_id) or self._song_from_archive(song_id, item))
+            seen.add(song_id)
+        for entry in entries:
+            if entry.song_id in seen:
+                continue
+            ordered.append(
+                details.get(entry.song_id)
+                or Song(entry.song_id, f"未识别曲目 {entry.song_id}", [], "")
+            )
+
+        if not ordered:
+            return ("本地缓存", [])
+
+        self._cache_rates = {
+            song_id: (
+                cache_mod.RATE_LABEL.get(item.get("rate", 0), f"{item.get('rate', 0)}k")
+                if song_id in index
+                else next(
+                    (e.rate_label for e in entries if e.song_id == song_id), ""
+                )
+            )
+            for song_id, item in index.items()
+        }
+        for entry in entries:
+            self._cache_rates.setdefault(entry.song_id, entry.rate_label)
+
+        live = len([e for e in entries if e.song_id in seen])
+        if keep:
+            title = f"本地缓存（存档 {len(seen)} 首 / 当前在缓存 {live} 首）"
+        else:
+            title = f"本地缓存（{len(ordered)} 首）"
+        return (title, ordered)
+
+    def _song_from_archive(self, song_id: int, item: dict) -> Song:
+        return Song(
+            song_id,
+            item.get("name") or f"未识别曲目 {song_id}",
+            list(item.get("artists") or []),
+            item.get("album") or "",
+            int(item.get("duration_ms") or 0),
+            0,
+        )
 
     def _on_task_error(self, message: str) -> None:
         log.warning("任务失败：%s", message)
@@ -2455,7 +2676,11 @@ class MainWindow(QMainWindow):
             self.settings.setValue("name_pattern", self.name_pattern)
             self.settings.setValue("folder_pattern", self.folder_pattern)
             self.settings.setValue("out_dir", str(self.out_dir))
+            keep_before = self.settings.value("keep_cache", False, type=bool)
             self.settings.setValue("startup_view", dialog.startup_view.currentData())
+            self.settings.setValue("keep_cache", dialog.keep_cache.isChecked())
+            if keep_before != dialog.keep_cache.isChecked() and self._current_source() == "cache":
+                self.on_load_cache()  # 开关变了，列表内容也要跟着变
             if dialog.cache_dir != self.cache_dir:
                 self.cache_dir = dialog.cache_dir
                 # 换目录后旧的扫描结果作废，「容量/缓存」相关判断要重来
