@@ -30,6 +30,9 @@ class FluidTable(QTableWidget):
         # 上半段遮住，视觉上它就只从内容区开始。
         self._corner = QWidget(self)
         self._corner.setObjectName("cornerPatch")
+        # 普通 QWidget 默认不画 QSS 里的 background，必须显式打开，
+        # 否则补丁位置算得再对，实际也是透明的，滚动条照样露出来
+        self._corner.setAttribute(Qt.WA_StyledBackground, True)
         # 让滚轮能穿透到表格，否则鼠标停在这一小块上滚不动
         self._corner.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self._corner.show()
@@ -58,18 +61,47 @@ class FluidTable(QTableWidget):
         self._place_corner()
 
     def _place_corner(self) -> None:
-        """把补丁贴在表头右侧、滚动条上方那一小块。"""
+        """把滚动条压到表头下方，并用同色补丁补齐表头右侧那条竖缝。
+
+        Qt 默认让竖向滚动条贯穿整张表（连表头右侧都是它），看起来像「越界」。
+        盖一块补丁没用——滚动条容器是后绘制的，会压在补丁上面；直接改容器的
+        几何才稳。
+        """
         if not hasattr(self, "_corner"):
             return
         bar = self.verticalScrollBar()
+        container = bar.parentWidget()
+        header_h = self.horizontalHeader().height()
+
+        # 先挪容器：这一步即使滚动条还没显示也要做，否则首帧还是贯穿的
+        width = bar.width()
+        if container is not None and container is not self and container.objectName().startswith(
+            "qt_scrollarea_vcontainer"
+        ):
+            height = max(0, self.height() - header_h - 1)
+            target = (self.width() - width - 1, header_h, width, height)
+            if container.geometry().getRect() != target:
+                container.setGeometry(*target)
+
         if not bar.isVisible():
             self._corner.hide()
             return
-        width = bar.width()
-        header_h = self.horizontalHeader().height()
-        self._corner.setGeometry(self.width() - width - 1, 0, width + 1, header_h + 1)
-        self._corner.raise_()
+
+        # 表头只铺到 viewport 宽度，右侧这条缝要用同色补上，否则露底色
+        self._corner.setGeometry(
+            self.width() - width - 1, 0, width + 1, header_h + 1
+        )
         self._corner.show()
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:
+        super().scrollContentsBy(dx, dy)
+        self._place_corner()
+
+    def paintEvent(self, event) -> None:
+        # 有些布局路径（换策略、动态调整视口边距）会悄悄把容器挪回去，
+        # 这里每次绘制前对一眼几何，不对就按回去，成本是四次整数比较
+        super().paintEvent(event)
+        self._place_corner()
 
     def _fill_fluid(self) -> None:
         """把视口剩余宽度给弹性列，其余列保持用户设定的宽度。"""
