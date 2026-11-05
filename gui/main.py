@@ -780,6 +780,8 @@ class MainWindow(QMainWindow):
         # 鼠标掠过时就不会产生 MouseMove，边缘带等于失效
         for child in self.findChildren(QWidget):
             child.setMouseTracking(True)
+        # 建完界面先按当前音源渲染一次：否则「音质」列会一直显到第一次搜索为止
+        self._apply_view()
 
     def _init_tray(self) -> None:
         """托盘 + 媒体键。放最后初始化：winId 这时候才是有效的 HWND。"""
@@ -2382,9 +2384,8 @@ class MainWindow(QMainWindow):
             action.setData(key)
             action.setEnabled(enabled)
 
-        if self._playing_id is not None:
-            menu.addAction("停止播放").setData("stop")
-
+        # 「停止播放」不放这儿：右键某一首时它看起来像是「停这一首」，
+        # 实际停的是全局播放。播放条上已经有独立的停止按钮了。
         menu.addSeparator()
         for text, key, enabled in (
             (f"下载选中（{picked} 首）", "download", picked > 0 and idle),
@@ -2434,8 +2435,6 @@ class MainWindow(QMainWindow):
             self._play_from_list(self.songs, row)
         elif key == "play_one":
             self._play_from_list([song], 0)
-        elif key == "stop":
-            self._stop_playback()
         elif key == "download":
             self.on_download()
         elif key == "one":

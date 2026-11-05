@@ -1,0 +1,5 @@
+<!-- 实心方形：播放条上的「停止」，描边版会被误认成最大化。
+     方块要尽量占满 viewBox，否则渲染到 16px 时只剩 9px，比相邻图标小一圈 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+  <rect x="2.5" y="2.5" width="19" height="19" rx="3.5" />
+</svg>

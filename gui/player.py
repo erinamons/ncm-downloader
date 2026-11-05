@@ -392,7 +392,11 @@ class TopBar(QWidget):
         self.btn_play.setFocusPolicy(Qt.NoFocus)
         self.btn_play.clicked.connect(self.play_pause.emit)
         self.btn_next = self._icon_button("skip-forward", "下一首", self.next.emit, 22)
-        for w in (self.btn_prev, self.btn_play, self.btn_next):
+        # 停止单独给个按钮：以前只在右键菜单里，右键某一首看到「停止播放」
+        # 很容易被理解成停这一首
+        self.btn_stop = self._icon_button("stop", "停止播放", self.stop_requested.emit, 22)
+        self.btn_stop.setEnabled(False)
+        for w in (self.btn_prev, self.btn_play, self.btn_next, self.btn_stop):
             row.addWidget(w)
 
         row.addSpacing(6)
@@ -495,6 +499,7 @@ class TopBar(QWidget):
     def set_state(self, state: str) -> None:
         self._state = state
         self._sync_play_icon()
+        self.btn_stop.setEnabled(state != STOPPED)
         self.text.set_scrolling_allowed(state == PLAYING)
 
     def set_position(self, pos: int, duration: int) -> None:
@@ -647,15 +652,11 @@ class TopBar(QWidget):
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
         act_mini = menu.addAction("还原窗口" if self._compact else "紧凑模式")
-        act_stop = menu.addAction("停止播放")
-        act_stop.setEnabled(self._song is not None)
         menu.addSeparator()
         act_close = menu.addAction("关闭")
         chosen = menu.exec_(event.globalPos())
         if chosen is act_mini:
             self.toggle_mini.emit()
-        elif chosen is act_stop:
-            self.stop_requested.emit()
         elif chosen is act_close:
             self._win.close()
 
