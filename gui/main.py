@@ -1713,11 +1713,10 @@ class MainWindow(QMainWindow):
         # hover 高亮需要鼠标跟踪
         table.setMouseTracking(True)
         table.viewport().setMouseTracking(True)
-        # 滚动条常驻，否则内容变化时出现/消失会让列宽来回跳
-        table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
-        # 横向滚动条绝不能出现：往回拖窄时列宽还没跟上（有防抖），
-        # 列宽总和会短暂超过视口，一旦冒出横向滚动条就会挤掉一行高度、
-        # 整块重排，看起来就是往回拉时闪的那一下。超出的部分直接裁掉。
+        # 滚动条由 FluidTable 自己管：有内容时常驻（否则出现/消失会让列宽来回跳），
+        # 空表时隐藏（范围为 0 时滑块会铺满整条，看着像根竖线）
+        # 横向滚动条绝不能出现：往回拖窄时列宽还没跟上（有防抖），列宽总和会
+        # 短暂超过视口，一冒出横向滚动条就挤掉一行高度、整块重排，看着就是闪
         table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         table.horizontalHeader().setHighlightSections(False)
         # viewport 在尺寸变化时会用 palette.base 填新露出的区域，默认是白底，

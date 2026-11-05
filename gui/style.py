@@ -208,6 +208,13 @@ QTableCornerButton::section {{
     background: {BG};
     border: none;
 }}
+/* 盖住表格右上角、滚动条上段的那块补丁，配色跟表头保持一致 */
+QWidget#cornerPatch {{
+    background: {BG};
+    border: none;
+    border-bottom: 1px solid {BORDER};
+    border-top-right-radius: 7px;
+}}
 
 QProgressBar {{
     background: #2e2e34;
