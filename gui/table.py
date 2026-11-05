@@ -58,6 +58,8 @@ class FluidTable(QTableWidget):
         policy = Qt.ScrollBarAlwaysOff if self.rowCount() == 0 else Qt.ScrollBarAlwaysOn
         if self.verticalScrollBarPolicy() != policy:
             self.setVerticalScrollBarPolicy(policy)
+            # 滚动条显隐会改变视口宽度，弹性列得跟着重算
+            self._fill_fluid()
         self._place_corner()
 
     def _place_corner(self) -> None:
@@ -102,6 +104,19 @@ class FluidTable(QTableWidget):
         # 这里每次绘制前对一眼几何，不对就按回去，成本是四次整数比较
         super().paintEvent(event)
         self._place_corner()
+
+    def refit(self) -> None:
+        """外部调完 setColumnWidth 之后叫一次，把弹性列重新拉满。"""
+        self._fill_fluid()
+
+    def setColumnHidden(self, column: int, hidden: bool) -> None:
+        """列显隐变化后重算弹性列宽度。
+
+        隐藏/显示列不会触发 resizeEvent，光靠那个钩子的话，切音源或进出紧凑
+        模式之后曲名列还是旧宽度，右边会空出一截，滚动条也跟着偏。
+        """
+        super().setColumnHidden(column, hidden)
+        self._fill_fluid()
 
     def _fill_fluid(self) -> None:
         """把视口剩余宽度给弹性列，其余列保持用户设定的宽度。"""

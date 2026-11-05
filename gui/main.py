@@ -1297,6 +1297,9 @@ class MainWindow(QMainWindow):
         for col in (2, 3):
             self.result_table.setColumnHidden(col, True)
         self.result_table.setColumnWidth(4, 56)
+        self.result_table.refit()
+        # 窗口尺寸还在收尾，等布局稳定后再拉一次，否则会差出一个滚动条的宽度
+        QTimer.singleShot(80, self.result_table.refit)
         # 音源/音质只留选择器本身，标签藏起来省宽度
         self.level_label.hide()
         self.source_label.hide()
@@ -1343,6 +1346,8 @@ class MainWindow(QMainWindow):
         self.result_table.setColumnWidth(2, 160)
         self.result_table.setColumnWidth(3, 200)
         self.result_table.setColumnWidth(4, 88)
+        self.result_table.refit()
+        QTimer.singleShot(80, self.result_table.refit)
         self.level_label.show()
         self.source_label.show()
         # 解除紧凑时的定宽与样式覆盖，回到 QSS 的 min-width 与内容自适应
@@ -2131,6 +2136,9 @@ class MainWindow(QMainWindow):
         self._pools["cache"] = (list(songs), title, True)
         self._has_more = False
         self.btn_more.hide()
+        # 扫描是异步的：用户可能已经切回别的音源了，这时别再把缓存列表顶上来
+        if self._current_source() != "cache":
+            return
         self._apply_view()
         self._fade_in(self.result_table)
         if songs:
@@ -2348,12 +2356,16 @@ class MainWindow(QMainWindow):
                 picked.append(song)
         return picked
 
+    def _verb(self) -> str:
+        """缓存视图其实是把本地 .uc 解密复制出来，全程不联网，叫「导出」更准确。"""
+        return "导出" if self._current_source() == "cache" else "下载"
+
     def _update_download_button(self, *_args) -> None:
         if self.batch is not None:
             return
         count = len(self._selected_songs())
-        # 紧凑模式一行要塞下两个选择器，文案缩到「下载 (n)」
-        verb = "下载" if self._mini else "下载选中"
+        # 紧凑模式一行要塞下两个选择器，文案缩到「导出 (n)」
+        verb = self._verb() if self._mini else f"{self._verb()}选中"
         self.btn_download.setText(f"{verb} ({count})" if count else verb)
         self.btn_download.setMinimumWidth(84 if self._mini else 126)
         self.btn_download.setIcon(icons.icon("download", "#ffffff", 18))
@@ -2388,8 +2400,8 @@ class MainWindow(QMainWindow):
         # 实际停的是全局播放。播放条上已经有独立的停止按钮了。
         menu.addSeparator()
         for text, key, enabled in (
-            (f"下载选中（{picked} 首）", "download", picked > 0 and idle),
-            ("仅下载此曲", "one", idle),
+            (f"{self._verb()}选中（{picked} 首）", "download", picked > 0 and idle),
+            (f"仅{self._verb()}此曲", "one", idle),
         ):
             action = menu.addAction(text)
             action.setData(key)
@@ -2985,6 +2997,8 @@ class MainWindow(QMainWindow):
         key = self.source_box.currentData()
         self.settings.setValue("source", key)
         self.status_label.setText(f"音源：{SOURCE_LABEL.get(key, key)}")
+        # 文案跟着音源走（缓存是「导出」），扫缓存是异步的，先立刻换掉按钮字
+        self._update_download_button()
         # 每次切到「仅本地缓存」都重扫：客户端那边可能刚缓存了新歌，
         # 或者用户清过缓存，吃旧结果会显示已经不存在的东西
         if key == "cache":
