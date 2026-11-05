@@ -94,7 +94,7 @@ from gui.table import FluidTable
 from gui.player import PlayerEngine, TopBar
 from gui.workers import BatchTask, Task
 
-HEADERS = ["", "曲名", "艺人", "专辑", "时长"]
+HEADERS = ["", "曲名", "艺人", "专辑", "时长", "音质"]
 
 log = logging.getLogger("ncm.gui")
 
@@ -1149,7 +1149,7 @@ class MainWindow(QMainWindow):
             if item_song.id not in (previous, self._playing_id):
                 continue
             active = item_song.id == self._playing_id
-            for col in range(5):
+            for col in range(6):
                 cell = self.result_table.item(row, col)
                 if cell is not None:
                     cell.setBackground(
@@ -1387,19 +1387,21 @@ class MainWindow(QMainWindow):
         layout.addLayout(info_row)
 
         # 所有列都能拖动；窗口变宽时余量给曲名（见 FluidTable）
-        self.result_table = FluidTable(0, 5, fluid_col=1)
+        self.result_table = FluidTable(0, 6, fluid_col=1)
         self.result_table.setHorizontalHeaderLabels(HEADERS)
         self._style_table(self.result_table)
         header = self.result_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Fixed)
         header.setSectionResizeMode(4, QHeaderView.Fixed)
+        header.setSectionResizeMode(5, QHeaderView.Fixed)
         self.result_table.setColumnWidth(0, 30)
         self.result_table.setColumnWidth(1, 300)
         self.result_table.setColumnWidth(2, 160)
         self.result_table.setColumnWidth(3, 200)
-        # 缓存视图下时长列带档位（如 3:48 · 320k），需要更宽
-        self.result_table.setColumnWidth(4, 88)
-        self._align_header(self.result_table, {4})
+        # 时长与音质分开：挤在一列时右对齐会把时长截掉，只剩「320k」
+        self.result_table.setColumnWidth(4, 64)
+        self.result_table.setColumnWidth(5, 70)
+        self._align_header(self.result_table, {4, 5})
         # 排序挂在表头：点第一列切全选，点其余列排序（升 → 降 → 取消）
         header.setSectionsClickable(True)
         header.setSortIndicatorShown(False)
@@ -1780,6 +1782,8 @@ class MainWindow(QMainWindow):
 
     def _apply_view(self) -> None:
         """按当前关键词与排序方式，把当前音源的数据渲染到表格。"""
+        # 音质只有缓存视图知道（来自 .uc 文件名），其它视图藏起来，别留空列
+        self.result_table.setColumnHidden(5, self._current_source() != "cache")
         pool = self._pool()
         if pool is None:
             self.songs = []
@@ -2191,6 +2195,9 @@ class MainWindow(QMainWindow):
 
     def _fill_result_table(self) -> None:
         table = self.result_table
+        # 音质列只在真的有数据时显示：别的音源没有码率信息，留个空列很难看
+        has_rate = any(self._cache_rates.get(song.id) for song in self.songs)
+        table.setColumnHidden(5, not has_rate)
         table.blockSignals(True)
         table.setRowCount(len(self.songs))
         for row, song in enumerate(self.songs):
@@ -2213,15 +2220,21 @@ class MainWindow(QMainWindow):
             album.setToolTip(song.album)
             table.setItem(row, 3, album)
 
-            rate = self._cache_rates.get(song.id)
-            text = f"{song.duration_text} · {rate}" if rate else song.duration_text
-            duration = QTableWidgetItem(text)
+            duration = QTableWidgetItem(song.duration_text)
             duration.setForeground(QColor(MUTED))
             duration.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             table.setItem(row, 4, duration)
 
+            # 音质单列：只有缓存视图知道码率，其它视图留空
+            rate_text = self._cache_rates.get(song.id, "")
+            quality = QTableWidgetItem(rate_text)
+            quality.setForeground(QColor(MUTED))
+            quality.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            quality.setToolTip(f"缓存音质 {rate_text}" if rate_text else "")
+            table.setItem(row, 5, quality)
+
             if song.id == self._playing_id:
-                for col in range(5):
+                for col in range(6):
                     cell = table.item(row, col)
                     if cell is not None:
                         cell.setBackground(QColor("#2c2c36"))
@@ -2230,6 +2243,9 @@ class MainWindow(QMainWindow):
                 bold.setBold(True)
                 name.setFont(bold)
         table.blockSignals(False)
+        # 表格内容变了，空状态提示也要跟着收/放，否则会压在行上面
+        if hasattr(self, "empty_hint"):
+            self._update_empty_hint()
 
     def _set_all(self, checked: bool) -> None:
         self.result_table.blockSignals(True)

@@ -227,17 +227,23 @@ QWidget#barHolder {{
 }}
 
 QScrollBar:vertical {{
+    /* 平时几乎看不见：内容只多出一两行时滑块本来就接近满长，
+       画成实心就成了「一根贯穿表格的竖线」。悬停时才显现。 */
     background: transparent;
     width: 8px;
-    margin: 2px 1px;
+    margin: 6px 2px;
+    border-radius: 4px;
 }}
 QScrollBar::handle:vertical {{
-    background: #4a4a55;
+    background: rgba(255, 255, 255, 0.09);
     border-radius: 3px;
-    min-height: 28px;
+    min-height: 24px;
 }}
-QScrollBar::handle:vertical:hover {{
-    background: #5e5e6c;
+QScrollBar:hover::handle:vertical {{
+    background: rgba(255, 255, 255, 0.26);
+}}
+QScrollBar::handle:vertical:pressed {{
+    background: rgba(255, 255, 255, 0.36);
 }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
