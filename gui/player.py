@@ -172,14 +172,15 @@ class PlayerEngine(QObject):
     def song(self) -> Song | None:
         return self._song
 
-    def play_song(self, song: Song) -> None:
+    def play_song(self, song: Song, force_remote: bool = False) -> None:
+        """force_remote=True 用于「重试」：跳过本地文件，直接重新联网取。"""
         self._token += 1
         token = self._token
         self._song = song
         self.started.emit(song)
         self.state_changed.emit(LOADING)
         threading.Thread(
-            target=self._prepare, args=(song, token), daemon=True
+            target=self._prepare, args=(song, token, force_remote), daemon=True
         ).start()
 
     def play_local(self, song: Song, path: Path) -> None:
@@ -240,11 +241,18 @@ class PlayerEngine(QObject):
             except OSError:
                 pass
 
-    def _prepare(self, song: Song, token: int) -> None:
+    def _prepare(self, song: Song, token: int, force_remote: bool = False) -> None:
         try:
-            path = self.local_provider(song) if self.local_provider else None
+            path = None
+            # 重试时先绕开本地：播放失败往往就是这份本地文件本身解不开，
+            # 再按同样的顺序走一遍，只会得到同样的错误
+            if not force_remote:
+                path = self.local_provider(song) if self.local_provider else None
             if path is None:
-                path = self._download(song, token)
+                path = self._download(song, token, fresh=force_remote)
+            if path is None and force_remote and self.local_provider:
+                # 网络也没取到，退回本地：残片总比什么都没有强
+                path = self.local_provider(song)
             if token != self._token:
                 return
             if path is None:
@@ -257,7 +265,7 @@ class PlayerEngine(QObject):
                 self._safe(self.failed, str(exc))
                 self._safe(self.state_changed, STOPPED)
 
-    def _download(self, song: Song, token: int) -> Path | None:
+    def _download(self, song: Song, token: int, fresh: bool = False) -> Path | None:
         if self.remote_provider is None:
             return None
         resolved = self.remote_provider(song)
@@ -265,6 +273,10 @@ class PlayerEngine(QObject):
             return None
         url, ext = resolved
         dest = self._temp / f"{song.id}.{ext or 'mp3'}"
+        if fresh:
+            # 上次缓存的临时文件可能就是解不开的那份，重试时丢掉重下
+            dest.unlink(missing_ok=True)
+            dest.with_name(dest.name + ".part").unlink(missing_ok=True)
         if dest.exists() and dest.stat().st_size > 0:
             return dest
         part = dest.with_suffix(dest.suffix + ".part")

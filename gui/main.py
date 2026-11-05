@@ -791,6 +791,7 @@ class MainWindow(QMainWindow):
         self.queue_rows: dict[int, int] = {}
         self.bars: dict[int, QProgressBar] = {}
         self._failed: list[Song] = []
+        self._partial_skipped: list[Song] = []
         self.out_dir = Path(
             self.settings.value("out_dir", str(default_download_dir()), type=str)
         )
@@ -1288,9 +1289,11 @@ class MainWindow(QMainWindow):
         self.play_index = index
         self._play_current()
 
-    def _play_current(self) -> None:
+    def _play_current(self, force_remote: bool = False) -> None:
         if 0 <= self.play_index < len(self.playlist):
-            self.player.play_song(self.playlist[self.play_index])
+            self.player.play_song(
+                self.playlist[self.play_index], force_remote=force_remote
+            )
 
     def _play_row(self, index) -> None:
         row = index.row() if hasattr(index, "row") else int(index)
@@ -1897,7 +1900,8 @@ class MainWindow(QMainWindow):
         if link == "cache":
             self._open_settings()
         elif link == "retry":
-            self._play_current()
+            # 重试直接联网取：失败大多出在本地文件上，原路再走一遍没用
+            self._play_current(force_remote=True)
 
     def _on_summary_link(self, link: str) -> None:
         if link == "retry":
@@ -3077,6 +3081,12 @@ class MainWindow(QMainWindow):
 
         # 记下失败项，可通过汇总里的「失败 N」重试
         self._failed = [r.song for r in results if r.status == FAILED]
+        # 因缓存没下完被跳过的：开关补上后可以一键补回，单独记一份
+        self._partial_skipped = [
+            r.song
+            for r in results
+            if r.status == CACHE_MISS and "缓存未下完" in (r.message or "")
+        ]
 
         stats = Counter(r.status for r in results)
         total_bytes = sum(
@@ -3185,9 +3195,12 @@ class MainWindow(QMainWindow):
             self.to_mp3 = dialog.to_mp3.isChecked()
             self.name_pattern = dialog.name_box.currentData()
             self.folder_pattern = dialog.folder_box.currentData()
-            self.settings.setValue(
-                "partial_fallback", dialog.partial_fallback.isChecked()
+            partial_before = bool(
+                self.settings.value("partial_fallback", True, type=bool)
             )
+            partial_after = dialog.partial_fallback.isChecked()
+            self.settings.setValue("partial_fallback", partial_after)
+            partial_turned_on = partial_after and not partial_before
             if dialog.out_dir != self.out_dir:
                 self.out_dir = dialog.out_dir
                 # 索引是按目录存的，换了目录必须换库，否则「已下载」永远查的是老地方
@@ -3231,6 +3244,31 @@ class MainWindow(QMainWindow):
                     if auth.load_cookie()
                     else "已退出登录，当前为匿名身份"
                 )
+            if partial_turned_on:
+                self._offer_complete_partials()
+
+    def _offer_complete_partials(self) -> None:
+        """刚打开「联网补齐」，问一句要不要把上一批跳过的歌补回来。"""
+        songs = list(getattr(self, "_partial_skipped", []))
+        if not songs:
+            return
+        if self.batch is not None:
+            self.status_label.setText(
+                f"已开启联网补齐；上一批有 {len(songs)} 首未缓存完，重新导出即可"
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "联网补齐",
+            f"上一批有 {len(songs)} 首因为缓存没下完被跳过了。\n"
+            "现在联网补齐这些歌吗？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self._partial_skipped = []
+        self._start_batch(songs)
 
     def _refresh_account_label(self) -> None:
         if auth.load_cookie():
