@@ -3353,15 +3353,34 @@ class MainWindow(QMainWindow):
         entries = cache_mod.scan(root)
         entry_map = {e.song_id: e for e in entries}
         
-        # 批量读取 idx 文件，更新进度
+        # 批量读取 idx 文件和 .uc 文件大小，更新进度
         updated = False
         for song_id in list(self._cache_progress.keys()):
             entry = entry_map.get(song_id)
             if not entry:
                 continue
+            
+            # 优先使用 idx 文件的 covered 数据
             covered, total = cache_mod.coverage(entry)
+            
+            # 如果 idx 没有数据或 total 为 0，使用 .uc 文件大小估算
+            if total <= 0:
+                try:
+                    # 获取 .uc 文件的实际大小
+                    uc_size = entry.path.stat().st_size
+                    # 用文件大小作为 covered 的近似值
+                    # 注意：这可能不准确，因为 .uc 是预分配的
+                    # 但至少能检测到文件在增长
+                    if uc_size > 0:
+                        covered = uc_size
+                        # 假设文件大小就是总大小（不准确，但能显示变化）
+                        total = uc_size
+                except OSError:
+                    continue
+            
             if total <= 0:
                 continue
+            
             old_covered, old_total, old_complete = self._cache_progress.get(song_id, (0, 0, False))
             if covered != old_covered or total != old_total:
                 self._cache_progress[song_id] = (covered, total, entry.complete)
@@ -3403,8 +3422,9 @@ class MainWindow(QMainWindow):
                     progress.setForeground(QColor(MUTED))
             else:
                 # 没有 idx 文件，根据 complete 状态显示
+                # 统一显示为"100%"或"未完成"，避免混淆
                 if complete:
-                    progress.setText("完成")
+                    progress.setText("100%")
                     progress.setForeground(QColor("#4caf50"))
                 else:
                     progress.setText("未完成")
