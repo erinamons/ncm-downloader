@@ -31,6 +31,7 @@ class CacheEntry:
     size: int
     complete: bool
     covered: int
+    mtime: float = 0.0
 
     @property
     def rate_label(self) -> str:
@@ -119,7 +120,9 @@ def scan(cache_dir: Path | str, max_depth: int = 3) -> list[CacheEntry]:
             if not match:
                 continue
             try:
-                size = path.stat().st_size
+                st = path.stat()
+                size = st.st_size
+                mtime = st.st_mtime
             except OSError:
                 continue
             declared, covered = _read_idx(path.with_suffix(".idx"))
@@ -138,6 +141,7 @@ def scan(cache_dir: Path | str, max_depth: int = 3) -> list[CacheEntry]:
                     size=size,
                     complete=complete,
                     covered=covered,
+                    mtime=mtime,
                 )
             )
     entries.sort(key=lambda e: (e.song_id, -e.rate))

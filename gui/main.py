@@ -2461,6 +2461,9 @@ class MainWindow(QMainWindow):
         # 以前一律过滤，表现就是「明明有缓存文件，列表只剩一首」。
         # 阈值只用来挡碎片文件，不用来挡没下完的歌。
         all_entries = [e for e in cache_mod.scan(root) if e.size > 100_000]
+        # 按缓存文件修改时间倒序：最新的在最上面。边听边缓存时文件一直在写，
+        # 正在听的歌会一直浮在顶部，新缓存的歌一出现就能看到，不用翻列表找。
+        all_entries.sort(key=lambda e: e.mtime, reverse=True)
         entries = all_entries
         self._cache_partial = {e.song_id for e in entries if not e.complete}
         # 记录每个缓存条目的进度（covered, total, complete），用于显示状态
