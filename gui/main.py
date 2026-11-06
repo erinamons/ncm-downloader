@@ -1066,10 +1066,16 @@ class MainWindow(QMainWindow):
             t.setColumnWidth(4, 88)
             t.setWordWrap(False)
             t.setItemDelegateForColumn(1, self._name_delegate)
+            # 曲名列保底让到 116px：mini 窗口视口 ~358px，若保底 160，
+            # 「30+88+80+160」会超出视口，最右侧的进度列被裁得只剩半截
+            t.min_fluid = 116
         else:
             vh.setDefaultSectionSize(self._normal_row_h)
             t.setColumnWidth(4, 64)
+            t.min_fluid = 160
             t.setItemDelegateForColumn(1, None)
+        # 列宽是手动 set 的，不会自动触发弹性列重算，收尾补一次
+        t.refit()
 
     def _center_window(self, width: int, height: int) -> None:
         """在主屏可用区域居中，尺寸超出时退回屏幕尺寸。"""

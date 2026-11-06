@@ -87,6 +87,9 @@ class FluidTable(QTableWidget):
     def __init__(self, rows: int, cols: int, fluid_col: int = 1, parent=None):
         super().__init__(rows, cols, parent)
         self.fluid_col = fluid_col
+        # 弹性列的最小宽度：紧凑模式下主窗口会调小它，否则 mini 窗口里
+        # 「30 + 固定列 + 160」超过视口宽，最右边的进度列会被裁掉半截
+        self.min_fluid = MIN_FLUID
         self._filling = False
 
         header = self.horizontalHeader()
@@ -200,7 +203,7 @@ class FluidTable(QTableWidget):
             for c in range(self.columnCount())
             if c != self.fluid_col and not self.isColumnHidden(c)
         )
-        target = max(MIN_FLUID, total - others)
+        target = max(self.min_fluid, total - others)
         if self.columnWidth(self.fluid_col) == target:
             return
         self._filling = True
