@@ -144,6 +144,17 @@ def scan(cache_dir: Path | str, max_depth: int = 3) -> list[CacheEntry]:
     return entries
 
 
+def coverage(entry: CacheEntry) -> tuple[int, int]:
+    """返回 (已写入字节, 预期总字节)；没有 idx 时给 (0, 0)，表示无从判断。
+
+    预期总字节以 idx 声明的 size 为准：.uc 文件是预分配的，实际长度不可信。
+    """
+    declared, covered = _read_idx(entry.path.with_suffix(".idx"))
+    if not declared:
+        return (0, 0)
+    return (covered, max(declared, 0))
+
+
 def recheck(entry: CacheEntry) -> tuple[bool, int, int]:
     """用之前重新读一遍 idx，返回 (是否完整, 已覆盖字节, 文件长度)。
 

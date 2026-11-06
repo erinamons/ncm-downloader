@@ -98,7 +98,7 @@ from gui.table import FluidTable
 from gui.player import PlayerEngine, TopBar
 from gui.workers import BatchTask, Task
 
-HEADERS = ["", "曲名", "艺人", "专辑", "时长", "音质"]
+HEADERS = ["", "曲名", "艺人", "专辑", "时长", "音质", "进度"]
 
 log = logging.getLogger("ncm.gui")
 
@@ -778,6 +778,8 @@ class MainWindow(QMainWindow):
         self._cache_rates: dict[int, str] = {}
         # 缓存没下完的曲目 id，列表里要标注，免得用户以为能直接导出
         self._cache_partial: set[int] = set()
+        # 缓存进度：{song_id: (covered_bytes, total_bytes)}，用于显示百分比
+        self._cache_progress: dict[int, tuple[int, int]] = {}
         # 曲目详情的内存缓存：缓存自动刷新很频繁，避免反复请求接口
         self._detail_cache: dict[int, Song] = {}
         # 活着的后台任务：只靠 self.task 一个引用不够，旧任务的 finished
@@ -833,6 +835,11 @@ class MainWindow(QMainWindow):
         # QFileSystemWatcher 在 Windows 上遇到大量增删会静默失效（缓存目录正好
         # 是边播边写边删），所以再加一道轮询兜底：定时比一下目录指纹，变了就重扫
         self._cache_signature: tuple[int, float] | None = None
+        # 进度刷新定时器：每 1.5 秒刷新一次进度列，显示缓存写入进度
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(1500)
+        self._progress_timer.timeout.connect(self._refresh_progress_column)
+        self._progress_timer.start()
         self._cache_poll = QTimer(self)
         self._cache_poll.setInterval(8000)
         self._cache_poll.timeout.connect(self._poll_cache_dir)
@@ -1600,13 +1607,14 @@ class MainWindow(QMainWindow):
         layout.addLayout(info_row)
 
         # 所有列都能拖动；窗口变宽时余量给曲名（见 FluidTable）
-        self.result_table = FluidTable(0, 6, fluid_col=1)
+        self.result_table = FluidTable(0, 7, fluid_col=1)
         self.result_table.setHorizontalHeaderLabels(HEADERS)
         self._style_table(self.result_table)
         header = self.result_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Fixed)
         header.setSectionResizeMode(4, QHeaderView.Fixed)
         header.setSectionResizeMode(5, QHeaderView.Fixed)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
         self.result_table.setColumnWidth(0, 30)
         self.result_table.setColumnWidth(1, 300)
         self.result_table.setColumnWidth(2, 160)
@@ -1614,7 +1622,8 @@ class MainWindow(QMainWindow):
         # 时长与音质分开：挤在一列时右对齐会把时长截掉，只剩「320k」
         self.result_table.setColumnWidth(4, 64)
         self.result_table.setColumnWidth(5, 70)
-        self._align_header(self.result_table, {4, 5})
+        self.result_table.setColumnWidth(6, 80)
+        self._align_header(self.result_table, {4, 5, 6})
         # 排序挂在表头：点第一列切全选，点其余列排序（升 → 降 → 取消）
         header.setSectionsClickable(True)
         header.setSortIndicatorShown(False)
@@ -2390,6 +2399,12 @@ class MainWindow(QMainWindow):
         all_entries = [e for e in cache_mod.scan(root) if e.size > 100_000]
         entries = all_entries
         self._cache_partial = {e.song_id for e in entries if not e.complete}
+        # 记录每个缓存条目的进度（covered, total），用于显示百分比
+        self._cache_progress = {}
+        for e in entries:
+            covered, total = cache_mod.coverage(e)
+            if total > 0:
+                self._cache_progress[e.song_id] = (covered, total)
         # 每次扫描都留一条记录：以后出现「有文件却不显示」时，翻日志就能看出
         # 是文件根本没被扫到，还是被哪一步过滤掉了
         try:
@@ -2534,6 +2549,7 @@ class MainWindow(QMainWindow):
         # 别用「有没有码率」判断，否则解析歌单时撞上缓存里的同 id 会串味
         show_quality = self._current_source() == "cache"
         table.setColumnHidden(5, not show_quality)
+        table.setColumnHidden(6, not show_quality)  # 进度列也只在缓存视图显示
         self._ensure_audio_store()
         store = self._audio_store
         table.blockSignals(True)
@@ -2582,8 +2598,30 @@ class MainWindow(QMainWindow):
             quality.setToolTip(f"缓存音质 {rate_text}" if rate_text else "")
             table.setItem(row, 5, quality)
 
+            # 进度列：缓存视图显示完成百分比，其它视图留空
+            progress = QTableWidgetItem()
+            progress.setTextAlignment(Qt.AlignCenter)
+            if self._current_source() == "cache":
+                if song.id in self._cache_progress:
+                    covered, total = self._cache_progress[song.id]
+                    if total > 0:
+                        pct = covered / total * 100
+                        progress.setText(f"{pct:.0f}%")
+                        # 颜色：完成=绿色，进行中=蓝色，未开始=灰色
+                        if pct >= 98:
+                            progress.setForeground(QColor("#4caf50"))
+                        elif pct > 0:
+                            progress.setForeground(QColor("#2196f3"))
+                        else:
+                            progress.setForeground(QColor(MUTED))
+                else:
+                    # 没有idx文件，无法判断进度
+                    progress.setText("-")
+                    progress.setForeground(QColor(MUTED))
+            table.setItem(row, 6, progress)
+
             if song.id == self._playing_id:
-                for col in range(6):
+                for col in range(7):
                     cell = table.item(row, col)
                     if cell is not None:
                         cell.setBackground(QColor("#2c2c36"))
@@ -3278,6 +3316,74 @@ class MainWindow(QMainWindow):
             return
         self._partial_skipped = []
         self._start_batch(songs)
+
+    def _refresh_progress_column(self) -> None:
+        """定期刷新进度列，显示缓存写入进度。"""
+        if self._current_source() != "cache":
+            return
+        table = self.result_table
+        if table.isColumnHidden(6):  # 进度列隐藏时不刷新
+            return
+        
+        # 重新扫描缓存目录，更新进度数据
+        root = self.cache_dir
+        if root is None or not Path(root).is_dir():
+            return
+        
+        # 只扫描有缓存条目的 song_id
+        if not self._cache_progress:
+            return
+        
+        # 直接从缓存目录扫描，建立 song_id 到 entry 的映射
+        entries = cache_mod.scan(root)
+        entry_map = {e.song_id: e for e in entries}
+        
+        # 批量读取 idx 文件，更新进度
+        updated = False
+        for song_id in list(self._cache_progress.keys()):
+            entry = entry_map.get(song_id)
+            if not entry:
+                continue
+            covered, total = cache_mod.coverage(entry)
+            if total <= 0:
+                continue
+            old_covered, old_total = self._cache_progress.get(song_id, (0, 0))
+            if covered != old_covered or total != old_total:
+                self._cache_progress[song_id] = (covered, total)
+                updated = True
+        
+        # 只在有变化时更新 UI
+        if not updated:
+            return
+        
+        # 更新进度列显示
+        for row in range(table.rowCount()):
+            item = table.item(row, 1)
+            if not item:
+                continue
+            tooltip = item.toolTip()
+            if not tooltip or "id " not in tooltip:
+                continue
+            try:
+                song_id = int(tooltip.split("id ")[-1].split("\n")[0])
+            except (ValueError, IndexError):
+                continue
+            if song_id not in self._cache_progress:
+                continue
+            covered, total = self._cache_progress[song_id]
+            if total <= 0:
+                continue
+            pct = covered / total * 100
+            progress = table.item(row, 6)
+            if not progress:
+                continue
+            progress.setText(f"{pct:.0f}%")
+            if pct >= 98:
+                progress.setForeground(QColor("#4caf50"))
+            elif pct > 0:
+                progress.setForeground(QColor("#2196f3"))
+            else:
+                progress.setForeground(QColor(MUTED))
 
     def _refresh_account_label(self) -> None:
         if auth.load_cookie():
