@@ -2399,12 +2399,12 @@ class MainWindow(QMainWindow):
         all_entries = [e for e in cache_mod.scan(root) if e.size > 100_000]
         entries = all_entries
         self._cache_partial = {e.song_id for e in entries if not e.complete}
-        # 记录每个缓存条目的进度（covered, total），用于显示百分比
+        # 记录每个缓存条目的进度（covered, total, complete），用于显示状态
         self._cache_progress = {}
         for e in entries:
             covered, total = cache_mod.coverage(e)
-            if total > 0:
-                self._cache_progress[e.song_id] = (covered, total)
+            # 即使没有 idx 文件，也记录完成状态
+            self._cache_progress[e.song_id] = (covered, total, e.complete)
         # 每次扫描都留一条记录：以后出现「有文件却不显示」时，翻日志就能看出
         # 是文件根本没被扫到，还是被哪一步过滤掉了
         try:
@@ -2603,8 +2603,9 @@ class MainWindow(QMainWindow):
             progress.setTextAlignment(Qt.AlignCenter)
             if self._current_source() == "cache":
                 if song.id in self._cache_progress:
-                    covered, total = self._cache_progress[song.id]
+                    covered, total, complete = self._cache_progress[song.id]
                     if total > 0:
+                        # 有 idx 文件，显示百分比
                         pct = covered / total * 100
                         progress.setText(f"{pct:.0f}%")
                         # 颜色：完成=绿色，进行中=蓝色，未开始=灰色
@@ -2614,8 +2615,16 @@ class MainWindow(QMainWindow):
                             progress.setForeground(QColor("#2196f3"))
                         else:
                             progress.setForeground(QColor(MUTED))
+                    else:
+                        # 没有 idx 文件，根据 complete 状态显示
+                        if complete:
+                            progress.setText("完成")
+                            progress.setForeground(QColor("#4caf50"))
+                        else:
+                            progress.setText("未完成")
+                            progress.setForeground(QColor("#ff9800"))
                 else:
-                    # 没有idx文件，无法判断进度
+                    # 没有缓存条目
                     progress.setText("-")
                     progress.setForeground(QColor(MUTED))
             table.setItem(row, 6, progress)
