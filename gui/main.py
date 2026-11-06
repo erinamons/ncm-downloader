@@ -1184,9 +1184,11 @@ class MainWindow(QMainWindow):
             return
         if signature != self._cache_signature:
             self._cache_signature = signature
-            # 如果当前在缓存视图，立即刷新
-            if self._current_source() == "cache":
-                self._auto_refresh_cache()
+            self._rescan_pending = True
+        # pending 交给 _auto_refresh_cache 决定：节流没到点就保持 pending，
+        # 下个 tick 再试，重扫请求不会被丢掉
+        if self._rescan_pending and self._current_source() == "cache":
+            self._auto_refresh_cache()
 
     def _on_cache_dir_changed(self, _path: str) -> None:
         # 监听器偶发失效后就再也不触发了，这里顺手重新挂一次当作自愈
@@ -1197,18 +1199,35 @@ class MainWindow(QMainWindow):
         if not self._cache_timer.isActive():
             self._cache_timer.start()
 
+    def _has_unchecked_rows(self) -> bool:
+        """表格里是否有未勾选的行。
+
+        表格重建时默认全勾；出现未勾选行说明用户手动取消过——重扫重建
+        会把这个勾选状态抹掉，自动刷新要为它让路。默认全勾不阻断。
+        （之前直接用 _selected_songs() 判断，而列表默认全勾，结果自动
+        刷新被永久挡住，一次都不会触发。）
+        """
+        for row in range(self.result_table.rowCount()):
+            item = self.result_table.item(row, 0)
+            if item and item.checkState() != Qt.Checked:
+                return True
+        return False
+
     def _auto_refresh_cache(self) -> None:
         """缓存目录变了就静默重扫，但不打断用户正在做的事。"""
         if self.task is not None or self._current_source() != "cache":
             return
         if self._cache_scan_failed:
             return  # 上次就失败了，等用户手动点「本地缓存」再试
-        if self._selected_songs():
-            return  # 正勾着歌单，重排会清掉勾选，等下次
-        # 节流：播放中指纹每秒都在变，全量重扫最快 2 秒一次
+        if self._has_unchecked_rows():
+            return  # 用户手动取消过勾选，重排会清掉勾选，等恢复全勾
+        # 节流：播放中指纹每秒都在变，全量重扫最快 2 秒一次；
+        # 窗口内置 pending，轮询下个 tick 会带着 pending 重试
         now = time.monotonic()
         if now - self._last_auto_rescan < 2.0:
+            self._rescan_pending = True
             return
+        self._rescan_pending = False
         self._last_auto_rescan = now
         self._auto_rescanning = True
         try:
@@ -1918,6 +1937,7 @@ class MainWindow(QMainWindow):
         # 全量重扫 + 重建表格很重，节流到最快 2 秒一次
         self._last_auto_rescan = 0.0
         self._auto_rescanning = False
+        self._rescan_pending = False
 
         # 排序切换：只对缓存视图生效，默认按缓存时间（最新在前）
         self.btn_sort = QPushButton()

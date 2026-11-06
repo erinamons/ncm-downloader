@@ -16,6 +16,11 @@ from ncm.log import setup_logging  # noqa: E402
 
 
 def main() -> None:
+    # C++/Qt 层段错误不会走 Python 异常机制，faulthandler 能把崩溃时的
+    # Python 调用栈打到 stderr，是定位 segfault 的唯一线索
+    import faulthandler
+
+    faulthandler.enable()
     log_file = setup_logging()
     logging.getLogger("ncm.gui").info("启动，日志位于 %s", log_file)
 
