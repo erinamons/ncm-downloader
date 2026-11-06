@@ -324,7 +324,12 @@ class PlayerEngine(QObject):
             timeout=(10, 40),
         ) as resp:
             resp.raise_for_status()
-            total = src.size or 0
+            # remote_provider 只给 (url, ext)，没有 size；总长从响应头拿，
+            # 缺失（chunked 传输）时走按字节数报进度的分支
+            try:
+                total = int(resp.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                total = 0
             written = 0
             last_milestone = 0
             with open(part, "wb") as fh:
