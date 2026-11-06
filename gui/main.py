@@ -1886,6 +1886,20 @@ class MainWindow(QMainWindow):
         self.btn_refresh.clicked.connect(self._refresh_current)
         bar.addWidget(self.btn_refresh)
 
+        # 自动刷新开关按钮
+        self.btn_auto_refresh = QPushButton()
+        self.btn_auto_refresh.setObjectName("helpBtn")
+        self.btn_auto_refresh.setIcon(icons.stateful("refresh-cw", "#8b8b95", "#ffffff", 14))
+        self.btn_auto_refresh.setIconSize(QSize(14, 14))
+        self.btn_auto_refresh.setFixedSize(22, 20)
+        self.btn_auto_refresh.setToolTip("自动刷新缓存列表（每秒检测一次）")
+        self.btn_auto_refresh.setFocusPolicy(Qt.NoFocus)
+        self.btn_auto_refresh.setCheckable(True)
+        self.btn_auto_refresh.setChecked(False)
+        self.btn_auto_refresh.clicked.connect(self._toggle_auto_refresh)
+        bar.addWidget(self.btn_auto_refresh)
+        self._auto_refresh_enabled = False
+
         self.btn_clear = QPushButton()
         self.btn_clear.setObjectName("helpBtn")
         self.btn_clear.setIcon(icons.stateful("trash-2", "#8b8b95", "#ffffff", 14))
@@ -2120,6 +2134,22 @@ class MainWindow(QMainWindow):
         self.input.blockSignals(False)
         self._apply_view()
         self.status_label.setText(f"已清空 {SOURCE_LABEL.get(source, source)} 的结果")
+
+    def _toggle_auto_refresh(self) -> None:
+        """切换自动刷新开关"""
+        self._auto_refresh_enabled = self.btn_auto_refresh.isChecked()
+        if self._auto_refresh_enabled:
+            # 开启自动刷新：加快进度刷新和目录轮询
+            self._progress_timer.setInterval(500)
+            self._cache_poll.setInterval(500)
+            self.btn_auto_refresh.setToolTip("自动刷新已开启（点击关闭）")
+            self.status_label.setText("自动刷新已开启")
+        else:
+            # 关闭自动刷新：恢复正常间隔
+            self._progress_timer.setInterval(1500)
+            self._cache_poll.setInterval(1000)
+            self.btn_auto_refresh.setToolTip("开启自动刷新（更快更新进度）")
+            self.status_label.setText("自动刷新已关闭")
 
     @staticmethod
     def _looks_like_link(text: str) -> bool:
@@ -3228,7 +3258,6 @@ class MainWindow(QMainWindow):
         self.songs = []
         self._list_cleared = False
         self._fill_result_table()
-        self.result_info.setText("已退出登录，重新搜索或选择音源")
         self._update_empty_hint()
         self._update_download_button()
         self.status_label.setText("已退出登录")
@@ -3353,42 +3382,35 @@ class MainWindow(QMainWindow):
         entries = cache_mod.scan(root)
         entry_map = {e.song_id: e for e in entries}
         
-        # 批量读取 idx 文件和 .uc 文件大小，更新进度
-        updated = False
+        # 批量读取 idx 文件的实时内容，更新进度
+        # 注意：idx 文件只有在切歌时才会更新，所以正在播放的歌曲进度不会实时变化
         for song_id in list(self._cache_progress.keys()):
             entry = entry_map.get(song_id)
             if not entry:
                 continue
             
-            # 优先使用 idx 文件的 covered 数据
-            covered, total = cache_mod.coverage(entry)
-            
-            # 如果 idx 没有数据或 total 为 0，使用 .uc 文件大小估算
-            if total <= 0:
+            # 直接读取 idx 文件的实时内容
+            idx_path = entry.path.with_suffix(".idx")
+            if idx_path.exists():
                 try:
-                    # 获取 .uc 文件的实际大小
+                    import json
+                    with open(idx_path, "r", encoding="utf-8") as f:
+                        idx_data = json.load(f)
+                    covered = idx_data.get("covered", 0)
+                    total = idx_data.get("total", 0)
+                    if total > 0:
+                        self._cache_progress[song_id] = (covered, total, entry.complete)
+                except Exception:
+                    pass
+            else:
+                # 没有 idx 文件，使用 .uc 文件大小估算
+                try:
                     uc_size = entry.path.stat().st_size
-                    # 用文件大小作为 covered 的近似值
-                    # 注意：这可能不准确，因为 .uc 是预分配的
-                    # 但至少能检测到文件在增长
                     if uc_size > 0:
-                        covered = uc_size
-                        # 假设文件大小就是总大小（不准确，但能显示变化）
-                        total = uc_size
+                        # 假设文件大小就是总大小
+                        self._cache_progress[song_id] = (uc_size, uc_size, entry.complete)
                 except OSError:
-                    continue
-            
-            if total <= 0:
-                continue
-            
-            old_covered, old_total, old_complete = self._cache_progress.get(song_id, (0, 0, False))
-            if covered != old_covered or total != old_total:
-                self._cache_progress[song_id] = (covered, total, entry.complete)
-                updated = True
-        
-        # 只在有变化时更新 UI
-        if not updated:
-            return
+                    pass
         
         # 更新进度列显示
         for row in range(table.rowCount()):
