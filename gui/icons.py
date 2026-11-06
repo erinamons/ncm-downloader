@@ -60,8 +60,14 @@ def stateful(
     hover: str = "#ffffff",
     size: int = 15,
 ) -> QIcon:
-    """带悬停态的图标：普通一色，悬停提亮。"""
+    """带悬停/选中态的图标：普通一色，悬停或勾选（checked）提亮。
+
+    checkable 按钮 checked 时 Qt 取 QIcon 的 On 状态；不补的话会回退到
+    Normal/Off 的灰色，出现「红底上灰图标」的违和组合。
+    """
     result = QIcon()
     result.addPixmap(pixmap(name, normal, size), QIcon.Normal, QIcon.Off)
     result.addPixmap(pixmap(name, hover, size), QIcon.Active, QIcon.Off)
+    result.addPixmap(pixmap(name, hover, size), QIcon.Normal, QIcon.On)
+    result.addPixmap(pixmap(name, hover, size), QIcon.Active, QIcon.On)
     return result
