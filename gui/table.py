@@ -7,10 +7,80 @@ Qt 原生的 Stretch 模式有两个毛病：被拉伸的列无法拖动（曲�
 """
 from __future__ import annotations
 
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtWidgets import QHeaderView, QTableWidget, QWidget
+from PyQt5.QtCore import QSize, Qt, QTimer
+from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter
+from PyQt5.QtWidgets import (
+    QApplication,
+    QHeaderView,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QTableWidget,
+    QWidget,
+)
 
 MIN_FLUID = 160
+NAME_COLOR = "#d8d8dc"
+MUTED_COLOR = "#96969e"
+
+
+class TwoLineNameDelegate(QStyledItemDelegate):
+    """紧凑模式的曲名列：上行曲名，下行「艺人 · 专辑」灰色小字。
+
+    完整模式的艺人/专辑列被隐藏时用它补回信息。选中高亮、悬停、播放行
+    底色仍走默认绘制：先把 CE_ItemViewItem 的背景部分画出来，再自己叠
+    两行文本。名字颜色取 item 的 ForegroundRole（已下载绿、未完成橙、
+    播放白），和完整模式的状态色自动保持一致。
+    """
+
+    def __init__(self, window, parent=None):
+        super().__init__(parent)
+        self._win = window
+
+    def sizeHint(self, option, index):
+        return QSize(0, 44)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        widget = opt.widget if opt.widget is not None else self.parent()
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+
+        songs = getattr(self._win, "songs", [])
+        row = index.row()
+        song = songs[row] if 0 <= row < len(songs) else None
+        if song is None:
+            return
+
+        rect = option.rect.adjusted(2, 0, -6, 0)
+        fg = index.data(Qt.ForegroundRole)
+        name_color = fg if isinstance(fg, QColor) else QColor(NAME_COLOR)
+
+        painter.save()
+        # FontRole 里可能是播放行的加粗字体
+        fnt = index.data(Qt.FontRole)
+        painter.setFont(fnt if isinstance(fnt, QFont) else option.font)
+        painter.setPen(name_color)
+        name = QFontMetrics(painter.font()).elidedText(
+            song.name, Qt.ElideRight, rect.width()
+        )
+        painter.drawText(rect.adjusted(0, 4, 0, 0), Qt.AlignTop | Qt.AlignLeft, name)
+
+        sub = (
+            song.artist_text
+            if not song.album
+            else f"{song.artist_text} · {song.album}"
+        )
+        sub_font = QFont(option.font)
+        sub_font.setPointSizeF(max(8.5, option.font.pointSizeF() - 1.5))
+        sub_fm = QFontMetrics(sub_font)
+        painter.setFont(sub_font)
+        painter.setPen(QColor(MUTED_COLOR))
+        sub = sub_fm.elidedText(sub, Qt.ElideRight, rect.width())
+        painter.drawText(rect.adjusted(0, 0, 0, -4), Qt.AlignBottom | Qt.AlignLeft, sub)
+        painter.restore()
 
 
 class FluidTable(QTableWidget):

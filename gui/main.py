@@ -95,7 +95,7 @@ from gui.help import HelpDialog
 from gui.inputs import HistoryLineEdit
 from gui.shadow import clip_outside_window, render_shadow
 from gui.style import BG, MUTED, PANEL, QSS
-from gui.table import FluidTable
+from gui.table import FluidTable, TwoLineNameDelegate
 from gui.player import PlayerEngine, TopBar
 from gui.workers import BatchTask, Task
 
@@ -859,6 +859,7 @@ class MainWindow(QMainWindow):
             self.resize(400, 620)
             QTimer.singleShot(0, self._enter_mini_from_startup)
         # 上次停在「仅本地缓存」时，启动就把列表载入
+        self._update_compact_mode()
         if self._current_source() == "cache":
             self.on_load_cache()
 
@@ -1028,6 +1029,47 @@ class MainWindow(QMainWindow):
         self.repaint()
         if hasattr(self, "_shadow_timer"):
             self._shadow_timer.start()
+        if hasattr(self, "_compact_mode"):
+            self._update_compact_mode()
+
+    # 7 列完整布局的最小总宽约 764px（30+160+160+200+64+70+80），
+    # 阈值要盖住它，否则 700~764 之间会出现横向滚动条
+    COMPACT_WIDTH = 780
+
+    def _update_compact_mode(self) -> None:
+        """窗口过窄时切到紧凑列布局，变宽后切回完整 7 列。
+
+        只在状态翻转时动作；紧凑与否不影响列结构和数据，切换即重填。
+        """
+        compact = self.width() < self.COMPACT_WIDTH
+        if compact == self._compact_mode:
+            return
+        self._compact_mode = compact
+        self._apply_compact_columns()
+        # 时长列文本（是否并音质）随模式变化，重建一次内容
+        self._fill_result_table()
+
+    def _apply_compact_columns(self) -> None:
+        """按紧凑/完整模式显隐列、调行高、换曲名列的绘制代理。"""
+        t = self.result_table
+        c = self._compact_mode
+        t.setColumnHidden(2, c)
+        t.setColumnHidden(3, c)
+        header_item = t.horizontalHeaderItem(4)
+        if header_item is not None:
+            header_item.setText("时长 · 音质" if c else "时长")
+        vh = t.verticalHeader()
+        if c:
+            vh.setDefaultSectionSize(self._compact_row_h)
+            # 时长并了音质，64px 放不下「2:35 · 320k」；还要关 wordWrap，
+            # 否则这个宽度下 Qt 会把合并文本折成两行
+            t.setColumnWidth(4, 88)
+            t.setWordWrap(False)
+            t.setItemDelegateForColumn(1, self._name_delegate)
+        else:
+            vh.setDefaultSectionSize(self._normal_row_h)
+            t.setColumnWidth(4, 64)
+            t.setItemDelegateForColumn(1, None)
 
     def _center_window(self, width: int, height: int) -> None:
         """在主屏可用区域居中，尺寸超出时退回屏幕尺寸。"""
@@ -1669,6 +1711,13 @@ class MainWindow(QMainWindow):
         self.result_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.result_table.customContextMenuRequested.connect(self._show_context_menu)
 
+        # 紧凑模式：窗口过窄时曲名列双行（艺人·专辑沉到第二行）、时长并音质，
+        # 艺人/专辑列隐藏，进度列常驻。列结构与数据不变，只是显隐+自绘
+        self._compact_mode = False
+        self._compact_row_h = 44
+        self._normal_row_h = self.result_table.verticalHeader().defaultSectionSize()
+        self._name_delegate = TwoLineNameDelegate(self, self.result_table)
+
         # 空列表时表格就是一块黑，盖一层居中说明告诉用户下一步做什么
         self.empty_hint = QLabel("输入歌名、歌手开始搜索\n也可以直接粘贴歌曲 / 歌单链接")
         self.empty_hint.setObjectName("emptyHint")
@@ -2008,6 +2057,9 @@ class MainWindow(QMainWindow):
         table.verticalHeader().setVisible(False)
         table.setShowGrid(False)
         table.setAlternatingRowColors(False)
+        # 单元格文本一律省略号截断，绝不折行：紧凑模式的「时长 · 音质」
+        # 合并文本靠这个保持单行
+        table.setWordWrap(False)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setFocusPolicy(Qt.NoFocus)
@@ -2702,9 +2754,12 @@ class MainWindow(QMainWindow):
         # 其它音源没有码率信息，就别占一列空的
         # 只看音源：缓存视图常驻（空表也留着，避免列宽跳动）；
         # 别用「有没有码率」判断，否则解析歌单时撞上缓存里的同 id 会串味
-        show_quality = self._current_source() == "cache"
+        # 紧凑模式下音质并入时长列，音质列一律隐藏；进度列仍只看音源
+        compact = self._compact_mode
+        is_cache = self._current_source() == "cache"
+        show_quality = is_cache and not compact
         table.setColumnHidden(5, not show_quality)
-        table.setColumnHidden(6, not show_quality)  # 进度列也只在缓存视图显示
+        table.setColumnHidden(6, not is_cache)
         btn_sort = getattr(self, "btn_sort", None)
         if btn_sort is not None:
             btn_sort.setVisible(show_quality)  # 排序按钮同理
@@ -2743,11 +2798,6 @@ class MainWindow(QMainWindow):
             album.setToolTip(song.album)
             table.setItem(row, 3, album)
 
-            duration = QTableWidgetItem(song.duration_text)
-            duration.setForeground(QColor(MUTED))
-            duration.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            table.setItem(row, 4, duration)
-
             # 音质单列：只有缓存视图知道码率，其它视图留空
             rate_text = self._cache_rates.get(song.id, "")
             quality = QTableWidgetItem(rate_text)
@@ -2755,6 +2805,16 @@ class MainWindow(QMainWindow):
             quality.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             quality.setToolTip(f"缓存音质 {rate_text}" if rate_text else "")
             table.setItem(row, 5, quality)
+
+            # 时长列：紧凑模式下音质并进来（完整模式音质有独立列）
+            if compact and is_cache and rate_text:
+                duration = QTableWidgetItem(f"{song.duration_text} · {rate_text}")
+                duration.setToolTip(f"缓存音质 {rate_text}")
+            else:
+                duration = QTableWidgetItem(song.duration_text)
+            duration.setForeground(QColor(MUTED))
+            duration.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            table.setItem(row, 4, duration)
 
             # 进度列：缓存视图显示完成百分比，其它视图留空
             progress = QTableWidgetItem()
