@@ -354,19 +354,19 @@ QPushButton#helpBtn:hover {{
     background: #2f2f36;
     border: none;
 }}
-QPushButton#autoRefreshBtn {{
+QPushButton#autoRefreshBtn, QPushButton#sortBtn {{
     background: transparent;
     border: none;
     border-radius: 10px;
     padding: 0;
 }}
-QPushButton#autoRefreshBtn:hover {{
+QPushButton#autoRefreshBtn:hover, QPushButton#sortBtn:hover {{
     background: #2f2f36;
 }}
-QPushButton#autoRefreshBtn:checked {{
+QPushButton#autoRefreshBtn:checked, QPushButton#sortBtn:checked {{
     background: {ACCENT};
 }}
-QPushButton#autoRefreshBtn:checked:hover {{
+QPushButton#autoRefreshBtn:checked:hover, QPushButton#sortBtn:checked:hover {{
     background: {ACCENT_HOVER};
 }}
 QPushButton#moreButton {{

@@ -1905,6 +1905,23 @@ class MainWindow(QMainWindow):
         self._ar_spin.setInterval(33)  # ~30fps，一圈约 0.8 秒
         self._ar_spin.timeout.connect(self._spin_auto_refresh)
 
+        # 排序切换：只对缓存视图生效，默认按缓存时间（最新在前）
+        self.btn_sort = QPushButton()
+        self.btn_sort.setObjectName("sortBtn")
+        self.btn_sort.setIcon(icons.stateful("arrow-down-wide-narrow", "#8b8b95", "#ffffff", 14))
+        self.btn_sort.setIconSize(QSize(14, 14))
+        self.btn_sort.setFixedSize(22, 20)
+        self.btn_sort.setToolTip("排序：最新缓存在前\n点击改为按曲名")
+        self.btn_sort.setFocusPolicy(Qt.NoFocus)
+        self.btn_sort.setCheckable(True)
+        self.btn_sort.setChecked(True)
+        self.btn_sort.setVisible(False)
+        self.btn_sort.clicked.connect(self._toggle_sort)
+        bar.addWidget(self.btn_sort)
+        self._sort_by_time = True
+        # song_id -> 缓存时间（文件 mtime 或存档 at，同单位），切换排序时免重扫
+        self._cache_sort_key: dict[int, float] = {}
+
         self.btn_clear = QPushButton()
         self.btn_clear.setObjectName("helpBtn")
         self.btn_clear.setIcon(icons.stateful("trash-2", "#8b8b95", "#ffffff", 14))
@@ -2178,6 +2195,28 @@ class MainWindow(QMainWindow):
         painter.drawPixmap(0, 0, pm)
         painter.end()
         self.btn_auto_refresh.setIcon(QIcon(rotated))
+
+    def _toggle_sort(self) -> None:
+        """切换缓存列表排序：最新缓存在前 <-> 按曲名。"""
+        self._sort_by_time = self.btn_sort.isChecked()
+        if self._sort_by_time:
+            self.btn_sort.setToolTip("排序：最新缓存在前\n点击改为按曲名")
+            self.status_label.setText("缓存列表：最新缓存在前")
+        else:
+            self.btn_sort.setToolTip("排序：按曲名\n点击改为最新缓存在前")
+            self.status_label.setText("缓存列表：按曲名排序")
+        # 就在缓存视图且有数据时原地重排，不用重扫
+        if self._current_source() == "cache" and "cache" in self._pools:
+            songs, title, flag = self._pools["cache"]
+            if songs:
+                self._pools["cache"] = (self._sorted_cache_songs(songs), title, flag)
+                self._apply_view()
+
+    def _sorted_cache_songs(self, songs: list[Song]) -> list[Song]:
+        """按当前排序模式排列缓存歌曲：时间（新→旧）或曲名。"""
+        if not self._sort_by_time:
+            return sorted(songs, key=lambda s: s.name)
+        return sorted(songs, key=lambda s: -self._cache_sort_key.get(s.id, 0.0))
 
     @staticmethod
     def _looks_like_link(text: str) -> bool:
@@ -2461,10 +2500,15 @@ class MainWindow(QMainWindow):
         # 以前一律过滤，表现就是「明明有缓存文件，列表只剩一首」。
         # 阈值只用来挡碎片文件，不用来挡没下完的歌。
         all_entries = [e for e in cache_mod.scan(root) if e.size > 100_000]
-        # 按缓存文件修改时间倒序：最新的在最上面。边听边缓存时文件一直在写，
-        # 正在听的歌会一直浮在顶部，新缓存的歌一出现就能看到，不用翻列表找。
+        # 按 mtime 降序遍历：同一首歌多档位时，「未识别曲目」等去重逻辑
+        # 会取第一个遇到的条目，最近播过的档位排在前面正合适
         all_entries.sort(key=lambda e: e.mtime, reverse=True)
         entries = all_entries
+        # 每首歌取最新的缓存文件时间，给排序按钮用（存档歌补上存档时间）
+        sort_key: dict[int, float] = {}
+        for e in entries:
+            if e.mtime > sort_key.get(e.song_id, 0.0):
+                sort_key[e.song_id] = e.mtime
         self._cache_partial = {e.song_id for e in entries if not e.complete}
         # 记录每个缓存条目的进度（covered, total, complete），用于显示状态
         self._cache_progress = {}
@@ -2555,6 +2599,14 @@ class MainWindow(QMainWindow):
         for entry in entries:
             self._cache_rates.setdefault(entry.song_id, entry.rate_label)
 
+        # 存档歌文件可能已不在客户端目录，用存档时间参与排序（与 mtime 同单位）
+        for song_id, item in index.items():
+            at = float(item.get("at") or 0)
+            if at and at > sort_key.get(song_id, 0.0):
+                sort_key[song_id] = at
+        self._cache_sort_key = sort_key
+        ordered = self._sorted_cache_songs(ordered)
+
         partial = len([s for s in ordered if s.id in self._cache_partial])
         # 数量由 _apply_view 统一追加「共 N 首」，这里只补充额外说明
         extras = []
@@ -2617,6 +2669,9 @@ class MainWindow(QMainWindow):
         show_quality = self._current_source() == "cache"
         table.setColumnHidden(5, not show_quality)
         table.setColumnHidden(6, not show_quality)  # 进度列也只在缓存视图显示
+        btn_sort = getattr(self, "btn_sort", None)
+        if btn_sort is not None:
+            btn_sort.setVisible(show_quality)  # 排序按钮同理
         self._ensure_audio_store()
         store = self._audio_store
         table.blockSignals(True)
