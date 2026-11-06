@@ -841,7 +841,7 @@ class MainWindow(QMainWindow):
         self._progress_timer.timeout.connect(self._refresh_progress_column)
         self._progress_timer.start()
         self._cache_poll = QTimer(self)
-        self._cache_poll.setInterval(8000)
+        self._cache_poll.setInterval(1000)  # 从 2 秒改为 1 秒，更实时
         self._cache_poll.timeout.connect(self._poll_cache_dir)
         self._cache_poll.start()
         # 启动视图为紧凑模式：先记下完整窗口的几何（Ctrl+M 要还原到这儿），
@@ -1148,32 +1148,33 @@ class MainWindow(QMainWindow):
         self._cache_dir_path = target
         self._cache_signature = None  # 换了目录，指纹作废
 
-    def _cache_dir_signature(self) -> tuple[int, float] | None:
-        """缓存目录的指纹：文件数 + 最新修改时间，用来判断有没有新歌进来。"""
+    def _cache_dir_signature(self) -> tuple[int, float, int] | None:
+        """缓存目录的指纹：文件数 + 最新修改时间 + 总大小，用来判断有没有新歌进来或正在下载。"""
         root = getattr(self, "_cache_dir_path", None)
         if not root or not Path(root).is_dir():
             return None
         count = 0
         latest = 0.0
+        total_size = 0
         try:
-            with os.scandir(root) as entries:
-                for entry in entries:
-                    if not entry.name.lower().endswith(".uc"):
-                        continue
-                    try:
-                        stat = entry.stat()
-                    except OSError:
-                        continue
+            # 递归扫描，确保子目录里的缓存变化也能被检测到
+            for path in Path(root).rglob("*.uc"):
+                try:
+                    stat = path.stat()
                     count += 1
                     latest = max(latest, stat.st_mtime)
+                    total_size += stat.st_size
+                except OSError:
+                    continue
         except OSError:
             return None
-        return (count, round(latest, 1))
+        return (count, round(latest, 1), total_size)
 
     def _poll_cache_dir(self) -> None:
         """兜底轮询：只比指纹，不扫内容。"""
-        if self._current_source() != "cache" or self.task is not None:
-            return
+        # 只要有缓存目录就检测，不管当前是否在缓存视图
+        if self.task is not None:
+            return  # 有任务在跑，等会儿再说
         signature = self._cache_dir_signature()
         if signature is None:
             return
@@ -1182,13 +1183,18 @@ class MainWindow(QMainWindow):
             return
         if signature != self._cache_signature:
             self._cache_signature = signature
-            self._auto_refresh_cache()
+            # 如果当前在缓存视图，立即刷新
+            if self._current_source() == "cache":
+                self._auto_refresh_cache()
 
     def _on_cache_dir_changed(self, _path: str) -> None:
         # 监听器偶发失效后就再也不触发了，这里顺手重新挂一次当作自愈
         if _path and Path(_path).is_dir() and _path not in self._cache_watcher.directories():
             self._cache_watcher.addPath(_path)
-        self._cache_timer.start()  # 防抖：连续写入只触发最后一次
+        # 使用固定间隔轮询，而不是防抖，避免网易云边听边写时定时器被无限重置
+        # 如果定时器已经在跑，就不重置，让它按原计划触发
+        if not self._cache_timer.isActive():
+            self._cache_timer.start()
 
     def _auto_refresh_cache(self) -> None:
         """缓存目录变了就静默重扫，但不打断用户正在做的事。"""
@@ -3356,9 +3362,9 @@ class MainWindow(QMainWindow):
             covered, total = cache_mod.coverage(entry)
             if total <= 0:
                 continue
-            old_covered, old_total = self._cache_progress.get(song_id, (0, 0))
+            old_covered, old_total, old_complete = self._cache_progress.get(song_id, (0, 0, False))
             if covered != old_covered or total != old_total:
-                self._cache_progress[song_id] = (covered, total)
+                self._cache_progress[song_id] = (covered, total, entry.complete)
                 updated = True
         
         # 只在有变化时更新 UI
@@ -3379,14 +3385,30 @@ class MainWindow(QMainWindow):
                 continue
             if song_id not in self._cache_progress:
                 continue
-            covered, total = self._cache_progress[song_id]
-            if total <= 0:
-                continue
-            pct = covered / total * 100
+            covered, total, complete = self._cache_progress[song_id]
             progress = table.item(row, 6)
             if not progress:
                 continue
-            progress.setText(f"{pct:.0f}%")
+            
+            if total > 0:
+                # 有 idx 文件，显示百分比
+                pct = covered / total * 100
+                progress.setText(f"{pct:.0f}%")
+                # 颜色：完成=绿色，进行中=蓝色，未开始=灰色
+                if pct >= 98:
+                    progress.setForeground(QColor("#4caf50"))
+                elif pct > 0:
+                    progress.setForeground(QColor("#2196f3"))
+                else:
+                    progress.setForeground(QColor(MUTED))
+            else:
+                # 没有 idx 文件，根据 complete 状态显示
+                if complete:
+                    progress.setText("完成")
+                    progress.setForeground(QColor("#4caf50"))
+                else:
+                    progress.setText("未完成")
+                    progress.setForeground(QColor("#ff9800"))
             if pct >= 98:
                 progress.setForeground(QColor("#4caf50"))
             elif pct > 0:
