@@ -43,11 +43,7 @@ class Backend(Protocol):
 
     def album(self, album_id: int) -> Playlist: ...
 
-    def expand_link(self, url: str) -> str:
-        """跟随 163cn.tv 短链的跳转，拿到带 id 的完整地址。"""
-        with self._lock:
-            resp = self.session.head(url, allow_redirects=True, timeout=self.timeout)
-        return resp.url or url
+    def expand_link(self, url: str) -> str: ...
 
     def song_url(self, song_id: int, level: str = "exhigh") -> AudioSource: ...
 
@@ -139,9 +135,20 @@ class LocalBackend:
     def song_details(self, song_ids: list[int]) -> list[Song]:
         if not song_ids:
             return []
-        payload = json.dumps([{"id": sid} for sid in song_ids])
-        data = self._api("/api/v3/song/detail", {"c": payload})
-        return [Song.from_api(item) for item in (data.get("songs") or [])]
+        # c 参数是整段 JSON 拼 URL，批次太大会被服务端拒；统一按 100 一批
+        result: list[Song] = []
+        for start in range(0, len(song_ids), 100):
+            chunk = song_ids[start : start + 100]
+            payload = json.dumps([{"id": sid} for sid in chunk])
+            data = self._api("/api/v3/song/detail", {"c": payload})
+            result.extend(Song.from_api(item) for item in (data.get("songs") or []))
+        return result
+
+    def expand_link(self, url: str) -> str:
+        """跟随 163cn.tv 短链的跳转，拿到带 id 的完整地址。"""
+        with self._lock:
+            resp = self.session.head(url, allow_redirects=True, timeout=self.timeout)
+        return resp.url or url
 
     def song_detail(self, song_id: int) -> Song | None:
         songs = self.song_details([song_id])

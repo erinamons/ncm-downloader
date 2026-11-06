@@ -53,9 +53,17 @@ TEMPLATE_HELP = """可用变量：
 """
 
 
+# Windows 保留设备名：歌曲/专辑名撞上时 open() 直接 WinError，且极难排查
+_RESERVED = re.compile(
+    r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$", re.IGNORECASE
+)
+
+
 def sanitize(name: str, fallback: str = "未命名") -> str:
     name = _ILLEGAL.sub("_", name or "").strip()
     name = _DOTS.sub("", name)
+    if _RESERVED.match(name):
+        name += "_"
     return name[:120] or fallback
 
 

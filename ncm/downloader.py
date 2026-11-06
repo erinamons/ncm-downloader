@@ -230,6 +230,17 @@ class Downloader:
         )
 
     def download(self, song: Song, on_progress: ProgressFn | None = None) -> TaskResult:
+        # 单曲取消标记只在这一次任务里生效：结束后必须清掉，否则同一会话
+        # 里再下载这首（换音质重试、重新入队）会永远 CANCELLED
+        try:
+            return self._download_one(song, on_progress)
+        finally:
+            with self._song_lock:
+                self._song_cancels.discard(song.id)
+
+    def _download_one(
+        self, song: Song, on_progress: ProgressFn | None = None
+    ) -> TaskResult:
         if self._cancel.is_set() or self._song_cancelled(song.id):
             return TaskResult(song, CANCELLED, message="已取消")
         if not self.force and self.store.done(song.id):
@@ -335,6 +346,11 @@ class Downloader:
             headers["Range"] = f"bytes={have}-"
 
         with requests.get(url, headers=headers, stream=True, timeout=(10, 60)) as resp:
+            if resp.status_code == 416 and have:
+                # .part 已经等于全量（上次最后一字节写完、还没来得及
+                # os.replace 就断了）。Range 起点越界永远 416，删掉从头下
+                part.unlink(missing_ok=True)
+                return self._fetch_stream(url, part, total_hint, on_progress, song_id)
             if have and resp.status_code == 200:
                 have = 0  # 服务端不支持续传，从头来
             elif resp.status_code not in (200, 206):
@@ -343,7 +359,9 @@ class Downloader:
             total = total_hint
             crange = resp.headers.get("Content-Range")
             if crange and "/" in crange:
-                total = int(crange.rsplit("/", 1)[1])
+                tail = crange.rsplit("/", 1)[1]
+                # 有些代理回 "bytes 0-99/*"，total 是星号
+                total = int(tail) if tail.isdigit() else total_hint
             elif resp.headers.get("Content-Length"):
                 total = have + int(resp.headers["Content-Length"])
 

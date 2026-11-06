@@ -144,6 +144,9 @@ class PlayerEngine(QObject):
     finished = pyqtSignal()
     failed = pyqtSignal(str)
     notice = pyqtSignal(str)            # 给状态栏用的一句话提示
+    # 工作线程准备好文件后经此信号封送回主线程：QMediaPlayer 只能在
+    # 创建它的线程里 setMedia/play，跨线程直接调会随机崩溃
+    _start_requested = pyqtSignal(str, int)  # 本地文件路径, token
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -161,6 +164,7 @@ class PlayerEngine(QObject):
 
         self.local_provider: Callable[[Song], Path | None] | None = None
         self.remote_provider: Callable[[Song], tuple[str, str] | None] | None = None
+        self._start_requested.connect(self._on_start_requested)
 
         # 和其他缓存一样放在程序目录：系统 TEMP 可能被别的软件改成无写权限的
         # 公共目录，那样网络播放会直接失败
@@ -199,6 +203,11 @@ class PlayerEngine(QObject):
         """队列里已有落盘文件时直接播，不再走取地址。"""
         self._token += 1
         self._song = song
+        # 和 play_song 一样重置回退状态：上一首残留的 _last_pos 会让
+        # 「提前结束」检测虚高，_net_fallback 残留会吞掉该有的网络回退
+        self._used_local = False
+        self._net_fallback = False
+        self._last_pos = 0
         self.started.emit(song)
         self._start_file(Path(path))
 
@@ -273,11 +282,18 @@ class PlayerEngine(QObject):
                 self._safe(self.failed, "拿不到可播放的音频")
                 self._safe(self.state_changed, STOPPED)
                 return
-            self._start_file(path)
+            # 不直接碰 QMediaPlayer：emit 让主线程去 setMedia/play
+            self._safe(self._start_requested, str(path), token)
         except Exception as exc:  # noqa: BLE001
             if token == self._token:
                 self._safe(self.failed, str(exc))
                 self._safe(self.state_changed, STOPPED)
+
+    def _on_start_requested(self, path: str, token: int) -> None:
+        """主线程槽：token 仍有效才真正起播（期间可能已经切歌/停止）。"""
+        if token != self._token:
+            return
+        self._start_file(Path(path))
 
     def _download(self, song: Song, token: int, fresh: bool = False) -> Path | None:
         if self.remote_provider is None:
@@ -315,17 +331,21 @@ class PlayerEngine(QObject):
         self._player.setMedia(QMediaContent(QUrl.fromLocalFile(str(path))))
         self._player.play()
         if self._song is not None and self._song.cover_url:
+            token = self._token
             threading.Thread(
-                target=self._load_cover, args=(self._song.cover_url,), daemon=True
+                target=self._load_cover, args=(self._song.cover_url, token), daemon=True
             ).start()
 
-    def _load_cover(self, url: str) -> None:
+    def _load_cover(self, url: str, token: int = 0) -> None:
         try:
             resp = requests.get(
                 url + "?param=120y120",
                 headers={"User-Agent": _UA, "Referer": "https://music.163.com/"},
                 timeout=8,
             )
+            # 快速切歌时旧请求可能后返回，别拿上一首的封面盖掉这一首
+            if token != self._token:
+                return
             if resp.ok and resp.content:
                 self._safe(self.cover_ready, resp.content)
         except Exception:  # noqa: BLE001

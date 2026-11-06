@@ -95,9 +95,24 @@ def to_mp3(src: Path, bitrate: str = "auto", keep_source: bool = False) -> Path:
         "-b:a", bitrate,
         str(dst),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # timeout：坏输入可能让 ffmpeg 挂住，卡死线程池的一个槽位；
+    # CREATE_NO_WINDOW：GUI（pythonw）下每个 ffmpeg 会弹黑控制台
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
+            creationflags=flags,
+        )
+    except subprocess.TimeoutExpired:
+        raise TranscodeError("ffmpeg 超时（10 分钟），已中止")
     if proc.returncode != 0 or not dst.exists():
         detail = (proc.stderr or "").strip().splitlines()
+        dst.unlink(missing_ok=True)  # 别留半截 mp3 占空间/被误当成品
         raise TranscodeError(detail[-1] if detail else "ffmpeg 执行失败")
 
     if not keep_source:

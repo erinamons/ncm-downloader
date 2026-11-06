@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -1204,7 +1205,16 @@ class MainWindow(QMainWindow):
             return  # 上次就失败了，等用户手动点「本地缓存」再试
         if self._selected_songs():
             return  # 正勾着歌单，重排会清掉勾选，等下次
-        self.on_load_cache()
+        # 节流：播放中指纹每秒都在变，全量重扫最快 2 秒一次
+        now = time.monotonic()
+        if now - self._last_auto_rescan < 2.0:
+            return
+        self._last_auto_rescan = now
+        self._auto_rescanning = True
+        try:
+            self.on_load_cache()
+        finally:
+            self._auto_rescanning = False
 
     def _cache_map(self) -> dict[int, object]:
         """客户端缓存只在第一次需要时扫一遍。"""
@@ -1904,6 +1914,10 @@ class MainWindow(QMainWindow):
         self._ar_spin = QTimer(self)
         self._ar_spin.setInterval(33)  # ~30fps，一圈约 0.8 秒
         self._ar_spin.timeout.connect(self._spin_auto_refresh)
+        # 自动刷新节流与静默标志：播放时缓存文件一直在写，指纹秒秒变，
+        # 全量重扫 + 重建表格很重，节流到最快 2 秒一次
+        self._last_auto_rescan = 0.0
+        self._auto_rescanning = False
 
         # 排序切换：只对缓存视图生效，默认按缓存时间（最新在前）
         self.btn_sort = QPushButton()
@@ -2464,7 +2478,9 @@ class MainWindow(QMainWindow):
         if self._current_source() != "cache":
             return
         self._apply_view()
-        self._fade_in(self.result_table)
+        # 静默重扫（自动刷新触发）不做淡入：列表频繁重建时动画只会闪
+        if not self._auto_rescanning:
+            self._fade_in(self.result_table)
         if songs:
             self.status_label.setText(
                 f"已载入本地缓存 {len(songs)} 首，搜索框只会在缓存内筛选"
@@ -3448,56 +3464,39 @@ class MainWindow(QMainWindow):
         self._start_batch(songs)
 
     def _refresh_progress_column(self) -> None:
-        """定期刷新进度列，显示缓存写入进度。"""
+        """定期刷新进度列，显示缓存写入进度。
+
+        idx 的 JSON 字段是 size/zone（zone 是区间列表），没有 covered/total
+        这样的直读字段；之前按后者取值永远取不到，进度列等于从没更新过。
+        这里直接用 scan() 的结果——它解析 idx 时已经把 covered/declared/
+        complete 都算好了，不再逐个重读 idx 文件。
+        """
         if self._current_source() != "cache":
             return
         table = self.result_table
         if table.isColumnHidden(6):  # 进度列隐藏时不刷新
             return
-        
-        # 重新扫描缓存目录，更新进度数据
         root = self.cache_dir
         if root is None or not Path(root).is_dir():
             return
-        
-        # 只扫描有缓存条目的 song_id
         if not self._cache_progress:
             return
-        
-        # 直接从缓存目录扫描，建立 song_id 到 entry 的映射
-        entries = cache_mod.scan(root)
-        entry_map = {e.song_id: e for e in entries}
-        
-        # 批量读取 idx 文件的实时内容，更新进度
-        # 注意：idx 文件只有在切歌时才会更新，所以正在播放的歌曲进度不会实时变化
-        for song_id in list(self._cache_progress.keys()):
-            entry = entry_map.get(song_id)
-            if not entry:
-                continue
-            
-            # 直接读取 idx 文件的实时内容
-            idx_path = entry.path.with_suffix(".idx")
-            if idx_path.exists():
-                try:
-                    import json
-                    with open(idx_path, "r", encoding="utf-8") as f:
-                        idx_data = json.load(f)
-                    covered = idx_data.get("covered", 0)
-                    total = idx_data.get("total", 0)
-                    if total > 0:
-                        self._cache_progress[song_id] = (covered, total, entry.complete)
-                except Exception:
-                    pass
-            else:
-                # 没有 idx 文件，使用 .uc 文件大小估算
-                try:
-                    uc_size = entry.path.stat().st_size
-                    if uc_size > 0:
-                        # 假设文件大小就是总大小
-                        self._cache_progress[song_id] = (uc_size, uc_size, entry.complete)
-                except OSError:
-                    pass
-        
+
+        # 同一首歌可能有多档位条目，取 idx 声明最全（覆盖最多）的那份
+        best: dict[int, object] = {}
+        for e in cache_mod.scan(root):
+            cur = best.get(e.song_id)
+            if cur is None or e.covered > cur.covered:
+                best[e.song_id] = e
+
+        for song_id, entry in best.items():
+            if entry.declared > 0:
+                self._cache_progress[song_id] = (
+                    entry.covered, entry.declared, entry.complete
+                )
+            # declared == 0（没有可用 idx）时保持原值：既没有进度可读，
+            # 也不能拿 .uc 文件大小冒充总长假装 100%
+
         # 更新进度列显示
         for row in range(table.rowCount()):
             item = table.item(row, 1)
@@ -3516,33 +3515,25 @@ class MainWindow(QMainWindow):
             progress = table.item(row, 6)
             if not progress:
                 continue
-            
+
             if total > 0:
-                # 有 idx 文件，显示百分比
                 pct = covered / total * 100
                 progress.setText(f"{pct:.0f}%")
-                # 颜色：完成=绿色，进行中=蓝色，未开始=灰色
                 if pct >= 98:
+                    progress.setText("100%")
                     progress.setForeground(QColor("#4caf50"))
                 elif pct > 0:
                     progress.setForeground(QColor("#2196f3"))
                 else:
                     progress.setForeground(QColor(MUTED))
             else:
-                # 没有 idx 文件，根据 complete 状态显示
-                # 统一显示为"100%"或"未完成"，避免混淆
+                # 没有 idx：统一显示"100%"或"未完成"，避免混淆
                 if complete:
                     progress.setText("100%")
                     progress.setForeground(QColor("#4caf50"))
                 else:
                     progress.setText("未完成")
                     progress.setForeground(QColor("#ff9800"))
-            if pct >= 98:
-                progress.setForeground(QColor("#4caf50"))
-            elif pct > 0:
-                progress.setForeground(QColor("#2196f3"))
-            else:
-                progress.setForeground(QColor(MUTED))
 
     def _refresh_account_label(self) -> None:
         if auth.load_cookie():

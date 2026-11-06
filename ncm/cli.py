@@ -356,6 +356,19 @@ def cmd_download(
                 f"[dim]{playlist.creator} · {playlist.track_count} 首[/dim]"
             )
             _add_unique(songs, seen, playlist.songs)
+        elif kind == "album":
+            # 专辑必须走 /album 接口；拿专辑 id 查歌单只会得到空结果
+            with console.status(f"读取专辑 {ident}…"):
+                try:
+                    playlist = backend.album(ident)
+                except BackendError as exc:
+                    console.print(f"[red]{exc}[/red]")
+                    continue
+            console.print(
+                f"[bold]{playlist.name}[/bold] "
+                f"[dim]{playlist.creator} · {playlist.track_count} 首[/dim]"
+            )
+            _add_unique(songs, seen, playlist.songs)
         else:
             with console.status(f"读取歌单 {ident}…"):
                 try:

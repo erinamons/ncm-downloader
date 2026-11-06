@@ -32,6 +32,7 @@ class CacheEntry:
     complete: bool
     covered: int
     mtime: float = 0.0
+    declared: int = 0  # idx 声明的预期总长；0 表示没有可用的 idx
 
     @property
     def rate_label(self) -> str:
@@ -79,23 +80,25 @@ def looks_like_cache_dir(path: Path | str) -> bool:
 
 
 def _read_idx(idx: Path) -> tuple[int, int]:
-    """返回 (声明大小, 已覆盖字节数)。"""
+    """返回 (声明大小, 已覆盖字节数)。idx 可能写了一半，任何异常都按没有处理。"""
     try:
         data = json.loads(idx.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
+        if not isinstance(data, dict):
+            return 0, 0
+        size = int(data.get("size") or 0)
+        covered = 0
+        for zone in data.get("zone") or []:
+            parts = str(zone).split()
+            if len(parts) != 2:
+                continue
+            try:
+                start, end = int(parts[0]), int(parts[1])
+            except ValueError:
+                continue
+            covered += max(0, end - start + 1)
+        return size, covered
+    except (OSError, ValueError, AttributeError, TypeError):
         return 0, 0
-    size = int(data.get("size") or 0)
-    covered = 0
-    for zone in data.get("zone") or []:
-        parts = str(zone).split()
-        if len(parts) != 2:
-            continue
-        try:
-            start, end = int(parts[0]), int(parts[1])
-        except ValueError:
-            continue
-        covered += max(0, end - start + 1)
-    return size, covered
 
 
 def scan(cache_dir: Path | str, max_depth: int = 3) -> list[CacheEntry]:
@@ -142,6 +145,7 @@ def scan(cache_dir: Path | str, max_depth: int = 3) -> list[CacheEntry]:
                     complete=complete,
                     covered=covered,
                     mtime=mtime,
+                    declared=declared,
                 )
             )
     entries.sort(key=lambda e: (e.song_id, -e.rate))
@@ -308,8 +312,14 @@ def report(cache_dir: Path | str) -> dict[str, object]:
     stats["tiny"] = sum(1 for e in entries if e.size <= 100_000)
     parsed_names = {e.path.name for e in entries}
     stats["unparsed"] = [p.name for p in files if p.name not in parsed_names][:5]
-    recent = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[:3]
-    stats["recent"] = [f"{p.name}（{p.stat().st_size / 1048576:.1f} MB）" for p in recent]
+    # 文件可能在 rglob 和 stat 之间被客户端删掉，诊断函数自己不能崩
+    recent: list[tuple[float, str]] = []
+    for p in files:
+        try:
+            recent.append((p.stat().st_mtime, f"{p.name}（{p.stat().st_size / 1048576:.1f} MB）"))
+        except OSError:
+            continue
+    stats["recent"] = [text for _, text in sorted(recent, reverse=True)[:3]]
 
     # 按子目录分组：不同客户端版本会把缓存摊到不同层，
     # 「有文件却不显示」时先看文件到底躺在哪一层

@@ -63,8 +63,15 @@ class Song:
         cover = album_raw.get("picUrl") or raw.get("picUrl") or ""
         if cover.startswith("http://"):
             cover = "https://" + cover[len("http://"):]
+        # 接口偶发返回非数字的脏字段；列表解析里一条抛错会毁掉整批结果，
+        # 所以数值一律走安全转换
+        def to_int(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
         return cls(
-            id=int(raw.get("id") or 0),
+            id=to_int(raw.get("id")),
             name=raw.get("name") or "未知曲目",
             artists=[
                 str(a.get("name")).strip()
@@ -72,10 +79,10 @@ class Song:
                 if isinstance(a, dict) and a.get("name")
             ],
             album=album_raw.get("name") or "",
-            duration_ms=int(raw.get("dt") or raw.get("duration") or 0),
-            track_no=int(raw.get("no") or 0),
+            duration_ms=to_int(raw.get("dt") or raw.get("duration")),
+            track_no=to_int(raw.get("no")),
             cover_url=cover,
-            publish_time=int(raw.get("publishTime") or 0),
+            publish_time=to_int(raw.get("publishTime")),
         )
 
 
