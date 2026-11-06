@@ -354,6 +354,21 @@ QPushButton#helpBtn:hover {{
     background: #2f2f36;
     border: none;
 }}
+QPushButton#autoRefreshBtn {{
+    background: transparent;
+    border: none;
+    border-radius: 10px;
+    padding: 0;
+}}
+QPushButton#autoRefreshBtn:hover {{
+    background: #2f2f36;
+}}
+QPushButton#autoRefreshBtn:checked {{
+    background: {ACCENT};
+}}
+QPushButton#autoRefreshBtn:checked:hover {{
+    background: {ACCENT_HOVER};
+}}
 QPushButton#moreButton {{
     background: transparent;
     border: 1px solid {BORDER};

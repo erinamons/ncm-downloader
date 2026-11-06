@@ -1886,19 +1886,24 @@ class MainWindow(QMainWindow):
         self.btn_refresh.clicked.connect(self._refresh_current)
         bar.addWidget(self.btn_refresh)
 
-        # 自动刷新开关按钮
+        # 自动刷新开关：开启时按钮点亮成强调色胶囊 + 图标持续旋转
         self.btn_auto_refresh = QPushButton()
-        self.btn_auto_refresh.setObjectName("helpBtn")
+        self.btn_auto_refresh.setObjectName("autoRefreshBtn")
         self.btn_auto_refresh.setIcon(icons.stateful("refresh-cw", "#8b8b95", "#ffffff", 14))
         self.btn_auto_refresh.setIconSize(QSize(14, 14))
         self.btn_auto_refresh.setFixedSize(22, 20)
-        self.btn_auto_refresh.setToolTip("自动刷新缓存列表（每秒检测一次）")
+        self.btn_auto_refresh.setToolTip("自动刷新：关\n点击开启：每 0.5 秒检测一次缓存")
         self.btn_auto_refresh.setFocusPolicy(Qt.NoFocus)
         self.btn_auto_refresh.setCheckable(True)
         self.btn_auto_refresh.setChecked(False)
         self.btn_auto_refresh.clicked.connect(self._toggle_auto_refresh)
         bar.addWidget(self.btn_auto_refresh)
         self._auto_refresh_enabled = False
+        # 旋转动画：独立 QTimer 驱动图标旋转，开启时常转
+        self._ar_angle = 0
+        self._ar_spin = QTimer(self)
+        self._ar_spin.setInterval(33)  # ~30fps，一圈约 0.8 秒
+        self._ar_spin.timeout.connect(self._spin_auto_refresh)
 
         self.btn_clear = QPushButton()
         self.btn_clear.setObjectName("helpBtn")
@@ -2136,20 +2141,43 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"已清空 {SOURCE_LABEL.get(source, source)} 的结果")
 
     def _toggle_auto_refresh(self) -> None:
-        """切换自动刷新开关"""
+        """切换自动刷新开关：开启时按钮点亮、图标常转。"""
         self._auto_refresh_enabled = self.btn_auto_refresh.isChecked()
         if self._auto_refresh_enabled:
-            # 开启自动刷新：加快进度刷新和目录轮询
+            # 开启自动刷新：进度刷新和目录轮询都加快到 0.5 秒
             self._progress_timer.setInterval(500)
             self._cache_poll.setInterval(500)
-            self.btn_auto_refresh.setToolTip("自动刷新已开启（点击关闭）")
-            self.status_label.setText("自动刷新已开启")
+            self.btn_auto_refresh.setToolTip("自动刷新：开（每 0.5 秒检测一次）\n点击关闭")
+            self.status_label.setText("自动刷新已开启：每 0.5 秒检测缓存")
+            self._ar_angle = 0
+            self._ar_spin.start()
         else:
             # 关闭自动刷新：恢复正常间隔
             self._progress_timer.setInterval(1500)
             self._cache_poll.setInterval(1000)
-            self.btn_auto_refresh.setToolTip("开启自动刷新（更快更新进度）")
+            self.btn_auto_refresh.setToolTip("自动刷新：关\n点击开启：每 0.5 秒检测一次缓存")
             self.status_label.setText("自动刷新已关闭")
+            self._ar_spin.stop()
+            self._ar_angle = 0
+            self.btn_auto_refresh.setIcon(icons.stateful("refresh-cw", "#8b8b95", "#ffffff", 14))
+
+    def _spin_auto_refresh(self) -> None:
+        """旋转自动刷新图标（开启状态下白图标常转）。"""
+        self._ar_angle = (self._ar_angle + 15) % 360
+        pm = icons.pixmap("refresh-cw", "#ffffff", 14)
+        if pm.isNull():
+            return
+        rotated = QPixmap(pm.size())
+        rotated.setDevicePixelRatio(pm.devicePixelRatio())
+        rotated.fill(Qt.transparent)
+        painter = QPainter(rotated)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        painter.translate(pm.width() / 2 / pm.devicePixelRatio(), pm.height() / 2 / pm.devicePixelRatio())
+        painter.rotate(self._ar_angle)
+        painter.translate(-pm.width() / 2 / pm.devicePixelRatio(), -pm.height() / 2 / pm.devicePixelRatio())
+        painter.drawPixmap(0, 0, pm)
+        painter.end()
+        self.btn_auto_refresh.setIcon(QIcon(rotated))
 
     @staticmethod
     def _looks_like_link(text: str) -> bool:
