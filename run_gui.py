@@ -17,11 +17,17 @@ from ncm.log import setup_logging  # noqa: E402
 
 def main() -> None:
     # C++/Qt 层段错误不会走 Python 异常机制，faulthandler 能把崩溃时的
-    # Python 调用栈打到 stderr，是定位 segfault 的唯一线索
+    # Python 调用栈写到文件里，是定位 segfault 的唯一线索。
+    # 注意：--windowed 打包后没有控制台，sys.stderr 是 None，enable() 不给
+    # 文件参数会直接 RuntimeError（表现为双击 exe 秒退），必须显式开文件
     import faulthandler
+    import logging
 
-    faulthandler.enable()
     log_file = setup_logging()
+    crash_fh = Path(log_file).with_name("crash.log").open(
+        "a", encoding="utf-8", errors="replace"
+    )
+    faulthandler.enable(file=crash_fh)
     logging.getLogger("ncm.gui").info("启动，日志位于 %s", log_file)
 
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
