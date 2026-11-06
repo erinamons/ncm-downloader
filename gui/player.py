@@ -51,6 +51,11 @@ PLAYING = "playing"
 PAUSED = "paused"
 LOADING = "loading"
 STOPPED = "stopped"
+# 已起播但数据未就绪（联网补齐下载完后的加载、网络流缓冲）。
+# QMediaPlayer 的 state 只代表「用户意图」，play() 一调就是 Playing，
+# 真正出声要看 mediaStatus 到没到 Loaded/Buffered——之前把两者混为一谈，
+# 表现就是「状态栏写着正在播放，实际没声，像卡住了」
+BUFFERING = "buffering"
 
 REPEAT_MODES = ("list", "one", "off")
 REPEAT_ICON = {"list": "repeat", "one": "repeat-1", "off": "repeat"}
@@ -178,6 +183,8 @@ class PlayerEngine(QObject):
         self._net_fallback = False
         # 结束信号的瞬间 position 有时会被清零，用它兜一下
         self._last_pos = 0
+        # 数据就绪度：对外状态（正在播放/缓冲中）由它和 state 共同决定
+        self._media_status = QMediaPlayer.NoMedia
 
     # ---------------- 对外 ----------------
 
@@ -317,6 +324,9 @@ class PlayerEngine(QObject):
             timeout=(10, 40),
         ) as resp:
             resp.raise_for_status()
+            total = src.size or 0
+            written = 0
+            last_milestone = 0
             with open(part, "wb") as fh:
                 for chunk in resp.iter_content(64 * 1024):
                     if token != self._token:
@@ -324,6 +334,20 @@ class PlayerEngine(QObject):
                         part.unlink(missing_ok=True)
                         return None
                     fh.write(chunk)
+                    # 下载期间给状态栏一个进度感：整首要下几十秒时
+                    # 「没有反馈」看起来就像卡死
+                    written += len(chunk)
+                    if total:
+                        pct = int(written / total * 100)
+                        if pct >= last_milestone + 5 and pct < 100:
+                            last_milestone = pct
+                            self._safe(self.notice, f"正在获取音频 {pct}%")
+                    elif written // 524288 > last_milestone:
+                        last_milestone = written // 524288  # 每 512KB 报一次
+                        self._safe(
+                            self.notice,
+                            f"正在获取音频 {written / 1048576:.1f} MB",
+                        )
         os.replace(part, dest)
         return dest
 
@@ -361,32 +385,48 @@ class PlayerEngine(QObject):
         self.position.emit(self._player.position(), dur)
 
     def _on_state(self, state) -> None:
-        if state == QMediaPlayer.PlayingState:
-            self.state_changed.emit(PLAYING)
-        elif state == QMediaPlayer.PausedState:
-            self.state_changed.emit(PAUSED)
+        self._emit_state()
 
     def _on_media_status(self, status) -> None:
-        if status != QMediaPlayer.EndOfMedia:
+        self._media_status = status
+        if status == QMediaPlayer.InvalidMedia:
+            # 数据坏掉：error 信号随后必到，失败路径由 _on_error 负责
             return
-        # 本地文件坏了（缓存没写完、下载中断）时，Qt 常常播几秒就当成「正常结束」，
-        # 既不报错也不提示。按已播时长判断，明显不够就联网重放一次。
-        expected = self._song.duration_ms if self._song else 0
-        played = max(self._player.position(), self._last_pos)
-        if (
-            self._used_local
-            and not self._net_fallback
-            and expected
-            and played < expected * 0.8
-        ):
-            self._net_fallback = True
-            self._used_local = False
-            self.notice.emit("本地文件不完整，已改用网络播放")
-            song = self._song
-            # 别在信号里直接重开播放器，等这次回调走完
-            QTimer.singleShot(0, lambda: self.play_song(song, force_remote=True))
+        if status == QMediaPlayer.EndOfMedia:
+            # 本地文件坏了（缓存没写完、下载中断）时，Qt 常常播几秒就当成「正常结束」，
+            # 既不报错也不提示。按已播时长判断，明显不够就联网重放一次。
+            expected = self._song.duration_ms if self._song else 0
+            played = max(self._player.position(), self._last_pos)
+            if (
+                self._used_local
+                and not self._net_fallback
+                and expected
+                and played < expected * 0.8
+            ):
+                self._net_fallback = True
+                self._used_local = False
+                self.notice.emit("本地文件不完整，已改用网络播放")
+                song = self._song
+                # 别在信号里直接重开播放器，等这次回调走完
+                QTimer.singleShot(0, lambda: self.play_song(song, force_remote=True))
+                return
+            self.finished.emit()
             return
-        self.finished.emit()
+        self._emit_state()
+
+    # 对外状态以 mediaStatus（数据就绪度）为准：
+    # 只有 Playing 且媒体已 Loaded/Buffered 才算真正在播
+    _READY_STATUS = (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia)
+
+    def _emit_state(self) -> None:
+        state = self._player.state()
+        if state == QMediaPlayer.PlayingState:
+            if self._media_status in self._READY_STATUS:
+                self.state_changed.emit(PLAYING)
+            else:
+                self.state_changed.emit(BUFFERING)
+        elif state == QMediaPlayer.PausedState:
+            self.state_changed.emit(PAUSED)
 
     def _on_error(self, *_args) -> None:
         message = self._player.errorString() or "播放失败"
@@ -586,7 +626,8 @@ class TopBar(QWidget):
         self.btn_repeat.setToolTip(REPEAT_TIP[self._repeat])
 
     def _sync_play_icon(self) -> None:
-        playing = self._state == PLAYING
+        # 缓冲中也显示暂停键：起播意图已发生，点一下就是暂停
+        playing = self._state in (PLAYING, BUFFERING)
         name = "pause" if playing else "play"
         self.btn_play.setIcon(icons.icon(name, "#ffffff", 14))
         self.btn_play.setToolTip("暂停（空格）" if playing else "播放（空格）")

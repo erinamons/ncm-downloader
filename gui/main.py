@@ -96,7 +96,7 @@ from gui.inputs import HistoryLineEdit
 from gui.shadow import clip_outside_window, render_shadow
 from gui.style import BG, MUTED, PANEL, QSS
 from gui.table import FluidTable, TwoLineNameDelegate
-from gui.player import PlayerEngine, TopBar
+from gui.player import BUFFERING, LOADING, PAUSED, PLAYING, PlayerEngine, TopBar
 from gui.workers import BatchTask, Task
 
 HEADERS = ["", "曲名", "艺人", "专辑", "时长", "音质", "进度"]
@@ -1152,6 +1152,7 @@ class MainWindow(QMainWindow):
         self.player.remote_provider = self._remote_audio
         self.player.started.connect(self._on_play_started)
         self.player.state_changed.connect(self.topbar.set_state)
+        self.player.state_changed.connect(self._on_play_state)
         self.player.position.connect(self.topbar.set_position)
         self.player.cover_ready.connect(self.topbar.set_cover)
         self.player.finished.connect(self._on_play_finished)
@@ -1463,7 +1464,24 @@ class MainWindow(QMainWindow):
             self.result_table.scrollToItem(
                 self.result_table.item(row, 1), QAbstractItemView.PositionAtCenter
             )
-        self.status_label.setText(f"正在播放 {song.name} - {song.artist_text}")
+        # 状态栏文案不在这写「正在播放」：started 在拿到音频前就发，
+        # 真实状态（获取/缓冲/播放中）由 _on_play_state 按播放器回报驱动
+
+    def _on_play_state(self, state: str) -> None:
+        """播放状态 → 状态栏文案。只有真正出声才写「正在播放」。"""
+        song = self.player.song
+        if song is None:
+            return
+        label = f"{song.name} - {song.artist_text}"
+        if state == PLAYING:
+            self.status_label.setText(f"正在播放 {label}")
+        elif state == BUFFERING:
+            self.status_label.setText(f"缓冲中 {label}（音频数据加载中）")
+        elif state == LOADING:
+            self.status_label.setText(f"正在获取 {label}")
+        elif state == PAUSED:
+            self.status_label.setText(f"已暂停 {label}")
+        # STOPPED 不覆盖：失败/结束的信息更有价值
 
     def _on_play_finished(self) -> None:
         if self._repeat == "one" and self.player.song is not None:
