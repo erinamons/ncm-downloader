@@ -1293,10 +1293,16 @@ class MainWindow(QMainWindow):
                 root = cache_mod.default_cache_dir()
             if root and Path(root).is_dir():
                 for entry in cache_mod.scan(root):
-                    if not entry.complete or entry.size <= 200_000:
+                    if entry.size <= 200_000:
                         continue
+                    # 半截缓存也要收：右键「打开缓存目录」、播放前的 recheck
+                    # 都依赖它。之前只收 complete 的，缓存在 60% 的歌右键
+                    # 直接置灰、连目录都不给开
                     old = entries.get(entry.song_id)
-                    if old is None or entry.rate > old.rate:
+                    better = old is None or (
+                        (entry.complete, entry.covered) > (old.complete, old.covered)
+                    )
+                    if better:
                         entries[entry.song_id] = entry
             self._cache_entries = entries
         return self._cache_entries
@@ -2844,7 +2850,15 @@ class MainWindow(QMainWindow):
             progress = QTableWidgetItem()
             progress.setTextAlignment(Qt.AlignCenter)
             if self._current_source() == "cache":
-                if song.id in self._cache_progress:
+                if done_before:
+                    # 已导出：导出走的是联网补齐，不会回写客户端那份 .uc，
+                    # 再显示 61%/16% 会和左边的 ✓ 矛盾（用户以为导出没完成）
+                    progress.setText("已导出")
+                    progress.setForeground(QColor("#4caf50"))
+                    progress.setToolTip(
+                        "已导出到下载目录，无需再关心客户端缓存进度"
+                    )
+                elif song.id in self._cache_progress:
                     covered, total, complete = self._cache_progress[song.id]
                     if total > 0:
                         # 有 idx 文件，显示百分比
@@ -2957,10 +2971,11 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         target = self._song_path(song)
         has_file = target is not None
-        # 缓存条目对应的是客户端那串哈希 .uc，叫「缓存目录」比「文件夹」准确
+        # 只有客户端原始 .uc 时没有可「显示」的音频文件，只能开缓存目录并
+        # 选中那个哈希文件；有成品文件则用资源管理器的标准说法
         is_raw_cache = has_file and target.suffix.lower() == ".uc"
         act_reveal = menu.addAction(
-            "在缓存目录中显示" if is_raw_cache else "在文件夹中显示"
+            "打开缓存目录" if is_raw_cache else "在文件夹中显示"
         )
         act_reveal.setData("reveal")
         act_reveal.setEnabled(has_file)
@@ -3140,7 +3155,7 @@ class MainWindow(QMainWindow):
         act_play = menu.addAction("播放")
         act_play.setEnabled(bool(path and path.exists() and 0 <= row < len(self._queue_songs)))
         menu.addSeparator()
-        act_reveal = menu.addAction("打开所在文件夹")
+        act_reveal = menu.addAction("在文件夹中显示")
         act_reveal.setEnabled(bool(path and path.exists()))
         act_copy = menu.addAction("复制文件路径")
         act_copy.setEnabled(bool(path))
@@ -3432,6 +3447,26 @@ class MainWindow(QMainWindow):
         self.queue_info.setText(f"下载队列 · 已完成 {len(results)} 首")
 
         log.info("批量完成：%s，共 %.1f MB", dict(stats), total_bytes / 1048576)
+        # 增量更新结果表：只动本批成功的行，不重建表格（不丢勾选与滚动位置）。
+        # 之前不刷新，✓ 和「已导出」要等下一次自动重扫才出现
+        if self._current_source() == "cache":
+            for res in results:
+                if res.status not in (OK, SKIPPED):
+                    continue
+                row = next(
+                    (i for i, s in enumerate(self.songs) if s.id == res.song.id), -1
+                )
+                if row < 0:
+                    continue
+                name_item = self.result_table.item(row, 1)
+                if name_item is not None and not name_item.text().startswith("\u2713 "):
+                    name_item.setText(f"\u2713 {name_item.text()}")
+                    name_item.setForeground(QColor("#7fbf9a"))
+                prog = self.result_table.item(row, 6)
+                if prog is not None:
+                    prog.setText("已导出")
+                    prog.setForeground(QColor("#4caf50"))
+                    prog.setToolTip("已导出到下载目录，无需再关心客户端缓存进度")
         # 窗口不在前台时闪一下任务栏，批量下歌切走了也知道结束
         if not self.isActiveWindow():
             QApplication.alert(self, 3000)
@@ -3614,6 +3649,14 @@ class MainWindow(QMainWindow):
             except (ValueError, IndexError):
                 continue
             if song_id not in self._cache_progress:
+                continue
+            # 已导出的行显示「已导出」，不要用缓存百分比覆盖回去
+            row_song = self.songs[row] if 0 <= row < len(self.songs) else None
+            if (
+                row_song is not None
+                and self._audio_store is not None
+                and self._audio_store.done(row_song.id)
+            ):
                 continue
             covered, total, complete = self._cache_progress[song_id]
             progress = table.item(row, 6)

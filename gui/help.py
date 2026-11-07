@@ -8,13 +8,19 @@
 """
 from __future__ import annotations
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QSize, Qt
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
+    QMenu,
+    QPushButton,
     QScrollArea,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -56,6 +62,15 @@ QLabel#helpBadge {
     border-radius: 4px;
     padding: 2px 8px;
     font-size: 11px;
+}
+QTableWidget#helpMiniTable {
+    background: #24242b;
+    border: 1px solid #34343c;
+    border-radius: 6px;
+    font-size: 11px;
+}
+QTableWidget#helpMiniTable::item {
+    padding: 2px;
 }
 """
 
@@ -184,6 +199,149 @@ def _fail_table(rows: list[tuple[str, str]]) -> QFrame:
     return holder
 
 
+# ---------------- 真实控件模拟 ----------------
+# 帮助里出现的"样子"必须和软件里一模一样：勾选框用真实的表格 indicator
+# 样式，导出按钮用真实的主按钮样式，右键菜单弹真的 QMenu。
+# 不给功能硬配图标，避免用户照着找却找不到。
+
+def _mini_result_table(states: list[bool], header: bool = False) -> QTableWidget:
+    """迷你结果表：一列勾选 + 一列曲名，勾选框走全局 QSS 的真实样式。"""
+    table = QTableWidget(len(states), 2)
+    table.setObjectName("helpMiniTable")
+    table.setShowGrid(False)
+    table.verticalHeader().setVisible(False)
+    table.setSelectionBehavior(QTableWidget.SelectRows)
+    table.setEditTriggers(QTableWidget.NoEditTriggers)
+    table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+    table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+    table.setColumnWidth(0, 26)
+    if header:
+        table.setHorizontalHeaderLabels(["", "曲名"])
+        table.setFixedHeight(26 + 30 * len(states) + 6)
+    else:
+        table.horizontalHeader().setVisible(False)
+        table.setFixedHeight(30 * len(states) + 4)
+    table.setFixedWidth(190)
+    for row, checked in enumerate(states):
+        item = QTableWidgetItem()
+        item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+        table.setItem(row, 0, item)
+        name = QTableWidgetItem(f"示例曲目 {row + 1}")
+        name.setForeground(QColor("#d8d8dc"))
+        table.setItem(row, 1, name)
+    return table
+
+
+def _picker_demo() -> QWidget:
+    """勾选演示：上未选下已选，可点击切换，样式与列表完全一致。"""
+    holder = QWidget()
+    lay = QHBoxLayout(holder)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(10)
+    lay.addWidget(_mini_result_table([False, True]))
+    btn = QPushButton("导出选中 (1)")
+    btn.setObjectName("primary")
+    btn.setFixedHeight(30)
+    btn.setIcon(icons.icon("download", "#ffffff", 18))
+    btn.setIconSize(QSize(15, 15))
+    btn.setToolTip("这就是缓存视图里的导出按钮，数量跟着勾选变")
+    lay.addWidget(btn)
+    lay.addStretch(1)
+    return holder
+
+
+def _header_select_demo() -> QWidget:
+    """表头全选演示：点表头最左边的空白格切换全选，真实复刻。"""
+    table = _mini_result_table([True, True], header=True)
+
+    def toggle(_col: int) -> None:
+        checked = sum(
+            1 for r in range(table.rowCount())
+            if table.item(r, 0) and table.item(r, 0).checkState() == Qt.Checked
+        )
+        target = Qt.Unchecked if checked == table.rowCount() else Qt.Checked
+        table.blockSignals(True)
+        for r in range(table.rowCount()):
+            item = table.item(r, 0)
+            if item:
+                item.setCheckState(target)
+        table.blockSignals(False)
+
+    table.horizontalHeader().sectionClicked.connect(toggle)
+    table.horizontalHeader().setSectionsClickable(True)
+    holder = QWidget()
+    lay = QVBoxLayout(holder)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(2)
+    lay.addWidget(table)
+    hint = QLabel("← 点最左边的空白表头试试")
+    hint.setObjectName("helpCardDesc")
+    lay.addWidget(hint)
+    return holder
+
+
+def _context_menu_demo(parent) -> QWidget:
+    """右键菜单演示：弹出真实 QMenu，样式与软件内一致（含置灰项）。"""
+    holder = QWidget()
+    lay = QVBoxLayout(holder)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(4)
+    btn = QPushButton("点我展开完整右键菜单")
+    btn.setFixedHeight(28)
+    btn.setCursor(Qt.PointingHandCursor)
+
+    def show_menu() -> None:
+        menu = QMenu(btn)
+        menu.addAction("播放")
+        menu.addAction("仅播放此曲")
+        menu.addSeparator()
+        act = menu.addAction("导出选中（2 首）")
+        act.setEnabled(True)
+        menu.addAction("仅导出此曲")
+        menu.addSeparator()
+        menu.addAction("在文件夹中显示")
+        menu.addSeparator()
+        menu.addAction("复制歌曲链接")
+        menu.addAction("复制「歌名 - 歌手」")
+        menu.addAction("复制歌曲 ID")
+        menu.addSeparator()
+        menu.addAction("全选")
+        menu.addAction("取消全选")
+        menu.addAction("清空当前结果")
+        menu.addSeparator()
+        menu.addAction("在浏览器打开")
+        menu.exec_(btn.mapToGlobal(btn.rect().bottomLeft()))
+
+    btn.clicked.connect(show_menu)
+    lay.addWidget(btn)
+    return holder
+
+
+def _demo_row(widget: QWidget, title: str, desc: str) -> QFrame:
+    """演示卡：左侧真实控件，右侧标题与说明。"""
+    card = QFrame()
+    card.setObjectName("helpCard")
+    lay = QHBoxLayout(card)
+    lay.setContentsMargins(10, 8, 10, 8)
+    lay.setSpacing(12)
+    lay.addWidget(widget)
+    text = QVBoxLayout()
+    text.setSpacing(2)
+    t = QLabel(title)
+    t.setObjectName("helpCardTitle")
+    d = QLabel(desc)
+    d.setObjectName("helpCardDesc")
+    d.setWordWrap(True)
+    text.addWidget(t)
+    text.addWidget(d)
+    text.addStretch(1)
+    lay.addLayout(text, 1)
+    return card
+
+
 class HelpDialog(RoundDialog):
     def __init__(self, parent=None):
         super().__init__(parent, "帮助", width=640)
@@ -282,36 +440,44 @@ class HelpDialog(RoundDialog):
         )
 
         # ---- 结果列表 ----
-        _section("结果列表", flow)
+        _section("结果列表：真实样子（可点击试试）", flow)
+        flow.addWidget(
+            _demo_row(
+                _picker_demo(),
+                "勾选与导出",
+                "左侧方框决定导出哪些歌，点一下切换。缓存视图的按钮叫「导出」——"
+                "解密或联网补齐到下载目录；搜索 / 歌单视图叫「下载」",
+            )
+        )
+        flow.addWidget(
+            _demo_row(
+                _header_select_demo(),
+                "全选",
+                "没有独立按钮：点表头最左边的空白格，在全选和取消之间切换",
+            )
+        )
+        flow.addWidget(
+            _demo_row(
+                _context_menu_demo(self),
+                "右键菜单",
+                "完整菜单就长这样：播放、导出、在文件夹中显示、复制、全选、清空、"
+                "在浏览器打开；对着任意一行点右键即可",
+            )
+        )
         flow.addWidget(
             _grid(
                 [
                     _card(
-                        "download",
-                        "勾选与导出",
-                        "左侧方框决定下谁；缓存视图按钮叫「导出」——解密本地缓存，"
-                        "全程不联网不耗流量",
-                    ),
-                    _card(
-                        "check",
-                        "全选",
-                        "点表头最左边的空白格全选 / 取消；右键菜单里也有",
-                    ),
-                    _card(
                         "chevron-down",
                         "列头排序",
-                        "点「曲名 / 艺人 / 专辑 / 时长」：升序 → 降序 → 原序；当前列加粗带箭头",
-                    ),
-                    _card(
-                        "copy",
-                        "右键菜单",
-                        "播放、下载选中、复制歌曲链接 / 歌名、在浏览器打开等都在这",
+                        "点「曲名 / 艺人 / 专辑 / 时长」：升序 → 降序 → 原序；"
+                        "当前列加粗带箭头",
                     ),
                     _card(
                         "music",
                         "音质与进度列",
                         "缓存视图显示实际档位（320k 等）和缓存完成度；"
-                        "未下完的显示百分比或「未完成」",
+                        "已导出的歌显示「已导出」，不再显示缓存百分比",
                     ),
                     _card(
                         "search",
