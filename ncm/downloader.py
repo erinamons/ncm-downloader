@@ -140,11 +140,22 @@ class Downloader:
         if self.source in ("auto", "cache"):
             root = Path(cache_dir) if cache_dir else cache_mod.default_cache_dir()
             if root and Path(root).is_dir():
-                self._cache = {
-                    e.song_id: e
-                    for e in cache_mod.scan(root)
-                    if e.complete and e.size > 200_000
-                }
+                # 半截缓存也要收进来：下游要靠它识别「未下完 → 按
+                # partial_fallback 决定联网补齐还是跳过」。之前只收 complete
+                # 的条目，那个分支永远走不到，缓存在 60% 的歌会直接报「无缓存」
+                for e in cache_mod.scan(root):
+                    if e.size <= 200_000:
+                        continue
+                    cur = self._cache.get(e.song_id)
+                    if cur is None or self._better_entry(e, cur):
+                        self._cache[e.song_id] = e
+
+    @staticmethod
+    def _better_entry(new: cache_mod.CacheEntry, cur: cache_mod.CacheEntry) -> bool:
+        """同一首歌多个档位/进度时择优：完整的优先，都同状态时取写入更多的。"""
+        if new.complete != cur.complete:
+            return new.complete
+        return new.covered > cur.covered
 
     def cancel(self) -> None:
         """请求中断：进行中的下载尽快收尾，未开始的直接跳过。"""
