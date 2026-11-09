@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import threading
 import time
 from pathlib import Path
@@ -42,6 +43,7 @@ from ncm.models import Song
 BAR_H = 46
 ROW_H = 43
 TEMP_KEEP = 24 * 3600
+log = logging.getLogger("ncm.player")
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -181,6 +183,9 @@ class PlayerEngine(QObject):
         # 这一轮是否用了本地文件、是否已经试过「本地坏了改联网」
         self._used_local = False
         self._net_fallback = False
+        # 当前真正交给 QMediaPlayer 的文件：播放失败时据此判断能不能转码重试
+        self._current_path: Path | None = None
+        self._tried_transcode = False
         # 结束信号的瞬间 position 有时会被清零，用它兜一下
         self._last_pos = 0
         # 数据就绪度：对外状态（正在播放/缓冲中）由它和 state 共同决定
@@ -200,6 +205,8 @@ class PlayerEngine(QObject):
         self._used_local = False
         self._net_fallback = False
         self._last_pos = 0
+        self._current_path = None
+        self._tried_transcode = False
         self.started.emit(song)
         self.state_changed.emit(LOADING)
         threading.Thread(
@@ -215,6 +222,8 @@ class PlayerEngine(QObject):
         self._used_local = False
         self._net_fallback = False
         self._last_pos = 0
+        self._current_path = None
+        self._tried_transcode = False
         self.started.emit(song)
         self._start_file(Path(path))
 
@@ -229,6 +238,7 @@ class PlayerEngine(QObject):
         self._player.stop()
         self._player.setMedia(QMediaContent())
         self._song = None
+        self._current_path = None
         self.state_changed.emit(STOPPED)
         self.position.emit(0, 0)
 
@@ -309,6 +319,11 @@ class PlayerEngine(QObject):
         if not resolved:
             return None
         url, ext = resolved
+        # 之前因为系统放不了 flac/m4a 转过一次 mp3：直接复用，别重复下载 + 转码。
+        # fresh（用户点重试）时跳过，按用户的意思重新取。
+        converted = self._temp / f"{song.id}.qt.mp3"
+        if not fresh and converted.exists() and converted.stat().st_size > 0:
+            return converted
         dest = self._temp / f"{song.id}.{ext or 'mp3'}"
         if fresh:
             # 上次缓存的临时文件可能就是解不开的那份，重试时丢掉重下
@@ -357,6 +372,7 @@ class PlayerEngine(QObject):
         return dest
 
     def _start_file(self, path: Path) -> None:
+        self._current_path = Path(path)
         self._player.setMedia(QMediaContent(QUrl.fromLocalFile(str(path))))
         self._player.play()
         if self._song is not None and self._song.cover_url:
@@ -434,9 +450,75 @@ class PlayerEngine(QObject):
             self.state_changed.emit(PAUSED)
 
     def _on_error(self, *_args) -> None:
-        message = self._player.errorString() or "播放失败"
+        message = self._player.errorString() or "格式不支持或文件损坏"
+        if self._try_transcode_fallback():
+            return
         self.failed.emit(message)
         self.state_changed.emit(STOPPED)
+
+    def _try_transcode_fallback(self) -> bool:
+        """系统放不了这个容器时，用自带 ffmpeg 转成 mp3 再试一次。
+
+        典型场景：Windows N/KN 版没装媒体功能包，Qt 只能放 mp3 / wav；
+        而客户端缓存基本是 m4a（AAC），无损是 flac，于是「缓存播放必失败、
+        联网重试（mp3）却正常」。转码只做一次，产物留在 play-cache 复用。
+        """
+        path = self._current_path
+        if self._tried_transcode or path is None or not path.exists():
+            return False
+        if path.suffix.lower() in (".mp3", ".wav"):
+            # 这两种本来是能放的，失败说明文件坏了，转码救不回来
+            return False
+        self._tried_transcode = True
+        token = self._token
+        log.info("播放失败，尝试转码：%s（%s）", path.name, path.suffix)
+        self.notice.emit("系统缺少该音频格式的解码器，正在转换为 mp3…")
+        threading.Thread(
+            target=self._transcode_and_play, args=(path, token), daemon=True
+        ).start()
+        return True
+
+    def _transcode_and_play(self, path: Path, token: int) -> None:
+        target: Path | None = None
+        started = time.time()
+        try:
+            from ncm import transcode
+
+            # 只在 play-cache 里做文章：下载目录里的成品是用户的文件，
+            # 绝不能因为「转码」被改名或删掉。产物按歌曲 id 命名，
+            # _local_audio 下次能直接复用
+            stem = str(self._song.id) if self._song is not None else path.stem
+            target = self._temp / f"{stem}.qt.mp3"
+            src_is_temp = path.parent == self._temp
+            transcode.to_mp3(
+                path,
+                bitrate="auto",
+                keep_source=not src_is_temp,
+                dst=target,
+            )
+        except Exception:  # noqa: BLE001
+            target = None
+        if token != self._token:
+            return
+        if target is None or not target.exists():
+            log.warning("转码失败：%s（%.1fs）", path.name, time.time() - started)
+            song = self._song
+            if song is not None and self._used_local:
+                # 本地这份彻底没救，至少还能联网听
+                self.notice.emit("本地文件无法播放，已改用网络播放")
+                self.play_song(song, force_remote=True)
+            else:
+                self.failed.emit("音频解码失败")
+                self.state_changed.emit(STOPPED)
+            return
+        self.notice.emit("已转换为 mp3 播放")
+        log.info(
+            "转码完成并起播：%s（%.1fs，%.1f MB）",
+            target.name,
+            time.time() - started,
+            target.stat().st_size / 1048576,
+        )
+        self._safe(self._start_requested, str(target), token)
 
 
 class TopBar(QWidget):

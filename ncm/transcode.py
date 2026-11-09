@@ -67,12 +67,18 @@ def ffmpeg_path() -> str | None:
         return None
 
 
-def to_mp3(src: Path, bitrate: str = "auto", keep_source: bool = False) -> Path:
-    """把 src 转成同名 .mp3，返回新路径。失败抛 TranscodeError。
+def to_mp3(
+    src: Path,
+    bitrate: str = "auto",
+    keep_source: bool = False,
+    dst: Path | None = None,
+) -> Path:
+    """把 src 转成 mp3，返回新路径。失败抛 TranscodeError。
 
     bitrate 默认 auto：按源码率取略高一档，避免把 128k 硬转成 320k 白白放大体积。
+    dst 不给时输出到 src 同名 .mp3；播放器会指定到 play-cache，避免动到用户的成品文件。
     """
-    if src.suffix.lower() == ".mp3":
+    if src.suffix.lower() == ".mp3" and dst is None:
         return src
 
     exe = ffmpeg_path()
@@ -82,9 +88,10 @@ def to_mp3(src: Path, bitrate: str = "auto", keep_source: bool = False) -> Path:
     if not bitrate or bitrate == "auto":
         bitrate = _auto_bitrate(probe_bitrate(src))
 
-    dst = src.with_suffix(".mp3")
-    if dst.exists():
-        dst.unlink()
+    out = Path(dst) if dst is not None else src.with_suffix(".mp3")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists():
+        out.unlink()
     cmd = [
         exe,
         "-y",
@@ -93,7 +100,7 @@ def to_mp3(src: Path, bitrate: str = "auto", keep_source: bool = False) -> Path:
         "-vn",
         "-codec:a", "libmp3lame",
         "-b:a", bitrate,
-        str(dst),
+        str(out),
     ]
     # timeout：坏输入可能让 ffmpeg 挂住，卡死线程池的一个槽位；
     # CREATE_NO_WINDOW：GUI（pythonw）下每个 ffmpeg 会弹黑控制台
@@ -110,14 +117,14 @@ def to_mp3(src: Path, bitrate: str = "auto", keep_source: bool = False) -> Path:
         )
     except subprocess.TimeoutExpired:
         raise TranscodeError("ffmpeg 超时（10 分钟），已中止")
-    if proc.returncode != 0 or not dst.exists():
+    if proc.returncode != 0 or not out.exists():
         detail = (proc.stderr or "").strip().splitlines()
-        dst.unlink(missing_ok=True)  # 别留半截 mp3 占空间/被误当成品
+        out.unlink(missing_ok=True)  # 别留半截 mp3 占空间/被误当成品
         raise TranscodeError(detail[-1] if detail else "ffmpeg 执行失败")
 
     if not keep_source:
         src.unlink(missing_ok=True)
-    return dst
+    return out
 
 
 def probe_bitrate(path: Path) -> int:
