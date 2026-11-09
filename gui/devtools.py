@@ -26,6 +26,8 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPlainTextEdit,
     QPushButton,
     QSizeGrip,
@@ -228,17 +230,43 @@ class DevWindow(RoundDialog):
             "QTabWidget::pane { background:#17171a; border:1px solid #34343a;"
             " border-radius:6px; top:-1px; }"
         )
+        self.status_view = self._make_view()
         self.log_view = self._make_view()
+        err_panel = QWidget()
+        ev = QVBoxLayout(err_panel)
+        ev.setContentsMargins(0, 0, 0, 0)
+        ev.setSpacing(4)
+        self.err_list = QListWidget()
+        self.err_list.currentRowChanged.connect(self._show_error_detail)
         self.err_view = self._make_view()
+        ev.addWidget(self.err_list, 1)
+        ev.addWidget(self.err_view, 1)
         self.env_view = self._make_view()
+        self.tabs.addTab(self.status_view, "状态")
         self.tabs.addTab(self.log_view, "日志")
-        self.tabs.addTab(self.err_view, "问题 0")
+        self.tabs.addTab(err_panel, "问题 0")
         self.tabs.addTab(self.env_view, "环境")
+        self.tabs.currentChanged.connect(lambda _i: self._refresh_status())
         rv.addWidget(self.tabs, 1)
         split.addWidget(right)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
         split.setSizes([620, 440])
+
+        quick = QHBoxLayout()
+        quick.setSpacing(6)
+        for label, slot in (
+            ("打开缓存目录", lambda: self._open_dir(getattr(self._win, "cache_dir", None))),
+            ("打开下载目录", lambda: self._open_dir(getattr(self._win, "out_dir", None))),
+            ("打开配置目录", lambda: self._open_dir(data_dir())),
+            ("清空播放缓存", self._clear_play_cache),
+            ("重新扫描缓存", self._rescan_cache),
+        ):
+            btn = QPushButton(label)
+            btn.clicked.connect(slot)
+            quick.addWidget(btn)
+        quick.addStretch(1)
+        body.addLayout(quick)
 
         bottom = QHBoxLayout()
         bottom.setSpacing(8)
@@ -260,6 +288,10 @@ class DevWindow(RoundDialog):
         self._timer = QTimer(self)
         self._timer.setInterval(FLUSH_MS)
         self._timer.timeout.connect(self._flush)
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(1000)
+        self._status_timer.timeout.connect(self._refresh_status)
+        self._status_timer.start()
         self._attach()
         self._refresh_env()
 
@@ -276,6 +308,8 @@ class DevWindow(RoundDialog):
         trace_mod.add_listener(self._on_trace)
         if not self._timer.isActive():
             self._timer.start()
+        if not self._status_timer.isActive():
+            self._status_timer.start()
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
@@ -284,6 +318,7 @@ class DevWindow(RoundDialog):
 
     def _detach(self) -> None:
         self._timer.stop()
+        self._status_timer.stop()
         if self._handler is not None:
             logging.getLogger().removeHandler(self._handler)
             self._handler = None
@@ -379,7 +414,8 @@ class DevWindow(RoundDialog):
         self.tree.clear()
         self.log_view.clear()
         self.err_view.clear()
-        self.tabs.setTabText(1, "问题 0")
+        self.err_list.clear()
+        self.tabs.setTabText(2, "问题 0")
         self.count_label.setText("0 步")
         self._last_step = None
 
@@ -395,13 +431,15 @@ class DevWindow(RoundDialog):
             if level >= logging.WARNING:
                 line = f"{time.strftime('%H:%M:%S', time.localtime(created))} {_LEVEL_NAME.get(level, '信息')} {name}: {message}"
                 self._errors.append(_redact(line))
+                self.err_list.addItem(QListWidgetItem(self._errors[-1]))
+                while self.err_list.count() > MAX_ERRORS:
+                    self.err_list.takeItem(0)
                 dirty_err = True
             if self._match(level, message) and not self._paused:
                 self.log_view.appendPlainText(self._fmt(level, name, message, created))
                 dirty_log = True
         if dirty_err:
-            self.err_view.appendPlainText(self._errors[-1])
-            self.tabs.setTabText(1, f"问题 {len(self._errors)}")
+            self.tabs.setTabText(2, f"问题 {len(self._errors)}")
         appended = False
         if not self._paused:
             for _ in range(200):
@@ -458,10 +496,101 @@ class DevWindow(RoundDialog):
             self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
 
     def _rebuild_errors(self) -> None:
+        self.err_list.clear()
         self.err_view.clear()
+        for line in self._errors:
+            if not self._keyword or self._keyword.lower() in line.lower():
+                self.err_list.addItem(QListWidgetItem(line))
+
+    def _show_error_detail(self, row: int) -> None:
         lines = [line for line in self._errors if not self._keyword or self._keyword.lower() in line.lower()]
-        if lines:
-            self.err_view.setPlainText("\n".join(lines))
+        self.err_view.setPlainText(lines[row] if 0 <= row < len(lines) else "")
+
+    # ---------------- 状态 / 快捷动作 ----------------
+
+    def _refresh_status(self) -> None:
+        """每秒刷新一次「此刻在干什么」，比翻时间线快得多。"""
+        if not self.isVisible() or self.tabs.currentIndex() != 0:
+            return
+        win = self._win
+        player = getattr(win, "player", None)
+        out: list[str] = ["== 播放器 =="]
+        if player is None:
+            out.append("  未初始化")
+        else:
+            qp = player._player
+            state = {0: "已停止", 1: "播放中", 2: "已暂停"}.get(int(qp.state()), str(int(qp.state())))
+            dur, pos = qp.duration(), qp.position()
+            # 没有媒体时 Qt 会给出离谱的 position（几千万毫秒），别直接显示
+            prog = f"{self._mmss(min(pos, dur))} / {self._mmss(dur)}" if dur > 0 else "— / —"
+            out.append(f"  状态 {state} · mediaStatus {qp.mediaStatus()} · 进度 {prog}")
+            song = player.song
+            if song is not None:
+                out.append(f"  曲目 {song.name} - {song.artist_text}")
+            cur = player._current_path
+            if cur is not None:
+                size = f"{cur.stat().st_size / 1048576:.1f} MB" if cur.exists() else "文件不存在"
+                out.append(f"  文件 {cur.name} · {size}")
+            bad = ", ".join(sorted(player._bad_formats)) or "无"
+            out.append(
+                f"  兼容播放 {'开' if player.compat_play else '关'} · 已判定放不了的格式 {bad}"
+            )
+        out.append("")
+        out.append("== 任务 ==")
+        batch = getattr(win, "batch", None)
+        total = getattr(win, "_batch_total", 0)
+        done = getattr(win, "_batch_done", 0)
+        if batch is not None:
+            paused = "是" if getattr(win, "_paused", False) else "否"
+            out.append(f"  批量下载 进行中 {done}/{total} · 并发 {getattr(win, 'workers', '?')} · 已暂停 {paused}")
+        else:
+            out.append("  批量下载 空闲")
+        out.append(f"  搜索 {'进行中' if getattr(win, 'task', None) is not None else '空闲'}")
+        out.append("")
+        out.append("== 队列 ==")
+        songs = list(getattr(win, "_queue_songs", []))
+        bars = getattr(win, "bars", {})
+        if not songs:
+            out.append("  空")
+        else:
+            for song in songs[:12]:
+                bar = bars.get(song.id)
+                if bar is None:
+                    continue
+                mx, val = bar.maximum(), bar.value()
+                pct = f"{val * 100 // mx:>3}%" if mx else "  —"
+                out.append(f"  {song.name[:24]:<24} {pct}")
+        self.status_view.setPlainText("\n".join(out))
+
+    @staticmethod
+    def _mmss(ms: int) -> str:
+        sec = max(0, int(ms) // 1000)
+        return f"{sec // 60}:{sec % 60:02d}"
+
+    def _open_dir(self, path) -> None:
+        if not path:
+            self.status.setText("这个目录还没设置")
+            return
+        target = Path(path)
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
+    def _clear_play_cache(self) -> None:
+        from ncm import cache as cache_mod
+
+        count, freed = cache_mod.clear_player_cache()
+        self.status.setText(f"已清理播放缓存 {count} 个（{freed / 1048576:.0f} MB）")
+        trace_mod.trace("面板", "清空播放缓存", "ok", None, {"files": count})
+
+    def _rescan_cache(self) -> None:
+        try:
+            self._win.on_load_cache()
+            self.status.setText("已触发缓存重扫")
+        except Exception as exc:  # noqa: BLE001
+            self.status.setText(f"重扫失败：{exc}")
 
     def _rebuild_steps(self) -> None:
         self.tree.clear()
