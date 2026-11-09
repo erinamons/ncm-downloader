@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import logging
 import threading
 import time
 from pathlib import Path
@@ -42,6 +43,7 @@ from ncm.models import Song
 BAR_H = 46
 ROW_H = 43
 TEMP_KEEP = 24 * 3600
+log = logging.getLogger("ncm.player")
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -147,7 +149,7 @@ class PlayerEngine(QObject):
     position = pyqtSignal(int, int)     # 当前 ms, 总 ms
     cover_ready = pyqtSignal(bytes)
     finished = pyqtSignal()
-    failed = pyqtSignal(str)
+    failed = pyqtSignal(str, str)       # 给用户看的文案, 类型(format/file/convert/network)
     notice = pyqtSignal(str)            # 给状态栏用的一句话提示
     # 工作线程准备好文件后经此信号封送回主线程：QMediaPlayer 只能在
     # 创建它的线程里 setMedia/play，跨线程直接调会随机崩溃
@@ -181,6 +183,13 @@ class PlayerEngine(QObject):
         # 这一轮是否用了本地文件、是否已经试过「本地坏了改联网」
         self._used_local = False
         self._net_fallback = False
+        # 兼容播放：系统放不了的格式先用 ffmpeg 转成 WAV 再播。
+        # 默认关闭，由设置项控制；关闭时失败只提示，不擅自转换
+        self.compat_play = False
+        # 本进程里已经确认放不了的扩展名，下次直接转换，不再先失败一次
+        self._bad_formats: set[str] = set()
+        # 当前交给播放器的文件，失败时据此判断格式
+        self._current_path: Path | None = None
         # 结束信号的瞬间 position 有时会被清零，用它兜一下
         self._last_pos = 0
         # 数据就绪度：对外状态（正在播放/缓冲中）由它和 state 共同决定
@@ -200,6 +209,7 @@ class PlayerEngine(QObject):
         self._used_local = False
         self._net_fallback = False
         self._last_pos = 0
+        self._current_path = None
         self.started.emit(song)
         self.state_changed.emit(LOADING)
         threading.Thread(
@@ -215,6 +225,7 @@ class PlayerEngine(QObject):
         self._used_local = False
         self._net_fallback = False
         self._last_pos = 0
+        self._current_path = None
         self.started.emit(song)
         self._start_file(Path(path))
 
@@ -229,6 +240,7 @@ class PlayerEngine(QObject):
         self._player.stop()
         self._player.setMedia(QMediaContent())
         self._song = None
+        self._current_path = None
         self.state_changed.emit(STOPPED)
         self.position.emit(0, 0)
 
@@ -283,17 +295,21 @@ class PlayerEngine(QObject):
                 # 网络也没取到，退回本地：残片总比什么都没有强
                 path = self.local_provider(song)
                 self._used_local = path is not None
+            if path is not None and self.compat_play:
+                # 这种格式本进程里已经确认放不了：直接转换，不再先失败一次
+                path = self._maybe_convert(path, song.id, token) or path
             if token != self._token:
                 return
             if path is None:
-                self._safe(self.failed, "拿不到可播放的音频")
+                self._safe(self.failed, "拿不到可播放的音频", "network")
                 self._safe(self.state_changed, STOPPED)
                 return
             # 不直接碰 QMediaPlayer：emit 让主线程去 setMedia/play
             self._safe(self._start_requested, str(path), token)
         except Exception as exc:  # noqa: BLE001
             if token == self._token:
-                self._safe(self.failed, str(exc))
+                log.warning("准备播放失败：%s", exc)
+                self._safe(self.failed, "拿不到可播放的音频", "network")
                 self._safe(self.state_changed, STOPPED)
 
     def _on_start_requested(self, path: str, token: int) -> None:
@@ -356,7 +372,87 @@ class PlayerEngine(QObject):
         os.replace(part, dest)
         return dest
 
+    # ---------------- 兼容播放（系统放不了的格式 → WAV） ----------------
+
+    def _maybe_convert(self, path: Path, song_id: int, token: int) -> Path | None:
+        """已知放不了的格式直接转 WAV；不需要转换或失败时返回 None。
+
+        在准备阶段调用（工作线程），避免用户每次都要先失败一次再转。
+        """
+        ext = path.suffix.lower()
+        if ext in (".mp3", ".wav") or ext not in self._bad_formats:
+            return None
+        dst = self._temp / f"{song_id or path.stem}.pcm.wav"
+        try:
+            if (
+                dst.exists()
+                and dst.stat().st_size > 0
+                and dst.stat().st_mtime >= path.stat().st_mtime
+            ):
+                return dst
+        except OSError:
+            pass
+        self._safe(self.notice, "正在转换播放格式，首次需要几秒…")
+        try:
+            from ncm import transcode
+
+            transcode.to_wav(path, dst)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("兼容播放转换失败 %s：%s", path.name, exc)
+            return None
+        if token != self._token:
+            return None
+        self._prune_converted(dst)
+        return dst
+
+    def _convert_then_play(self, path: Path, song_id: int, token: int) -> None:
+        """播放失败后的补救：转成 WAV 再交给播放器。"""
+        dst = self._temp / f"{song_id or path.stem}.pcm.wav"
+        try:
+            from ncm import transcode
+
+            transcode.to_wav(path, dst)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("兼容播放转换失败 %s：%s", path.name, exc)
+            if token == self._token:
+                self._safe(self.failed, "转换失败", "convert")
+                self._safe(self.state_changed, STOPPED)
+            return
+        if token != self._token:
+            return
+        self._prune_converted(dst)
+        self._safe(self._start_requested, str(dst), token)
+
+    def _prune_converted(self, keep: Path, limit_mb: int = 1200) -> None:
+        """转出来的 WAV 很占地方（约 10 MB/分钟），超上限按最旧的删。"""
+        limit = limit_mb * 1048576
+        items: list[tuple[float, int, Path]] = []
+        try:
+            total = keep.stat().st_size if keep.exists() else 0
+        except OSError:
+            total = 0
+        for path in self._temp.glob("*.pcm.wav"):
+            if path == keep:
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            items.append((stat.st_mtime, stat.st_size, path))
+            total += stat.st_size
+        if total <= limit:
+            return
+        for _, size, path in sorted(items):
+            if total <= limit:
+                break
+            try:
+                path.unlink()
+                total -= size
+            except OSError:
+                continue
+
     def _start_file(self, path: Path) -> None:
+        self._current_path = Path(path)
         self._player.setMedia(QMediaContent(QUrl.fromLocalFile(str(path))))
         self._player.play()
         if self._song is not None and self._song.cover_url:
@@ -434,10 +530,46 @@ class PlayerEngine(QObject):
             self.state_changed.emit(PAUSED)
 
     def _on_error(self, *_args) -> None:
-        # 解码失败时 errorString 常常是空的，别让状态栏只显示「播放失败：」
-        message = self._player.errorString() or "格式不支持或文件损坏"
-        self.failed.emit(message)
+        raw = self._player.errorString().strip()
+        path = self._current_path
+        ext = path.suffix.lower() if path is not None else ""
+        try:
+            size = path.stat().st_size if path is not None and path.exists() else 0
+        except OSError:
+            size = 0
+        # 技术细节只进日志：用户看到的是上层按类型给的文案
+        log.warning(
+            "播放失败 backend=%s format=%s err=%s errstr=%r file=%s size=%s compat=%s",
+            os.environ.get("QT_MULTIMEDIA_PREFERRED_PLUGINS", ""),
+            ext.lstrip(".") or "-",
+            int(self._player.error()),
+            raw,
+            path.name if path else "-",
+            size or "-",
+            self.compat_play,
+        )
         self.state_changed.emit(STOPPED)
+
+        if path is None:
+            self.failed.emit(raw or "没能拿到可播放的音频", "network")
+            return
+        if ext in (".mp3", ".wav"):
+            # 这两种系统本来就能放，失败说明文件坏了，转换也救不回来
+            self.failed.emit(raw or "音频文件无法读取", "file")
+            return
+        self._bad_formats.add(ext)
+        if not self.compat_play:
+            # 开关关着就只提示，绝不擅自转码
+            self.failed.emit(raw or "音频格式不支持", "format")
+            return
+        song = self._song
+        token = self._token
+        self.notice.emit("正在转换播放格式，首次需要几秒…")
+        threading.Thread(
+            target=self._convert_then_play,
+            args=(path, song.id if song is not None else 0, token),
+            daemon=True,
+        ).start()
 
 
 class TopBar(QWidget):

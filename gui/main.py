@@ -374,6 +374,18 @@ class SettingsDialog(RoundDialog):
         play_row.addWidget(btn_play_cache)
         form.addRow("播放缓存", play_row)
 
+        # 系统解码器不全的机器（N 版、精简版）放不了 m4a/flac，给一个开关
+        self.compat_play = QCheckBox("放不了时自动转换")
+        self.compat_play.setChecked(settings.value("compat_play", False, type=bool))
+        self.compat_play.setToolTip(
+            "有些电脑的系统解码器不全，缓存里的 m4a / flac 会放不出来。\n"
+            "开启后遇到这种文件，先用内置 ffmpeg 转成 WAV 再播放：\n"
+            "· 音频不重新压缩，音质不变\n"
+            "· 首次需要 1~3 秒，临时占用磁盘（约每分钟 10 MB）\n"
+            "默认关闭；播放失败时状态栏会给出开启入口。"
+        )
+        form.addRow("兼容播放", self.compat_play)
+
         # 下载中断会留下 .part，默认保留是为了续传；用户想收空间得有个入口
         part_row = QHBoxLayout()
         part_row.setSpacing(8)
@@ -1159,6 +1171,7 @@ class MainWindow(QMainWindow):
         self.player = PlayerEngine(self)
         self.player.local_provider = self._local_audio
         self.player.remote_provider = self._remote_audio
+        self.player.compat_play = self.settings.value("compat_play", False, type=bool)
         self.player.started.connect(self._on_play_started)
         self.player.state_changed.connect(self.topbar.set_state)
         self.player.state_changed.connect(self._on_play_state)
@@ -1377,8 +1390,12 @@ class MainWindow(QMainWindow):
         try:
             os.replace(scratch, final)
         except OSError:
-            # 目录权限不够时别把播放卡死，交给上层走网络
+            # 同名文件可能还被播放器占着（上一首的 setMedia 还没释放句柄）。
+            # 这份 final 是之前完整解码出来的同一首歌，内容一样，直接用；
+            # 以前这里直接放弃 → 上层以为没缓存，静默改走网络
             scratch.unlink(missing_ok=True)
+            if final.exists() and final.stat().st_size > 0:
+                return final
             return None
         return final
 
@@ -1516,14 +1533,27 @@ class MainWindow(QMainWindow):
         self.topbar.set_state("stopped")
         self._refresh_playing_rows(previous)
 
-    def _on_play_failed(self, message: str) -> None:
+    # 播放失败文案：说清「怎么了 + 能做什么」，不出现异常名、路径、错误码
+    _PLAY_FAIL_TEXT = {
+        "format": "这首歌的音频格式系统不支持，暂时无法直接播放",
+        "file": "音频文件无法读取，可能没有下载完整",
+        "convert": "转换没有成功，文件可能不完整",
+        "network": "没能拿到播放地址，可能是网络中断或需要会员",
+    }
+
+    def _on_play_failed(self, _message: str, kind: str = "network") -> None:
         previous = self._playing_id
         self._playing_id = None
-        log.warning("播放失败：%s", message)
-        self.status_label.setText(
-            f"播放失败：{message}　"
-            '<a href="retry" style="color:#7aa7d8;text-decoration:none">重试</a>'
-        )
+        text = self._PLAY_FAIL_TEXT.get(kind, "播放没能成功")
+        link = 'style="color:#7aa7d8;text-decoration:none"'
+        actions = []
+        if kind == "format" and not self.player.compat_play:
+            actions.append(f'<a href="compat" {link}>开启兼容播放</a>')
+        if kind == "network":
+            actions.append(f'<a href="retry" {link}>重试</a>')
+        else:
+            actions.append(f'<a href="remote" {link}>联网播放</a>')
+        self.status_label.setText(f"{text}。　" + "　".join(actions))
         self._refresh_playing_rows(previous)
 
     def _on_volume_changed(self, value: int) -> None:
@@ -2081,6 +2111,15 @@ class MainWindow(QMainWindow):
         elif link == "retry":
             # 重试直接联网取：失败大多出在本地文件上，原路再走一遍没用
             self._play_current(force_remote=True)
+        elif link == "remote":
+            self._play_current(force_remote=True)
+        elif link == "compat":
+            # 用户点了「开启兼容播放」：写回设置并立刻重试当前这首。
+            # 该格式已经在失败时记进 _bad_formats，重试会直接转换，不再失败一次
+            self.settings.setValue("compat_play", True)
+            self.player.compat_play = True
+            self.status_label.setText("已开启兼容播放，正在重试…")
+            self._play_current()
 
     def _on_summary_link(self, link: str) -> None:
         if link == "retry":
@@ -3638,6 +3677,8 @@ class MainWindow(QMainWindow):
             keep_before = self.settings.value("keep_cache", False, type=bool)
             self.settings.setValue("startup_view", dialog.startup_view.currentData())
             self.settings.setValue("keep_cache", dialog.keep_cache.isChecked())
+            self.settings.setValue("compat_play", dialog.compat_play.isChecked())
+            self.player.compat_play = dialog.compat_play.isChecked()
             if keep_before != dialog.keep_cache.isChecked() and self._current_source() == "cache":
                 self.on_load_cache()  # 开关变了，列表内容也要跟着变
             if dialog.cache_dir != self.cache_dir:

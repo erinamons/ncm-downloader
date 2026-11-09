@@ -120,6 +120,47 @@ def to_mp3(src: Path, bitrate: str = "auto", keep_source: bool = False) -> Path:
     return dst
 
 
+def to_wav(src: Path, dst: Path) -> Path:
+    """把 src 无损解码成 WAV（PCM 16bit），给系统缺解码器的机器兜底播放用。
+
+    只读 src，不改不删；输出位置由调用方指定（播放器放进 play-cache）。
+    """
+    exe = ffmpeg_path()
+    if not exe:
+        raise TranscodeError("未找到 ffmpeg，请先安装并加入 PATH")
+
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.unlink(missing_ok=True)
+    cmd = [
+        exe,
+        "-y",
+        "-loglevel", "error",
+        "-i", str(src),
+        "-vn",
+        "-acodec", "pcm_s16le",
+        str(dst),
+    ]
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
+            creationflags=flags,
+        )
+    except subprocess.TimeoutExpired:
+        raise TranscodeError("ffmpeg 超时（10 分钟），已中止")
+    if proc.returncode != 0 or not dst.exists():
+        detail = (proc.stderr or "").strip().splitlines()
+        dst.unlink(missing_ok=True)
+        raise TranscodeError(detail[-1] if detail else "ffmpeg 执行失败")
+    return dst
+
+
 def probe_bitrate(path: Path) -> int:
     """读音频码率（bps），失败返回 0。"""
     try:
