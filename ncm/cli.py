@@ -557,11 +557,20 @@ def cmd_cache(
     ids = [e.song_id for e in items]
     with console.status("查询歌曲信息…"):
         for start in range(0, len(ids), 50):
+            chunk = ids[start : start + 50]
             try:
-                for song in backend.song_details(ids[start : start + 50]):
+                for song in backend.song_details(chunk):
                     details[song.id] = song
             except BackendError:
-                continue
+                # 整批失败就逐首补：以前直接 continue，一批 50 首全变
+                # 「未识别 <id>」，导出文件名也跟着废掉
+                for one in chunk:
+                    try:
+                        song = backend.song_detail(one)
+                    except BackendError:
+                        continue
+                    if song is not None:
+                        details[song.id] = song
 
     if dry_run:
         table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)

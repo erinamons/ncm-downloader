@@ -62,8 +62,6 @@ class LocalBackend:
     ):
         self.timeout = timeout
         self.retries = retries
-        # Session 的 cookie jar 不是线程安全的，取地址阶段又会多线程调用
-        self._lock = threading.Lock()
         self.session = requests.Session()
         cookie = (cookie or "").strip().strip('"').strip("'")
         if client_mode:
@@ -85,6 +83,20 @@ class LocalBackend:
                 "Accept-Language": "zh-CN,zh;q=0.9",
             }
         )
+        # cookie jar 不是线程安全的，但用一把大锁把整个请求串起来，等于让
+        # 3 个下载线程的取址/歌词/封面全部排队。改成每个线程一个 Session：
+        # 互不共享 jar，也就不需要锁
+        self._local = threading.local()
+        self._local.session = self.session
+
+    def _session(self) -> requests.Session:
+        """当前线程专用的 Session（主线程复用构造时那份）。"""
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update(self.session.headers)
+            self._local.session = session
+        return session
 
     # ---------------- 底层请求 ----------------
 
@@ -93,10 +105,9 @@ class LocalBackend:
         last: Exception | None = None
         for attempt in range(self.retries + 1):
             try:
-                with self._lock:
-                    resp = self.session.request(
-                        method, url, timeout=self.timeout, **kwargs
-                    )
+                resp = self._session().request(
+                    method, url, timeout=self.timeout, **kwargs
+                )
                 resp.raise_for_status()
                 return resp.json()
             except Exception as exc:  # noqa: BLE001
@@ -146,8 +157,7 @@ class LocalBackend:
 
     def expand_link(self, url: str) -> str:
         """跟随 163cn.tv 短链的跳转，拿到带 id 的完整地址。"""
-        with self._lock:
-            resp = self.session.head(url, allow_redirects=True, timeout=self.timeout)
+        resp = self._session().head(url, allow_redirects=True, timeout=self.timeout)
         return resp.url or url
 
     def song_detail(self, song_id: int) -> Song | None:

@@ -787,6 +787,9 @@ class MainWindow(QMainWindow):
         # 会把槽位清空，正在跑的新任务若没人引用就会被 GC，QThread 析构直接 abort
         self._live_tasks: set = set()
         self._pending_query = ""
+        # 切到「仅本地缓存」时若正有任务在跑，扫描请求排队等任务槽空出来；
+        # 以前直接丢掉，界面会停在「音源=缓存但列表还是搜索结果」的死状态
+        self._pending_cache_scan = False
         self.store: Store | None = None
         self.downloader: Downloader | None = None
         self.task: Task | None = None
@@ -1686,6 +1689,7 @@ class MainWindow(QMainWindow):
         self.btn_search.setIcon(icons.icon("search", "#ffffff", 18))
         self.btn_search.setIconSize(QSize(15, 15))
         self.btn_search.setMinimumWidth(88)
+        self.btn_search.setFocusPolicy(Qt.NoFocus)
         self.btn_search.clicked.connect(self.on_search)
         bar.addWidget(self.btn_search)
         return bar
@@ -1937,6 +1941,8 @@ class MainWindow(QMainWindow):
         self.btn_download.setMinimumWidth(126)
         self.btn_download.setFixedHeight(ACTION_BTN_H)
         self.btn_download.setEnabled(False)
+        # 不抢焦点：点过按钮后按空格应该切播放，而不是把按钮再点一遍
+        self.btn_download.setFocusPolicy(Qt.NoFocus)
         self.btn_download.clicked.connect(self.on_download)
         bar.addWidget(self.btn_download)
         return bar
@@ -2213,8 +2219,12 @@ class MainWindow(QMainWindow):
         if self.songs:
             self.empty_hint.hide()
             return
-        if self._scanning_cache:
+        if self._scanning_cache and self._current_source() == "cache":
             self.empty_hint.setText("正在扫描本地缓存…")
+            self.empty_hint.show()
+            return
+        if self._pending_cache_scan and self._current_source() == "cache":
+            self.empty_hint.setText("正在等待上一个任务结束…\n完成后自动扫描缓存")
             self.empty_hint.show()
             return
         keyword = self.input.text().strip()
@@ -2267,10 +2277,15 @@ class MainWindow(QMainWindow):
         """清空当前音源的结果，不影响其他音源已载入的内容。"""
         source = self._current_source()
         self._pools.pop(source, None)
+        # 和「清空列表」保持同一套状态：不置位的话空提示会回落成
+        # 「输入关键词开始搜索」，看起来像没清干净
+        self._list_cleared = True
         self.input.blockSignals(True)
         self.input.clear()
         self.input.blockSignals(False)
         self._apply_view()
+        if not self.songs:
+            self.result_info.setText("")
         self.status_label.setText(f"已清空 {SOURCE_LABEL.get(source, source)} 的结果")
 
     def _toggle_auto_refresh(self) -> None:
@@ -2315,6 +2330,13 @@ class MainWindow(QMainWindow):
     def _toggle_sort(self) -> None:
         """切换缓存列表排序：最新缓存在前 <-> 按曲名。"""
         self._sort_by_time = self.btn_sort.isChecked()
+        # 表头排序在 _apply_view 里排在最后，会把这个按钮的结果盖掉；
+        # 点过表头后按钮看起来就完全没反应，这里显式清掉表头排序
+        self.sort_key = "default"
+        self.sort_desc = False
+        self.settings.setValue("sort_key", self.sort_key)
+        self.settings.setValue("sort_desc", self.sort_desc)
+        self._update_header_sort_style()
         if self._sort_by_time:
             self.btn_sort.setToolTip("排序：最新缓存在前\n点击改为按曲名")
             self.status_label.setText("缓存列表：最新缓存在前")
@@ -2345,7 +2367,12 @@ class MainWindow(QMainWindow):
         self._has_more = False
         self.btn_more.hide()
         self._set_busy(True, f"搜索「{keyword}」…")
-        self.task = Task(lambda: ("搜索结果", self.backend.search(keyword, limit=PAGE_SIZE)))
+        # 结果落进「发起请求时」的音源池：用户中途切走，也不能把搜索结果
+        # 塞进缓存池，否则缓存视图会出现一堆导出必失败的歌
+        source = self._current_source()
+        self.task = Task(
+            lambda: (source, "搜索结果", self.backend.search(keyword, limit=PAGE_SIZE))
+        )
         self._keep_task(self.task)
         self.task.ok.connect(self._on_songs_loaded)
         self.task.fail.connect(self._on_task_error)
@@ -2358,8 +2385,12 @@ class MainWindow(QMainWindow):
         keyword, offset = self._search_keyword, self._search_offset
         self.btn_more.setText("加载中…")
         self.btn_more.setEnabled(False)
+        source = self._current_source()
         self.task = Task(
-            lambda: ("搜索结果", self.backend.search(keyword, limit=PAGE_SIZE, offset=offset))
+            lambda: (
+                source,
+                self.backend.search(keyword, limit=PAGE_SIZE, offset=offset),
+            )
         )
         self.task.ok.connect(self._on_more_loaded)
         self.task.fail.connect(self._on_more_failed)
@@ -2367,8 +2398,7 @@ class MainWindow(QMainWindow):
         self.task.start()
 
     def _on_more_loaded(self, payload: tuple[str, list[Song]]) -> None:
-        _, songs = payload
-        source = self._current_source()
+        source, songs = payload
         pool = self._pools.get(source)
         if pool is None or not songs:
             self._has_more = False
@@ -2381,7 +2411,9 @@ class MainWindow(QMainWindow):
             self._has_more = len(songs) >= PAGE_SIZE
         self.btn_more.setText("加载更多")
         self.btn_more.setEnabled(True)
-        self._apply_view()
+        # 结果属于另一个音源时只更新它的池子，别把当前视图抢过来
+        if source == self._current_source():
+            self._apply_view()
 
     def _on_more_failed(self, message: str) -> None:
         self.btn_more.setText("加载更多")
@@ -2434,26 +2466,27 @@ class MainWindow(QMainWindow):
         self._search_keyword = ""
         self._has_more = False
         self.btn_more.hide()
+        source = self._current_source()
 
         if kind == "song":
 
-            def load() -> tuple[str, list[Song]]:
+            def load() -> tuple[str, str, list[Song]]:
                 song = self.backend.song_detail(ident)
-                return ("单曲", [song] if song else [])
+                return (source, "单曲", [song] if song else [])
 
             self._set_busy(True, "解析歌曲…")
         elif kind == "album":
 
-            def load() -> tuple[str, list[Song]]:
+            def load() -> tuple[str, str, list[Song]]:
                 album = self.backend.album(ident)
-                return (album.name, album.songs)
+                return (source, album.name, album.songs)
 
             self._set_busy(True, "解析专辑…")
         else:
 
-            def load() -> tuple[str, list[Song]]:
+            def load() -> tuple[str, str, list[Song]]:
                 playlist = self.backend.playlist(ident)
-                return (playlist.name, playlist.songs)
+                return (source, playlist.name, playlist.songs)
 
             self._set_busy(True, "解析歌单…")
 
@@ -2464,9 +2497,16 @@ class MainWindow(QMainWindow):
         self.task.finished.connect(lambda: self._set_busy(False, None))
         self.task.start()
 
-    def _on_songs_loaded(self, payload: tuple[str, list[Song]]) -> None:
-        title, songs = payload
-        self._pools[self._current_source()] = (list(songs), title, False)
+    def _on_songs_loaded(self, payload: tuple[str, str, list[Song]]) -> None:
+        source, title, songs = payload
+        # 落到发起请求时的音源池，而不是「到达时的音源」：中途切走也不会
+        # 把接口结果塞进缓存池（那会让缓存视图出现导出必失败的歌）
+        self._pools[source] = (list(songs), title, False)
+        if source != self._current_source():
+            self.status_label.setText(
+                f"已载入 {len(songs)} 首到「{SOURCE_LABEL.get(source, source)}」，切回去即可查看"
+            )
+            return
         # 只有关键词搜索才有下一页；链接/歌单解析出来的是全量
         if self._search_keyword:
             self._search_offset = len(songs)
@@ -2523,7 +2563,13 @@ class MainWindow(QMainWindow):
                 self._update_empty_hint()
                 self._update_download_button()
                 return
-            self.status_label.setText("上一个任务还没结束，稍等一下再扫描")
+            self.status_label.setText("上一个任务还没结束，完成后自动扫描缓存")
+            self._pending_cache_scan = True
+            # 音源已经切到缓存了，旧音源的结果不能留在表里冒充缓存
+            self.songs = []
+            self._fill_result_table()
+            self._update_empty_hint()
+            self._update_download_button()
             return
 
         idx = GUI_SOURCES.index("cache")
@@ -2552,13 +2598,19 @@ class MainWindow(QMainWindow):
         self.task.start()
 
     def _drain_pending(self) -> None:
-        """扫描期间排队的输入，等任务槽空出来再执行。"""
-        text = getattr(self, "_pending_query", "")
-        if not text:
-            return
+        """扫描/搜索期间排队的请求，等任务槽空出来再执行。"""
         if self.task is not None:
             # 旧任务还在收尾，过一会儿再试，别硬抢任务槽
             QTimer.singleShot(40, self._drain_pending)
+            return
+        if self._pending_cache_scan:
+            self._pending_cache_scan = False
+            # 排队期间用户可能又切回别的音源了，只在还停在缓存视图时扫
+            if self._current_source() == "cache":
+                self.on_load_cache()
+                return
+        text = getattr(self, "_pending_query", "")
+        if not text:
             return
         self._pending_query = ""
         if self._looks_like_link(text):
@@ -2674,8 +2726,20 @@ class MainWindow(QMainWindow):
         keep = self.settings.value("keep_cache", False, type=bool)
         index = archive_mod.load() if keep else {}
         if keep:
-            # 只留完整的：半截缓存解出来也是半截，白占空间
-            pending = [e for e in entries if e.complete and e.song_id not in index]
+            # 只留完整的：半截缓存解出来也是半截，白占空间。
+            # 已在存档里的也不全跳过——后来听到更高码率的版本要能替换
+            pending = [
+                e
+                for e in entries
+                if e.complete
+                and (
+                    e.song_id not in index
+                    or (
+                        archive_mod.path_of(index[e.song_id]) is not None
+                        and index[e.song_id].get("rate", 0) < e.rate
+                    )
+                )
+            ]
             for done, entry in enumerate(pending, 1):
                 archive_mod.store(entry, details.get(entry.song_id), index)
                 if progress and (done % 3 == 0 or done == len(pending)):
@@ -2775,6 +2839,10 @@ class MainWindow(QMainWindow):
             self.status_label.setText(message)
         if not busy:
             self.task = None
+            # 任务槽空了：排队中的搜索/缓存扫描在这里接上。
+            # 只靠 _on_cache_loaded 触发的话，搜索结束后的排队请求永远等不到
+            if self._pending_query or self._pending_cache_scan:
+                QTimer.singleShot(0, self._drain_pending)
 
     # ---------------- 结果表 ----------------
 
@@ -2924,6 +2992,19 @@ class MainWindow(QMainWindow):
     def _update_download_button(self, *_args) -> None:
         if self.batch is not None:
             return
+        # 暂停后主按钮接着下：以前这里会变回「下载选中」，点下去把整批
+        # （含已下完的）重新排一遍，真正的续传藏在右键菜单里
+        rest = self._resume_rest() if self._paused else []
+        if rest:
+            # 缓存视图下这批是「导出」，继续时文案也要跟着走
+            verb = "导出" if self._current_source() == "cache" else "下载"
+            text = f"继续 ({len(rest)})" if self._mini else f"继续{verb} ({len(rest)})"
+            self.btn_download.setText(text)
+            self.btn_download.setMinimumWidth(84 if self._mini else 126)
+            self.btn_download.setIcon(icons.icon("play", "#ffffff", 18))
+            self.btn_download.setIconSize(QSize(16, 16))
+            self.btn_download.setEnabled(True)
+            return
         count = len(self._selected_songs())
         # 紧凑模式一行要塞下两个选择器，文案缩到「导出 (n)」
         verb = self._verb() if self._mini else f"{self._verb()}选中"
@@ -3048,6 +3129,10 @@ class MainWindow(QMainWindow):
             self.batch.cancel()
             self.btn_download.setEnabled(False)
             self.status_label.setText("正在取消…")
+            return
+        if self._paused and self._resume_rest():
+            # 暂停态下按钮已是「继续下载」，走续传而不是重新排整批
+            self._resume_batch()
             return
         songs = self._selected_songs()
         if not songs:
@@ -3216,9 +3301,14 @@ class MainWindow(QMainWindow):
         self.queue_rows.clear()
         self.bars.clear()
         self._failed = []
+        # 清空队列等于放弃这批的续传资格，否则主按钮会一直挂着「继续下载」
+        self._paused = False
+        self._batch_songs = []
+        self._done_ids.clear()
         self.queue_info.setText("下载队列")
         self.summary_label.setText("")
         self.status_label.setText("已清空下载队列")
+        self._update_download_button()
 
     def _resume_rest(self) -> list[Song]:
         """这批里还没跑完的曲目（取消掉的多半是没来得及开始的）。"""
@@ -3437,8 +3527,9 @@ class MainWindow(QMainWindow):
         reason = self._failure_hint(failed)
         if self._paused:
             left = len(self._resume_rest())
+            verb = "导出" if self._current_source() == "cache" else "下载"
             self.status_label.setText(
-                f"已暂停 · 剩 {left} 首未完成，右键下载队列可继续"
+                f"已暂停 · 剩 {left} 首未完成，点「继续{verb}」接着下"
             )
         else:
             self.status_label.setText(

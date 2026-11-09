@@ -73,7 +73,11 @@ def store(entry, song, index: dict[int, dict]) -> bool:
 
     entry 是 cache.CacheEntry，song 是带元数据的 Song（可缺）。
     """
-    if entry.song_id in index and path_of(index[entry.song_id]):
+    old = index.get(entry.song_id)
+    old_path = path_of(old) if old else None
+    # 同一首已有存档时不无条件跳过：先存了 128k 再听到 320k，旧逻辑永远
+    # 保留低码率那份。只在码率更高时替换，同等或更低保持原样
+    if old_path is not None and entry.rate <= old.get("rate", 0):
         return False
     store_dir().mkdir(parents=True, exist_ok=True)
     scratch = store_dir() / f"{entry.song_id}.bin"
@@ -97,6 +101,9 @@ def store(entry, song, index: dict[int, dict]) -> bool:
         "duration_ms": getattr(song, "duration_ms", 0) or 0,
         "at": int(time.time()),
     }
+    # 换了容器（m4a → flac）时文件名跟着变，旧文件不会被子替换掉，删掉免得白占空间
+    if old_path is not None and old_path.name != final.name:
+        old_path.unlink(missing_ok=True)
     return True
 
 

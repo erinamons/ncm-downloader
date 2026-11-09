@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 SRC = Path("pack/网易云下载器")
 OUT_DIR = Path("dist")
 EXCLUDE_NAMES = {"config.json", "settings.ini", "app.log", "app.log.1", "app.log.2"}
+# crash.log 是 windowed 模式的崩溃栈，随包发出去既没用又难看
+EXCLUDE_SUFFIXES = {".log"}
 EXCLUDE_DIRS = {"play-cache", "downloads"}
 
 
@@ -35,6 +37,9 @@ def main() -> int:
         if rel.parts[0] in EXCLUDE_DIRS:
             continue
         if path.name in EXCLUDE_NAMES or path.name.startswith("app.log."):
+            continue
+        # 只排顶层日志：_internal 里带的第三方资源不动
+        if len(rel.parts) == 1 and path.suffix.lower() in EXCLUDE_SUFFIXES:
             continue
         files.append((path, rel))
 

@@ -163,6 +163,11 @@ class Downloader:
 
     def reset_cancel(self) -> None:
         self._cancel.clear()
+        # 单曲取消标记也要一起清：全局取消时 run() 里的 work() 直接返回
+        # CANCELLED，不经过 download() 的 finally，标记会留到下一批，
+        # 让同一首歌永远显示「已取消」
+        with self._song_lock:
+            self._song_cancels.clear()
 
     def cancel_song(self, song_id: int) -> None:
         """只放弃某一首：正在下的尽快停，还没开始的直接跳过。
@@ -298,7 +303,7 @@ class Downloader:
         part = target.with_name(target.name + ".part")
 
         try:
-            self._fetch_stream(src.url, part, src.size, on_progress, song.id)
+            expected = self._fetch_stream(src.url, part, src.size, on_progress, song.id)
         except InterruptedError:
             # 主动取消就把半成品删掉：留着也没人续传，只会占空间
             part.unlink(missing_ok=True)
@@ -312,10 +317,14 @@ class Downloader:
                 message=f"下载中断: {exc}",
             )
 
-        if src.size and part.stat().st_size < src.size:
+        # 接口没给 size 时也得校验：连接中途被掐断，iter_content 往往
+        # 静默结束而不抛异常，以前这里只看 src.size，残缺文件会当成功落库
+        want = src.size or expected
+        have_size = part.stat().st_size if part.exists() else 0
+        if want and have_size < want:
             return TaskResult(
                 song, FAILED, br=src.br, quality=src.quality_label,
-                message=f"文件不完整 {part.stat().st_size}/{src.size}",
+                message=f"文件不完整 {have_size}/{want}",
             )
 
         os.replace(part, target)
@@ -343,7 +352,8 @@ class Downloader:
         total_hint: int,
         on_progress: ProgressFn | None,
         song_id: int = 0,
-    ) -> None:
+    ) -> int:
+        """下载到 part，返回本次预期的总字节数（未知时返回 0）。"""
         if part.exists() and part.stat().st_size >= 3:
             # 正常 .part 是裸音频；出现 ID3 头说明里面混了已打标签的文件，
             # 按字节偏移续传会让音频错位，直接丢弃
@@ -388,6 +398,7 @@ class Downloader:
                     done += len(chunk)
                     if on_progress:
                         on_progress(done, total)
+        return total
 
     def _maybe_transcode(self, target: Path) -> tuple[Path, str]:
         """按需把非 mp3 容器转成 mp3，返回 (新路径, 附加说明)。"""
