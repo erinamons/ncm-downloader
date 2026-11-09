@@ -160,6 +160,12 @@ painter.fillRect(QRectF(w - margin, margin, margin, h - margin*2), tint)
 | ctypes 调 RegisterHotKey 拿不到错误码 | 没声明 argtypes/restype，64 位下 HWND 被截断且 `get_last_error` 无效 | 用 `ctypes.WinDLL("user32", use_last_error=True)` 并显式声明 argtypes |
 | 普通 QWidget 设了 QSS 背景却不显示 | 需要 `WA_StyledBackground` | 补丁类控件记得打开 |
 | 盖住滚动条上段无效 | 滚动条容器后绘制，`raise_()` 改不了层序 | 直接改 `qt_scrollarea_vcontainer` 几何，把滚动条压到表头下方 |
+| **双击 exe 秒退，报 `sys.stderr is None`** | `--windowed` 无控制台，`sys.stderr` 为 None；`faulthandler.enable()` 无参会直接抛异常 | 崩溃栈写到程序目录 `crash.log`（`enable(file=...)`）；windowed 程序里任何依赖 stdout/stderr 的代码都要防 None |
+| **状态栏显示「正在播放」但没声音** | `QMediaPlayer.state` 是用户意图（`play()` 一调就是 Playing），不代表数据就绪 | 对外状态以 `mediaStatus` 为准：`LoadedMedia/BufferedMedia` 才报 PLAYING，否则 BUFFERING；QMediaPlayer 只能在主线程操作（`_start_requested` 信号封送） |
+| **缓存 60% 的歌报「无缓存」/ 右键置灰 / 进度列从不更新** | 三处同类：`Downloader._cache`、`_cache_map` 只收 `complete` 条目，下游分支/查找永远拿不到半截条目；进度列读了 idx 里不存在的 `covered/total` 字段（实际是 `size/zone`） | **半截缓存必须全程保留**，由 `partial_fallback` 决定补齐还是跳过；idx 字段名以 `cache.py::_read_idx` 为准 |
+| 联网播放必失败 `name 'src' is not defined` | 从 `downloader.py` 搬代码到 `player.py` 时带上了对方的 `src.size`，该作用域只有 `(url, ext)` | 总长从响应头 `Content-Length` 取；跨模块搬代码先核对变量作用域 |
+| mini 模式测试怎么都进不去紧凑布局 | 直接 `resize(400)` 会被 full 模式的 `setMinimumSize(840)` 顶回去 | 测试要走真实 `toggle_mini()` 入口（Ctrl+M 同款） |
+| 7 列布局在窄窗口下最右列被裁 | 弹性列保底 160px，`30+160+160+200+64+70+80` 超过视口，横向滚动条又被禁用 | `FluidTable.min_fluid` 可调，紧凑模式设 116；手动 `setColumnWidth` 后要 `refit()` |
 
 ## 二、文件都写到哪了
 
