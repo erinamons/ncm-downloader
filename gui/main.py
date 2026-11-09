@@ -256,6 +256,7 @@ class SettingsDialog(RoundDialog):
         self.logged_out = False
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.changed = False
+        self.dev_requested = False
 
         layout = self.body_layout
         form = QFormLayout()
@@ -654,9 +655,10 @@ class SettingsDialog(RoundDialog):
             self.cache_store_state.setText("空")
 
     def _open_devtools(self) -> None:
-        owner = self.parent()
-        if owner is not None and hasattr(owner, "open_devtools"):
-            owner.open_devtools()
+        # 设置是模态的，直接在这里开面板会压在它后面、既看不见也点不到。
+        # 先把自己的改动提交掉再关闭，由主窗口在 exec_() 返回后打开面板
+        self.dev_requested = True
+        self.accept()
 
     def _show_cache_report(self) -> None:
         from ncm import cache as cache_mod
@@ -822,6 +824,9 @@ class MainWindow(QMainWindow):
         # 会把槽位清空，正在跑的新任务若没人引用就会被 GC，QThread 析构直接 abort
         self._live_tasks: set = set()
         self._dev_window = None
+        self._dl_progress: dict[int, int] = {}
+        self._dl_totals: dict[int, int] = {}
+        self._dl_sample = None
         self._pending_query = ""
         # 切到「仅本地缓存」时若正有任务在跑，扫描请求排队等任务槽空出来；
         # 以前直接丢掉，界面会停在「音源=缓存但列表还是搜索结果」的死状态
@@ -1532,6 +1537,9 @@ class MainWindow(QMainWindow):
         previous = self._playing_id
         self._playing_id = song.id
         self.topbar.set_song(song)
+        tray = getattr(self, "tray", None)
+        if tray is not None:
+            tray.set_now_playing(f"{song.name} - {song.artist_text}")
         self._refresh_playing_rows(previous)
         row = next((i for i, s in enumerate(self.songs) if s.id == song.id), -1)
         if row >= 0:
@@ -3341,6 +3349,9 @@ class MainWindow(QMainWindow):
         self._batch_songs = list(songs)
         self._done_ids = set()
         self._paused = False
+        self._dl_progress = {}
+        self._dl_totals = {}
+        self._dl_sample = None
         self.batch = BatchTask(self.downloader, songs)
         self.batch.on_start_song.connect(self._on_song_start)
         self.batch.on_progress_song.connect(self._on_song_progress)
@@ -3529,8 +3540,38 @@ class MainWindow(QMainWindow):
         if total:
             bar.setRange(0, total)
             bar.setValue(done)
+            self._dl_progress[song_id] = done
+            self._dl_totals[song_id] = total
+            self._update_speed_text()
         else:
             bar.setRange(0, 0)
+
+    def _update_speed_text(self) -> None:
+        """按 0.8 秒采样算总速度和剩余时间；只改状态栏，不碰表格。"""
+        now = time.monotonic()
+        moved = sum(self._dl_progress.values())
+        if self._dl_sample is None:
+            self._dl_sample = (now, moved)
+            return
+        t0, m0 = self._dl_sample
+        span = now - t0
+        if span < 0.8:
+            return
+        speed = max(0.0, (moved - m0) / span)
+        self._dl_sample = (now, moved)
+        if not self._batch_total:
+            return
+        if speed >= 1048576:
+            text = f"下载中 {self._batch_done}/{self._batch_total} · {speed / 1048576:.1f} MB/s"
+        elif speed >= 1024:
+            text = f"下载中 {self._batch_done}/{self._batch_total} · {speed / 1024:.0f} KB/s"
+        else:
+            text = f"下载中 {self._batch_done}/{self._batch_total}"
+        remain = max(0, sum(self._dl_totals.values()) - moved)
+        if speed > 0 and remain:
+            sec = int(remain / speed)
+            text += f" · 剩 {sec // 60}:{sec % 60:02d}"
+        self.status_label.setText(text)
 
     def _on_song_result(self, res: TaskResult) -> None:
         self._batch_done += 1
@@ -3600,6 +3641,9 @@ class MainWindow(QMainWindow):
 
     def _on_batch_done(self, results: list[TaskResult]) -> None:
         cancelled = sum(1 for r in results if r.status == CANCELLED)
+        self._dl_progress = {}
+        self._dl_totals = {}
+        self._dl_sample = None
         trace("下载", "批次结束", "ok",
               detail={"total": len(results), "cancelled": cancelled,
                       "failed": sum(1 for r in results if r.status == FAILED)})
@@ -3799,6 +3843,9 @@ class MainWindow(QMainWindow):
                 )
             if partial_turned_on:
                 self._offer_complete_partials()
+            # 设置是模态的，面板要等它关掉再开，否则会压在后面看不见
+            if getattr(dialog, "dev_requested", False):
+                self.open_devtools()
 
     def _offer_complete_partials(self) -> None:
         """刚打开「联网补齐」，问一句要不要把上一批跳过的歌补回来。"""

@@ -123,6 +123,7 @@ class RoundDialog(QDialog):
 
         self._centered = False
         self._shadow = None
+        self._shadow_size = (0, 0)
 
     def make_scrollable(self, max_height: int = 640) -> None:
         """内容可能超出屏幕的对话框（比如设置）套一层滚动。
@@ -176,10 +177,11 @@ class RoundDialog(QDialog):
     # 阴影与主窗口同一套素材
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        if self._shadow is None:
-            self._shadow = render_shadow(
-                self.width(), self.height(), SHADOW, RADIUS
-            )
+        # 尺寸变了要重画：窗口能拉伸（开发者面板）时，旧尺寸的阴影会糊在边上
+        size = (self.width(), self.height())
+        if self._shadow is None or self._shadow_size != size:
+            self._shadow = render_shadow(size[0], size[1], SHADOW, RADIUS)
+            self._shadow_size = size
         if self._shadow.isNull():
             return
         painter = QPainter(self)

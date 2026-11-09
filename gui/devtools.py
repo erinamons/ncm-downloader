@@ -1,14 +1,16 @@
-"""开发者面板：运行流程、实时日志、问题列表、诊断包。
+"""开发者面板：运行流程、实时日志、问题列表、环境信息、诊断包。
 
-入口藏在设置里，不打扰普通用户。打开后挂一个日志 Handler 和一个 trace
-监听器，关掉就全部摘掉，文件日志不受影响。
+外观和主窗口/设置一致：无边框、圆角、同一套阴影与标题栏。
+入口藏在设置里；打开后挂一个日志 Handler 和一个 trace 监听器，关掉全部摘掉。
 """
 from __future__ import annotations
 
 import logging
+import os
 import platform
 import queue
 import re
+import shutil
 import time
 import zipfile
 from collections import deque
@@ -26,6 +28,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QSizeGrip,
     QSplitter,
     QTabWidget,
     QTreeWidget,
@@ -34,6 +37,8 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from gui.dialog import RoundDialog, SHADOW
+from gui.style import QSS
 from ncm import trace as trace_mod
 from ncm.paths import data_dir
 
@@ -49,34 +54,31 @@ _SECRET_TEXT = (
     re.compile(r"__csrf=[^;\s\"']+", re.I),
     re.compile(r"(?i)(cookie|token|authorization)\s*[:=]\s*\S+"),
 )
+_SCOPES = ("全部", "搜索", "缓存", "下载", "播放", "接口", "任务")
 
-_CSS = """
-#devRoot { background: #1c1c1f; }
-QLabel { color: #d8d8dc; }
-#envBar {
-    background: #242428; border: 1px solid #34343a; border-radius: 6px;
-    color: #b9b9c2; padding: 8px 10px;
-}
+_DEV_CSS = """
 QTreeWidget, QPlainTextEdit {
-    background: #17171a; border: 1px solid #34343a; border-radius: 4px;
+    background: #17171a; border: 1px solid #34343a; border-radius: 6px;
     color: #d8d8dc; selection-background-color: #33333a;
 }
 QTreeWidget::item { height: 22px; }
 QHeaderView::section {
-    background: #222226; color: #96969e; border: 0; border-bottom: 1px solid #34343a;
-    padding: 4px 6px;
+    background: #222226; color: #96969e; border: 0;
+    border-bottom: 1px solid #34343a; padding: 4px 6px;
 }
-QTabWidget::pane { border: 1px solid #34343a; border-radius: 4px; }
+QTabBar { background: transparent; }
+QTabWidget::pane {
+    top: -1px; background: #17171a;
+    border: 1px solid #34343a; border-radius: 6px;
+}
 QTabBar::tab {
-    background: #242428; color: #96969e; padding: 5px 12px;
-    border: 1px solid #34343a; border-bottom: 0; border-top-left-radius: 4px; border-top-right-radius: 4px;
+    background: #242428; color: #96969e; padding: 5px 14px;
+    min-width: 58px; min-height: 18px;
+    border: 1px solid #34343a; border-bottom: 0;
+    border-top-left-radius: 5px; border-top-right-radius: 5px;
 }
 QTabBar::tab:selected { background: #17171a; color: #e8e8ea; }
-QPushButton {
-    background: #2b2b31; color: #d8d8dc; border: 1px solid #3a3a42;
-    border-radius: 4px; padding: 5px 12px;
-}
-QPushButton:hover { background: #34343c; }
+QTabBar::tab:hover { color: #d8d8dc; }
 QComboBox, QLineEdit {
     background: #242428; color: #d8d8dc; border: 1px solid #3a3a42;
     border-radius: 4px; padding: 3px 6px;
@@ -109,14 +111,12 @@ def _redact(text: str) -> str:
     return text
 
 
-class DevWindow(QWidget):
+class DevWindow(RoundDialog):
     def __init__(self, window):
-        super().__init__(None)
+        super().__init__(window, "开发者面板")
         self._win = window
-        self.setObjectName("devRoot")
-        self.setWindowTitle("开发者面板")
-        self.resize(1120, 660)
-        self.setStyleSheet(_CSS)
+        self.setStyleSheet(QSS + _DEV_CSS)
+        self.resize(1120 + SHADOW * 2, 680 + SHADOW * 2)
 
         self._logs: deque[tuple[int, str, str, float]] = deque(maxlen=MAX_LOG)
         self._errors: deque[str] = deque(maxlen=MAX_ERRORS)
@@ -128,25 +128,53 @@ class DevWindow(QWidget):
         self._handler: _QueueHandler | None = None
         self._filter_level = logging.INFO
         self._keyword = ""
+        self._scope = "全部"
+        self._only_fail = False
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(8)
+        body = self.body_layout
+        body.setContentsMargins(14, 4, 14, 12)
+        body.setSpacing(8)
 
         self.env = QLabel()
         self.env.setObjectName("envBar")
         self.env.setTextFormat(Qt.RichText)
         self.env.setWordWrap(True)
-        root.addWidget(self.env)
+        self.env.setStyleSheet(
+            "#envBar { background: #202024; border: 1px solid #34343a;"
+            " border-radius: 6px; color: #b9b9c2; padding: 7px 10px; }"
+        )
+        body.addWidget(self.env)
 
         split = QSplitter(Qt.Horizontal)
-        root.addWidget(split, 1)
+        body.addWidget(split, 1)
+
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        lv.setSpacing(6)
+
+        filters = QHBoxLayout()
+        filters.setSpacing(6)
+        self.scope_box = QComboBox()
+        self.scope_box.addItems(_SCOPES)
+        self.scope_box.currentTextChanged.connect(self._on_scope_changed)
+        filters.addWidget(self.scope_box)
+        self.only_fail = QCheckBox("只看失败")
+        self.only_fail.stateChanged.connect(self._on_scope_changed)
+        filters.addWidget(self.only_fail)
+        self.count_label = QLabel("0 步")
+        self.count_label.setStyleSheet("color:#96969e;")
+        filters.addWidget(self.count_label)
+        filters.addStretch(1)
+        btn_clear_steps = QPushButton("清空")
+        btn_clear_steps.clicked.connect(self._clear_views)
+        filters.addWidget(btn_clear_steps)
+        lv.addLayout(filters)
 
         self.tree = QTreeWidget()
         self.tree.setColumnCount(5)
         self.tree.setHeaderLabels(["时间", "步骤", "结果", "耗时", "说明"])
         self.tree.setRootIsDecorated(True)
-        self.tree.setAlternatingRowColors(False)
         self.tree.setUniformRowHeights(True)
         header = self.tree.header()
         header.setSectionResizeMode(0, QHeaderView.Fixed)
@@ -155,15 +183,16 @@ class DevWindow(QWidget):
         header.setSectionResizeMode(3, QHeaderView.Fixed)
         header.setSectionResizeMode(4, QHeaderView.Stretch)
         self.tree.setColumnWidth(0, 104)
-        self.tree.setIndentation(12)
         self.tree.setColumnWidth(2, 58)
         self.tree.setColumnWidth(3, 66)
-        split.addWidget(self.tree)
+        self.tree.setIndentation(12)
+        lv.addWidget(self.tree, 1)
+        split.addWidget(left)
 
         right = QWidget()
-        rlay = QVBoxLayout(right)
-        rlay.setContentsMargins(0, 0, 0, 0)
-        rlay.setSpacing(6)
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(6)
 
         bar = QHBoxLayout()
         bar.setSpacing(6)
@@ -177,24 +206,34 @@ class DevWindow(QWidget):
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._on_filter_changed)
         bar.addWidget(self.search, 1)
-        self.pause = QCheckBox("暂停滚动")
+        self.pause = QCheckBox("暂停")
+        self.pause.setToolTip("暂停滚动和新事件，方便看现场")
         self.pause.stateChanged.connect(self._on_pause)
         bar.addWidget(self.pause)
-        btn_clear = QPushButton("清空")
-        btn_clear.clicked.connect(self._clear_views)
-        bar.addWidget(btn_clear)
-        rlay.addLayout(bar)
+        rv.addLayout(bar)
 
         self.tabs = QTabWidget()
+        # 全局 QSS 里没有 tab 规则，Fusion 默认会画成白底浅字；这里单独钉死
+        self.tabs.setStyleSheet(
+            "QTabBar::tab { background:#242428; color:#96969e; padding:6px 16px;"
+            " min-width:56px; border:1px solid #34343a; border-bottom:0;"
+            " border-top-left-radius:5px; border-top-right-radius:5px; }"
+            "QTabBar::tab:selected { background:#17171a; color:#e8e8ea; }"
+            "QTabBar::tab:hover { color:#d8d8dc; }"
+            "QTabWidget::pane { background:#17171a; border:1px solid #34343a;"
+            " border-radius:6px; top:-1px; }"
+        )
         self.log_view = self._make_view()
         self.err_view = self._make_view()
+        self.env_view = self._make_view()
         self.tabs.addTab(self.log_view, "日志")
         self.tabs.addTab(self.err_view, "问题 0")
-        rlay.addWidget(self.tabs, 1)
+        self.tabs.addTab(self.env_view, "环境")
+        rv.addWidget(self.tabs, 1)
         split.addWidget(right)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
-        split.setSizes([640, 460])
+        split.setSizes([620, 440])
 
         bottom = QHBoxLayout()
         bottom.setSpacing(8)
@@ -210,7 +249,8 @@ class DevWindow(QWidget):
             btn = QPushButton(label)
             btn.clicked.connect(slot)
             bottom.addWidget(btn)
-        root.addLayout(bottom)
+        bottom.addWidget(QSizeGrip(self._root), 0, Qt.AlignBottom | Qt.AlignRight)
+        body.addLayout(bottom)
 
         self._timer = QTimer(self)
         self._timer.setInterval(FLUSH_MS)
@@ -218,12 +258,10 @@ class DevWindow(QWidget):
         self._attach()
         self._refresh_env()
 
-    def _attach(self) -> None:
-        """挂到 root logger 和 trace 上；重复调用无副作用。
+    # ---------------- 挂载 ----------------
 
-        面板关掉时会摘掉，再次打开必须重新挂——否则窗口还在，但日志和步骤
-        永远停在关闭前那一屏（踩过：重开后面板是「死」的）。
-        """
+    def _attach(self) -> None:
+        """挂到 root logger 和 trace 上；重复调用无副作用。"""
         if self._handler is None:
             self._handler = _QueueHandler(self._log_q)
             self._handler.setFormatter(
@@ -235,9 +273,20 @@ class DevWindow(QWidget):
             self._timer.start()
 
     def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
         self._attach()
         self._refresh_env()
-        super().showEvent(event)
+
+    def reject(self) -> None:  # 标题栏的关闭按钮走这里
+        self.close()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._timer.stop()
+        if self._handler is not None:
+            logging.getLogger().removeHandler(self._handler)
+            self._handler = None
+        trace_mod.remove_listener(self._on_trace)
+        super().closeEvent(event)
 
     # ---------------- 构建 ----------------
 
@@ -247,6 +296,11 @@ class DevWindow(QWidget):
         view.setReadOnly(True)
         view.setMaximumBlockCount(MAX_LOG)
         view.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        # 单独写一份：全局 QSS 的 QWidget 规则会把底色让出去，Fusion 默认底是白的
+        view.setStyleSheet(
+            "QPlainTextEdit { background:#17171a; color:#d8d8dc;"
+            " border:1px solid #34343a; border-radius:6px; padding:4px; }"
+        )
         font = QFont("Consolas")
         font.setPointSize(9)
         view.setFont(font)
@@ -256,20 +310,19 @@ class DevWindow(QWidget):
         from gui import __version__
 
         pieces = [f"<b>v{__version__}</b>"]
+        pieces.append(f"Python {platform.python_version()}")
         try:
             from PyQt5.QtCore import PYQT_VERSION_STR, QT_VERSION_STR
 
-            pieces.append(f"Python {platform.python_version()}")
             pieces.append(f"PyQt5 {PYQT_VERSION_STR} / Qt {QT_VERSION_STR}")
         except Exception:  # noqa: BLE001
             pass
-        backend = __import__("os").environ.get("QT_MULTIMEDIA_PREFERRED_PLUGINS", "default")
-        pieces.append(f"播放后端 {backend}")
+        pieces.append(f"后端 {os.environ.get('QT_MULTIMEDIA_PREFERRED_PLUGINS', '默认')}")
         try:
             from ncm import transcode
 
-            ff = transcode.ffmpeg_path()
-            pieces.append("ffmpeg " + ("就绪" if ff else "<span style='color:#e8554a'>未找到</span>"))
+            ok = bool(transcode.ffmpeg_path())
+            pieces.append("ffmpeg " + ("就绪" if ok else "<span style='color:#e8554a'>未找到</span>"))
         except Exception:  # noqa: BLE001
             pieces.append("ffmpeg 未知")
         try:
@@ -278,17 +331,16 @@ class DevWindow(QWidget):
             pieces.append(f"缓存 {len(entries)} 个（完整 {done}）")
         except Exception:  # noqa: BLE001
             pass
-        cache_dir = getattr(self._win, "cache_dir", None)
-        out_dir = getattr(self._win, "out_dir", None)
         extra = []
-        if cache_dir:
-            extra.append(f"缓存目录 {cache_dir}")
-        if out_dir:
-            extra.append(f"保存目录 {out_dir}")
+        if getattr(self._win, "cache_dir", None):
+            extra.append(f"缓存目录 {self._win.cache_dir}")
+        if getattr(self._win, "out_dir", None):
+            extra.append(f"保存目录 {self._win.out_dir}")
         text = " · ".join(pieces)
         if extra:
             text += "<br><span style='color:#7f7f88'>" + "<br>".join(extra) + "</span>"
         self.env.setText(text)
+        self.env_view.setPlainText(self._env_full_text())
 
     # ---------------- 数据入口 ----------------
 
@@ -304,6 +356,11 @@ class DevWindow(QWidget):
         self._rebuild_log()
         self._rebuild_errors()
 
+    def _on_scope_changed(self, *_args) -> None:
+        self._scope = self.scope_box.currentText()
+        self._only_fail = self.only_fail.isChecked()
+        self._rebuild_steps()
+
     def _clear_views(self) -> None:
         self._logs.clear()
         self._errors.clear()
@@ -313,6 +370,7 @@ class DevWindow(QWidget):
         self.log_view.clear()
         self.err_view.clear()
         self.tabs.setTabText(1, "问题 0")
+        self.count_label.setText("0 步")
 
     def _flush(self) -> None:
         dirty_log = False
@@ -340,10 +398,13 @@ class DevWindow(QWidget):
                     event = self._event_q.get_nowait()
                 except queue.Empty:
                     break
-                self._append_step(event)
-                appended = True
+                self._steps.append(event)
+                if self._step_match(event):
+                    self._append_step(event)
+                    appended = True
             if appended:
                 self.tree.scrollToBottom()
+                self.count_label.setText(f"{len(self._steps)} 步")
         else:
             while True:
                 try:
@@ -364,8 +425,17 @@ class DevWindow(QWidget):
     def _match(self, level: int, message: str) -> bool:
         if level < self._filter_level:
             return False
-        if self._keyword and self._keyword.lower() not in message.lower():
+        return not (self._keyword and self._keyword.lower() not in message.lower())
+
+    def _step_match(self, event: dict) -> bool:
+        if self._scope != "全部" and event["scope"] != self._scope:
             return False
+        if self._only_fail and event["status"] != "fail":
+            return False
+        if self._keyword:
+            blob = f"{event['scope']} {event['step']} {event.get('detail')}"
+            if self._keyword.lower() not in blob.lower():
+                return False
         return True
 
     def _rebuild_log(self) -> None:
@@ -381,31 +451,38 @@ class DevWindow(QWidget):
         if lines:
             self.err_view.setPlainText("\n".join(lines))
 
+    def _rebuild_steps(self) -> None:
+        self.tree.clear()
+        self._groups.clear()
+        for event in self._steps:
+            if self._step_match(event):
+                self._append_step(event)
+        self.count_label.setText(f"{len(self._steps)} 步")
+
     def _append_step(self, event: dict) -> None:
-        self._steps.append(event)
         clock = time.strftime("%H:%M:%S", time.localtime(event["t"]))
         status = _STATUS.get(event["status"], event["status"])
         took = f"{event['ms']:.0f} ms" if event.get("ms") is not None else ""
         detail = " ".join(f"{k}={v}" for k, v in (event.get("detail") or {}).items())
+        color = {"ok": "#6fbf8f", "fail": "#e8554a", "skip": "#c9a45c"}.get(event["status"], "#96969e")
         group = event.get("group") or ""
         if group:
             key = f"{event['scope']}|{group}"
             top = self._groups.get(key)
             if top is None:
                 top = QTreeWidgetItem([clock, f"{event['scope']} · {group}", "", "", ""])
-                top.setFirstColumnSpanned(False)
                 font = top.font(1)
                 font.setBold(True)
                 top.setFont(1, font)
                 self.tree.addTopLevelItem(top)
                 self._groups[key] = top
             child = QTreeWidgetItem([clock, event["step"], status, took, detail])
-            child.setForeground(2, QColor({"ok": "#6fbf8f", "fail": "#e8554a", "skip": "#c9a45c"}.get(event["status"], "#96969e")))
+            child.setForeground(2, QColor(color))
             top.addChild(child)
             top.setExpanded(True)
         else:
             item = QTreeWidgetItem([clock, f"{event['scope']} · {event['step']}", status, took, detail])
-            item.setForeground(2, QColor({"ok": "#6fbf8f", "fail": "#e8554a", "skip": "#c9a45c"}.get(event["status"], "#96969e")))
+            item.setForeground(2, QColor(color))
             self.tree.addTopLevelItem(item)
         if self.tree.topLevelItemCount() > 800:
             for _ in range(200):
@@ -418,35 +495,63 @@ class DevWindow(QWidget):
 
     # ---------------- 诊断 ----------------
 
-    def _env_text(self) -> str:
+    def _env_full_text(self) -> str:
         from gui import __version__
 
-        lines = [f"版本 {__version__}", f"Python {platform.python_version()}", f"系统 {platform.platform()}"]
+        lines = [
+            f"版本 {__version__}",
+            f"Python {platform.python_version()}",
+            f"系统 {platform.platform()}",
+        ]
         try:
             from PyQt5.QtCore import PYQT_VERSION_STR, QT_VERSION_STR
 
             lines.append(f"PyQt5 {PYQT_VERSION_STR} / Qt {QT_VERSION_STR}")
         except Exception:  # noqa: BLE001
             pass
-        import os
-
-        lines.append(f"播放后端 {os.environ.get('QT_MULTIMEDIA_PREFERRED_PLUGINS', 'default')}")
+        lines.append(f"播放后端 {os.environ.get('QT_MULTIMEDIA_PREFERRED_PLUGINS', '默认')}")
         try:
             from ncm import transcode
 
             lines.append(f"ffmpeg {transcode.ffmpeg_path() or '未找到'}")
         except Exception:  # noqa: BLE001
             pass
-        for key in ("cache_dir", "out_dir"):
+        lines.append(f"数据目录 {data_dir()}")
+        for key, label in (("cache_dir", "缓存目录"), ("out_dir", "保存目录")):
             value = getattr(self._win, key, None)
             if value:
-                lines.append(f"{key} {value}")
+                lines.append(f"{label} {value}")
+        try:
+            from ncm.log import log_path
+
+            lines.append(f"日志文件 {log_path()}")
+        except Exception:  # noqa: BLE001
+            pass
         try:
             entries = self._win._cache_map()
             done = sum(1 for e in entries.values() if e.complete)
-            lines.append(f"缓存条目 {len(entries)}（完整 {done}）")
+            lines.append(f"缓存条目 {len(entries)}（完整 {done}，未完成 {len(entries) - done}）")
         except Exception:  # noqa: BLE001
             pass
+        try:
+            out = Path(getattr(self._win, "out_dir", data_dir()))
+            while not out.exists() and out != out.parent:
+                out = out.parent  # 保存目录可能还没建，往上一层层找到存在的
+            usage = shutil.disk_usage(str(out))
+            lines.append(
+                f"磁盘剩余 {usage.free / 1073741824:.1f} GB / 共 {usage.total / 1073741824:.1f} GB"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        lines.append("")
+        lines.append("---- 配置项 ----")
+        settings = getattr(self._win, "settings", None)
+        if settings is not None:
+            for key in settings.allKeys():
+                value = settings.value(key)
+                if any(word in key.lower() for word in _SECRET_KEY):
+                    value = "***"
+                lines.append(f"{key} = {value}")
         return _redact("\n".join(lines)) + "\n"
 
     def _settings_text(self) -> str:
@@ -472,7 +577,7 @@ class DevWindow(QWidget):
         return _redact("\n".join(rows)) + "\n"
 
     def _copy_diagnostics(self) -> None:
-        body = self._env_text() + "\n--- 最近日志 ---\n"
+        body = self._env_full_text() + "\n--- 最近日志 ---\n"
         body += "\n".join(self._fmt(lv, nm, msg, ts) for lv, nm, msg, ts in list(self._logs)[-120:])
         body += "\n\n--- 问题 ---\n" + "\n".join(list(self._errors)[-40:])
         QApplication.clipboard().setText(body)
@@ -486,7 +591,7 @@ class DevWindow(QWidget):
             target_dir.mkdir(parents=True, exist_ok=True)
             path = target_dir / f"诊断包-{time.strftime('%Y%m%d-%H%M%S')}.zip"
             with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("env.txt", self._env_text())
+                zf.writestr("env.txt", self._env_full_text())
                 zf.writestr("settings.txt", self._settings_text())
                 zf.writestr("steps.txt", self._steps_text())
                 zf.writestr("errors.txt", "\n".join(self._errors) + "\n")
@@ -505,13 +610,3 @@ class DevWindow(QWidget):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path())))
         except Exception as exc:  # noqa: BLE001
             self.status.setText(f"打不开日志：{exc}")
-
-    # ---------------- 生命周期 ----------------
-
-    def closeEvent(self, event) -> None:
-        self._timer.stop()
-        if self._handler is not None:
-            logging.getLogger().removeHandler(self._handler)
-            self._handler = None
-        trace_mod.remove_listener(self._on_trace)
-        super().closeEvent(event)

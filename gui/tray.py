@@ -120,6 +120,14 @@ class Tray(QObject):
         elif action == "next":
             self.next.emit()
 
+    def set_now_playing(self, text: str) -> None:
+        """托盘悬停提示带上当前曲目，最小化时也能确认在放什么。"""
+        if not self.available:
+            return
+        self.icon.setToolTip(
+            f"网易云音乐下载器\n{text}" if text else "网易云音乐下载器"
+        )
+
     def notify(self, title: str, message: str) -> None:
         if self.available:
             self.icon.showMessage(title, message, QSystemTrayIcon.Information, 4000)
