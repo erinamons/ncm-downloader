@@ -18,7 +18,7 @@ import zipfile
 from collections import deque
 from pathlib import Path
 
-from PyQt5.QtCore import QTimer, Qt, QUrl
+from PyQt5.QtCore import QSize, QTimer, Qt, QUrl
 from PyQt5.QtGui import QColor, QDesktopServices, QFont
 from PyQt5.QtWidgets import (
     QApplication,
@@ -47,6 +47,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from gui import icons
 from gui.dialog import RoundDialog, SHADOW
 from gui.style import QSS
 from ncm import trace as trace_mod
@@ -151,6 +152,8 @@ class DevWindow(RoundDialog):
         self._last_step: tuple | None = None  # (key, item, count, ts)
         self._replaying = False
         self._cmd_q: queue.Queue = queue.Queue()
+        # 工作线程不能直接碰控件：把回调塞进这个队列，由 _flush 在主线程执行
+        self._ui_q: queue.Queue = queue.Queue()
         self._cmd_history: list[str] = []
         self._cmd_pos = 0
 
@@ -285,6 +288,15 @@ class DevWindow(RoundDialog):
             nav_row.addWidget(btn)
             self.nav_buttons.append(btn)
         nav_row.addStretch(1)
+        self.help_btn = QPushButton()
+        self.help_btn.setIcon(icons.icon("circle-help", "#96969e", 16))
+        self.help_btn.setIconSize(QSize(16, 16))
+        self.help_btn.setFixedSize(30, 26)
+        self.help_btn.setToolTip("使用说明（可搜索功能名、按钮名）")
+        self.help_btn.setCursor(Qt.PointingHandCursor)
+        self.help_btn.setFocusPolicy(Qt.NoFocus)
+        self.help_btn.clicked.connect(self.open_help)
+        nav_row.addWidget(self.help_btn)
         rv.addLayout(nav_row)
         self.stack.setCurrentIndex(0)
         rv.addWidget(self.stack, 1)
@@ -366,6 +378,23 @@ class DevWindow(RoundDialog):
         for btn in self.findChildren(QPushButton):
             btn.setAutoDefault(False)
 
+    def open_help(self) -> None:
+        """打开使用说明。复用同一个窗口，避免反复创建。"""
+        win = getattr(self, "_help_window", None)
+        if win is None:
+            from gui.devhelp import DevHelpDialog
+
+            win = DevHelpDialog(self, on_goto=self._goto_page)
+            self._help_window = win
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def _goto_page(self, index: int) -> None:
+        """帮助里点「跳到该页」时切过去。"""
+        if 0 <= index < len(self.nav_buttons):
+            self.nav_buttons[index].click()
+
     def _detach(self) -> None:
         self._timer.stop()
         self._status_timer.stop()
@@ -446,6 +475,13 @@ class DevWindow(RoundDialog):
 
     def _on_pause(self, state) -> None:
         self._paused = state == Qt.Checked
+        if not self._paused:
+            # 暂停期间数据一直往队列里攒，只是没渲染。恢复时按数据重建一遍，
+            # 否则这段时间的日志和步骤再也不会出现（除非去改过滤条件）
+            self._rebuild_log()
+            self._rebuild_errors()
+            if not self._replaying:
+                self._rebuild_steps()
 
     def _on_filter_changed(self, *_args) -> None:
         self._filter_level = self.level_box.currentData()
@@ -484,9 +520,14 @@ class DevWindow(RoundDialog):
                 line = f"{time.strftime('%H:%M:%S', time.localtime(created))} {_LEVEL_NAME.get(level, '信息')} {name}: {message}"
                 self._errors.append(_redact(line))
                 self._last_error_ts = time.time()
-                self.err_list.addItem(QListWidgetItem(self._errors[-1]))
-                while self.err_list.count() > MAX_ERRORS:
-                    self.err_list.takeItem(0)
+                # 有过滤时只加匹配项，否则列表里混进不匹配的行，
+                # 点它取详情会按过滤后的下标去 _errors 里取，显示成别人的内容
+                if not self._paused and (
+                    not self._keyword or self._keyword.lower() in self._errors[-1].lower()
+                ):
+                    self.err_list.addItem(QListWidgetItem(self._errors[-1]))
+                    while self.err_list.count() > MAX_ERRORS:
+                        self.err_list.takeItem(0)
                 dirty_err = True
             if self._match(level, message) and not self._paused:
                 self.log_view.appendPlainText(self._fmt(level, name, message, created))
@@ -498,6 +539,16 @@ class DevWindow(RoundDialog):
                 self.cmd_out.appendPlainText(self._cmd_q.get_nowait())
             except queue.Empty:
                 break
+        while True:
+            try:
+                callback = self._ui_q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception:  # noqa: BLE001
+                # 回调只用来刷状态栏/标签，失败不影响面板本身
+                pass
         appended = False
         if not self._paused:
             for _ in range(200):
@@ -954,20 +1005,28 @@ class DevWindow(RoundDialog):
         if last is not None and last[0] == key and event["t"] - last[3] <= 8:
             # 自动刷新这类重复事件：不新增行，改成在原行上标次数
             item, count = last[1], last[2] + 1
-            item.setText(3, took)
-            item.setText(4, f"{detail} ×{count}".strip())
-            self._last_step = (key, item, count, event["t"])
-            return
+            try:
+                item.setText(3, took)
+                item.setText(4, f"{detail} ×{count}".strip())
+            except RuntimeError:
+                # 节点已经被容量上限淘汰掉，退化成新增一行
+                self._last_step = None
+            else:
+                self._last_step = (key, item, count, event["t"])
+                return
         if group:
-            key = f"{event['scope']}|{group}"
-            top = self._groups.get(key)
+            # 这里不能复用 key：合并判断用的是「步骤+结果+说明」的元组，
+            # 一旦被换成「范围|歌名」，同一首歌的取址/下载/写标签会被当成
+            # 同一个事件合并成一行 ×3，步骤名就全错了
+            group_key = f"{event['scope']}|{group}"
+            top = self._groups.get(group_key)
             if top is None:
                 top = QTreeWidgetItem([clock, f"{event['scope']} · {group}", "", "", ""])
                 font = top.font(1)
                 font.setBold(True)
                 top.setFont(1, font)
                 self.tree.addTopLevelItem(top)
-                self._groups[key] = top
+                self._groups[group_key] = top
             child = QTreeWidgetItem([clock, event["step"], status, took, detail])
             child.setForeground(2, QColor(color))
             top.addChild(child)
@@ -983,6 +1042,12 @@ class DevWindow(RoundDialog):
                 gone = self.tree.takeTopLevelItem(0)
                 if gone is None:
                     break
+                # _last_step 存的是 item 引用：它随节点一起被销毁后，下一次
+                # 合并还会去 setText，直接 RuntimeError。这里一并清掉
+                if self._last_step is not None:
+                    target = self._last_step[1]
+                    if target is gone or gone.indexOfChild(target) >= 0:
+                        self._last_step = None
                 for key, value in list(self._groups.items()):
                     if value is gone:
                         del self._groups[key]
@@ -1078,6 +1143,15 @@ class DevWindow(RoundDialog):
             "本机无法直接播放的格式：" + ("、".join(bad) if bad else "暂无（还没遇到过）")
         )
 
+    def _test_ffmpeg_async(self, path: str, on_done) -> None:
+        """ffmpeg -version 放后台跑：卡住的 exe 会让界面僵住好几秒。"""
+
+        def work() -> None:
+            ok, text = self._test_ffmpeg(path)
+            self._ui_q.put(lambda: on_done(ok, text))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _test_ffmpeg(self, path: str) -> tuple[bool, str]:
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
@@ -1099,16 +1173,20 @@ class DevWindow(RoundDialog):
         if "ffmpeg" not in Path(path).name.lower():
             self.status.setText("文件名里没有 ffmpeg，已拒绝")
             return
-        ok, text = self._test_ffmpeg(path)
-        if not ok:
-            self.status.setText(f"不可用：{text}")
-            return
-        self._win.settings.setValue("ffmpeg_path", path)
-        from ncm import transcode
+        self.status.setText("正在校验 ffmpeg…")
 
-        transcode.set_ffmpeg_override(path)
-        self._refresh_components()
-        self.status.setText(f"已替换：{text}")
+        def done(ok: bool, text: str) -> None:
+            if not ok:
+                self.status.setText(f"不可用：{text}")
+                return
+            self._win.settings.setValue("ffmpeg_path", path)
+            from ncm import transcode
+
+            transcode.set_ffmpeg_override(path)
+            self._refresh_components()
+            self.status.setText(f"已替换：{text}")
+
+        self._test_ffmpeg_async(path, done)
 
     def _test_current_ffmpeg(self) -> None:
         from ncm import transcode
@@ -1117,8 +1195,11 @@ class DevWindow(RoundDialog):
         if not path:
             self.status.setText("没有可用的 ffmpeg")
             return
-        ok, text = self._test_ffmpeg(path)
-        self.status.setText(("可用：" if ok else "不可用：") + text)
+        self.status.setText("正在测试 ffmpeg…")
+        self._test_ffmpeg_async(
+            path,
+            lambda ok, text: self.status.setText(("可用：" if ok else "不可用：") + text),
+        )
 
     def _reset_ffmpeg(self) -> None:
         self._win.settings.setValue("ffmpeg_path", "")
@@ -1210,7 +1291,6 @@ class DevWindow(RoundDialog):
         # status 会拿到空文本
         self._render_status()
         return self._status_plain
-        return self.status_view.toPlainText()
 
     def _cmd_scan(self) -> str:
         self._win.on_load_cache()
@@ -1460,10 +1540,7 @@ class DevWindow(RoundDialog):
         settings = getattr(self._win, "settings", None)
         if settings is not None:
             for key in settings.allKeys():
-                value = settings.value(key)
-                if any(word in key.lower() for word in _SECRET_KEY):
-                    value = "***"
-                lines.append(f"{key} = {value}")
+                lines.append(f"{key} = {self._settings_value_text(settings, key)}")
         return _redact("\n".join(lines)) + "\n"
 
     def _settings_text(self) -> str:
@@ -1472,11 +1549,21 @@ class DevWindow(RoundDialog):
             return "(无)"
         rows = []
         for key in settings.allKeys():
-            value = settings.value(key)
-            if any(word in key.lower() for word in _SECRET_KEY):
-                value = "***"
-            rows.append(f"{key} = {value}")
+            rows.append(f"{key} = {self._settings_value_text(settings, key)}")
         return _redact("\n".join(rows)) + "\n"
+
+    @staticmethod
+    def _settings_value_text(settings, key: str) -> str:
+        """配置值转文本：敏感项打码，二进制（搜索历史是 QVariant）别原样倒出来。"""
+        if any(word in key.lower() for word in _SECRET_KEY):
+            return "***"
+        value = settings.value(key)
+        if isinstance(value, (bytes, bytearray)):
+            return f"<{len(value)} 字节二进制>"
+        text = str(value)
+        if len(text) > 200:
+            text = text[:200] + "…"
+        return text
 
     def _steps_text(self) -> str:
         rows = []
@@ -1492,8 +1579,12 @@ class DevWindow(RoundDialog):
         body = self._env_full_text() + "\n--- 最近日志 ---\n"
         body += "\n".join(self._fmt(lv, nm, msg, ts) for lv, nm, msg, ts in list(self._logs)[-120:])
         body += "\n\n--- 问题 ---\n" + "\n".join(list(self._errors)[-40:])
-        QApplication.clipboard().setText(body)
-        self.status.setText("诊断信息已复制到剪贴板")
+        try:
+            QApplication.clipboard().setText(body)
+        except Exception as exc:  # noqa: BLE001
+            self.status.setText(f"复制失败：{exc}")
+            return
+        self.status.setText(f"诊断信息已复制（{len(body)} 字）")
 
     def _export_diagnostics(self) -> None:
         try:
@@ -1509,7 +1600,13 @@ class DevWindow(RoundDialog):
                 zf.writestr("errors.txt", "\n".join(self._errors) + "\n")
                 log_file = Path(log_path())
                 if log_file.exists():
-                    zf.write(log_file, "app.log")
+                    # 日志可能已经几十 MB，只带尾部 512 KB，够定位问题又不至于传不动
+                    with open(log_file, "rb") as fh:
+                        fh.seek(0, os.SEEK_END)
+                        size = fh.tell()
+                        fh.seek(max(0, size - 512 * 1024))
+                        tail = fh.read()
+                    zf.writestr("app.log", tail)
             self.status.setText(f"已导出：{path}")
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
         except Exception as exc:  # noqa: BLE001
@@ -1519,6 +1616,10 @@ class DevWindow(RoundDialog):
         try:
             from ncm.log import log_path
 
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path())))
+            path = Path(log_path())
+            if not path.exists():
+                self.status.setText("日志文件还没生成")
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
         except Exception as exc:  # noqa: BLE001
             self.status.setText(f"打不开日志：{exc}")
