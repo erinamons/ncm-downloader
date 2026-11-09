@@ -22,6 +22,7 @@ from PyQt5.QtCore import QTimer, Qt, QUrl
 from PyQt5.QtGui import QColor, QDesktopServices, QFont
 from PyQt5.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -35,7 +36,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QSizeGrip,
     QSplitter,
-    QTabWidget,
+    QStackedWidget,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -71,19 +72,15 @@ QHeaderView::section {
     background: #222226; color: #96969e; border: 0;
     border-bottom: 1px solid #34343a; padding: 4px 6px;
 }
-QTabBar { background: transparent; }
-QTabWidget::pane {
-    top: -1px; background: #17171a;
-    border: 1px solid #34343a; border-radius: 6px;
+QPushButton[nav="true"] {
+    background: #242428; color: #96969e;
+    border: 1px solid #34343a; border-radius: 6px; padding: 5px 12px;
 }
-QTabBar::tab {
-    background: #242428; color: #96969e; padding: 5px 14px;
-    min-width: 58px; min-height: 18px;
-    border: 1px solid #34343a; border-bottom: 0;
-    border-top-left-radius: 5px; border-top-right-radius: 5px;
+QPushButton[nav="true"]:hover { color: #d8d8dc; }
+QPushButton[nav="true"]:checked {
+    background: #2e2e34; color: #e8e8ea; border: 1px solid #5a5a64;
 }
-QTabBar::tab:selected { background: #17171a; color: #e8e8ea; }
-QTabBar::tab:hover { color: #d8d8dc; }
+QPushButton[nav="true"][danger="true"] { color: #e8554a; }
 QComboBox, QLineEdit {
     background: #242428; color: #d8d8dc; border: 1px solid #3a3a42;
     border-radius: 4px; padding: 3px 6px;
@@ -230,17 +227,6 @@ class DevWindow(RoundDialog):
         bar.addWidget(self.pause)
         rv.addLayout(bar)
 
-        self.tabs = QTabWidget()
-        # 全局 QSS 里没有 tab 规则，Fusion 默认会画成白底浅字；这里单独钉死
-        self.tabs.setStyleSheet(
-            "QTabBar::tab { background:#242428; color:#96969e; padding:6px 16px;"
-            " min-width:56px; border:1px solid #34343a; border-bottom:0;"
-            " border-top-left-radius:5px; border-top-right-radius:5px; }"
-            "QTabBar::tab:selected { background:#17171a; color:#e8e8ea; }"
-            "QTabBar::tab:hover { color:#d8d8dc; }"
-            "QTabWidget::pane { background:#17171a; border:1px solid #34343a;"
-            " border-radius:6px; top:-1px; }"
-        )
         self.status_view = self._make_view()
         self.log_view = self._make_view()
         err_panel = QWidget()
@@ -253,14 +239,45 @@ class DevWindow(RoundDialog):
         ev.addWidget(self.err_list, 1)
         ev.addWidget(self.err_view, 1)
         self.env_view = self._make_view()
-        self.tabs.addTab(self.status_view, "状态")
-        self.tabs.addTab(self.log_view, "日志")
-        self.tabs.addTab(err_panel, "问题 0")
-        self.tabs.addTab(self._build_components(), "组件")
-        self.tabs.addTab(self._build_console(), "指令")
-        self.tabs.addTab(self.env_view, "环境")
-        self.tabs.currentChanged.connect(lambda _i: self._refresh_status())
-        rv.addWidget(self.tabs, 1)
+
+        # 顶部分段按钮 + 页面栈。之前用 QTabWidget，6 个标签在默认宽度下放不下，
+        # Qt 会把第一个「状态」挤掉并出现 ◄► 滚动箭头；按钮行放得下，以后加页也不会再挤
+        self.stack = QStackedWidget()
+        self.nav_buttons: list[QPushButton] = []
+        nav_group = QButtonGroup(self)
+        nav_group.setExclusive(True)
+        nav_row = QHBoxLayout()
+        nav_row.setSpacing(6)
+        for index, (title, page) in enumerate(
+            (
+                ("状态", self.status_view),
+                ("日志", self.log_view),
+                ("问题", err_panel),
+                ("组件", self._build_components()),
+                ("指令", self._build_console()),
+                ("环境", self.env_view),
+            )
+        ):
+            self.stack.addWidget(page)
+            btn = QPushButton(title)
+            btn.setCheckable(True)
+            btn.setProperty("nav", True)
+            btn.setChecked(index == 0)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _c, i=index: self.stack.setCurrentIndex(i))
+            nav_group.addButton(btn, index)
+            nav_row.addWidget(btn)
+            self.nav_buttons.append(btn)
+        nav_row.addStretch(1)
+        rv.addLayout(nav_row)
+        self.stack.setCurrentIndex(0)
+        rv.addWidget(self.stack, 1)
+        self.stack.currentChanged.connect(lambda _i: self._refresh_status())
+
+        # QDialog 里回车会点中 autoDefault 按钮：在指令页按回车执行命令的同时，
+        # 还会把「导入回放」点一下。命令行的按钮一律不当默认按钮
+        for btn in self.findChildren(QPushButton):
+            btn.setAutoDefault(False)
         split.addWidget(right)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
@@ -328,6 +345,10 @@ class DevWindow(RoundDialog):
         super().showEvent(event)
         self._attach()
         self._refresh_env()
+        # 按钮挂进 QDialog 的那一刻 Qt 会把 autoDefault 重新打开（实测），回车
+        # 就会点中「导入回放」这类按钮。布局挂完之后这里再关一遍才真正生效
+        for btn in self.findChildren(QPushButton):
+            btn.setAutoDefault(False)
 
     def _detach(self) -> None:
         self._timer.stop()
@@ -430,7 +451,7 @@ class DevWindow(RoundDialog):
         self.log_view.clear()
         self.err_view.clear()
         self.err_list.clear()
-        self.tabs.setTabText(2, "问题 0")
+        self._update_problem_badge(0)
         self.count_label.setText("0 步")
         self._last_step = None
 
@@ -454,7 +475,7 @@ class DevWindow(RoundDialog):
                 self.log_view.appendPlainText(self._fmt(level, name, message, created))
                 dirty_log = True
         if dirty_err:
-            self.tabs.setTabText(2, f"问题 {len(self._errors)}")
+            self._update_problem_badge(len(self._errors))
         while True:
             try:
                 self.cmd_out.appendPlainText(self._cmd_q.get_nowait())
@@ -526,12 +547,25 @@ class DevWindow(RoundDialog):
         lines = [line for line in self._errors if not self._keyword or self._keyword.lower() in line.lower()]
         self.err_view.setPlainText(lines[row] if 0 <= row < len(lines) else "")
 
+    def _update_problem_badge(self, count: int) -> None:
+        """「问题」按钮兼当徽标：有未处理错误时整个按钮变红，不用翻页也能看见。"""
+        btn = self.nav_buttons[2]
+        btn.setText(f"问题 {count}" if count else "问题")
+        danger = count > 0
+        if btn.property("danger") != danger:
+            btn.setProperty("danger", danger)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
     # ---------------- 状态 / 快捷动作 ----------------
 
     def _refresh_status(self) -> None:
-        """每秒刷新一次「此刻在干什么」，比翻时间线快得多。"""
-        if not self.isVisible() or self.tabs.currentIndex() != 0:
+        """定时器入口：只在面板可见且停在状态页时才重渲染，省开销。"""
+        if not self.isVisible() or self.stack.currentIndex() != 0:
             return
+        self._render_status()
+
+    def _render_status(self) -> None:
         win = self._win
         player = getattr(win, "player", None)
         out: list[str] = ["== 播放器 =="]
@@ -885,7 +919,9 @@ class DevWindow(RoundDialog):
             self.cmd_out.appendPlainText(out)
 
     def _status_text(self) -> str:
-        self._refresh_status()
+        # 不走 _refresh_status：它有「只在状态页刷新」的节流，从指令页调
+        # status 会拿到空文本
+        self._render_status()
         return self.status_view.toPlainText()
 
     def _cmd_scan(self) -> str:
