@@ -376,11 +376,11 @@ class SettingsDialog(RoundDialog):
         play_row.addWidget(btn_play_cache)
         form.addRow("播放缓存", play_row)
 
-        # 系统解码器不全的机器（N 版、精简版）放不了 m4a/flac，给一个开关
-        self.compat_play = QCheckBox("放不了时自动转换")
+        # 系统解码器不全的机器（N 版、精简版）无法直接解码 m4a/flac，给一个开关
+        self.compat_play = QCheckBox("无法直接播放时自动转换")
         self.compat_play.setChecked(settings.value("compat_play", False, type=bool))
         self.compat_play.setToolTip(
-            "有些电脑的系统解码器不全，缓存里的 m4a / flac 会放不出来。\n"
+            "有些电脑的系统解码器不全，缓存里的 m4a / flac 会无法直接播放。\n"
             "开启后遇到这种文件，先用内置 ffmpeg 转成 WAV 再播放：\n"
             "· 音频不重新压缩，音质不变\n"
             "· 首次需要 1~3 秒，临时占用磁盘（约每分钟 10 MB）\n"

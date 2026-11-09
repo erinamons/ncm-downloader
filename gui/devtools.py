@@ -791,7 +791,7 @@ class DevWindow(RoundDialog):
                 meta.append(f"{src} {cur.name} · {size}")
             meta.append(f"兼容播放 {'开' if player.compat_play else '关'}")
             bad = ", ".join(sorted(player._bad_formats)) or "无"
-            meta.append(f"放不了 {bad}")
+            meta.append(f"无法直接播放：{bad}")
             self.st_meta.setText(" · ".join(meta))
             plain.append(f"  状态 {state} · mediaStatus {status} · 进度 {prog}")
             if song is not None:
@@ -1029,7 +1029,7 @@ class DevWindow(RoundDialog):
         self.backend_hint.setWordWrap(True)
         lay.addWidget(self.backend_hint)
 
-        self.compat_check = QCheckBox("兼容播放（放不了时用 ffmpeg 转 WAV）")
+        self.compat_check = QCheckBox("兼容播放（无法直接播放时转 WAV）")
         self.compat_check.stateChanged.connect(self._on_compat_changed)
         lay.addWidget(self.compat_check)
         self.decode_label = QLabel()
@@ -1070,7 +1070,7 @@ class DevWindow(RoundDialog):
         self.compat_check.blockSignals(False)
         bad = sorted(getattr(self._win.player, "_bad_formats", []) or [])
         self.decode_label.setText(
-            "本机直放不了的格式：" + ("、".join(bad) if bad else "暂无（还没遇到过）")
+            "本机无法直接播放的格式：" + ("、".join(bad) if bad else "暂无（还没遇到过）")
         )
 
     def _test_ffmpeg(self, path: str) -> tuple[bool, str]:
@@ -1234,7 +1234,7 @@ class DevWindow(RoundDialog):
         backend = _os.environ.get("QT_MULTIMEDIA_PREFERRED_PLUGINS", "默认")
         bad = sorted(getattr(self._win.player, "_bad_formats", []) or [])
         return (
-            f"后端 {backend}\n放不了的格式：{', '.join(bad) if bad else '无'}\n"
+            f"后端 {backend}\n无法直接播放的格式：{', '.join(bad) if bad else '无'}\n"
             f"ffmpeg：{self._ffmpeg_line()}"
         )
 
