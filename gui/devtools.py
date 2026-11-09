@@ -790,8 +790,13 @@ class DevWindow(RoundDialog):
                 src = "本地" if getattr(player, "_used_local", False) else "网络"
                 meta.append(f"{src} {cur.name} · {size}")
             meta.append(f"兼容播放 {'开' if player.compat_play else '关'}")
-            bad = ", ".join(sorted(player._bad_formats)) or "无"
-            meta.append(f"无法直接播放：{bad}")
+            # 针对当前这一首的判断，不是格式清单：进程里实测过这个后缀放不出来才是「是」。
+            # 没有文件时不适用，显示破折号，别硬说「否」
+            if cur is None:
+                verdict = "—"
+            else:
+                verdict = "是" if cur.suffix.lower() in player._bad_formats else "否"
+            meta.append(f"无法直接播放：{verdict}")
             self.st_meta.setText(" · ".join(meta))
             plain.append(f"  状态 {state} · mediaStatus {status} · 进度 {prog}")
             if song is not None:
