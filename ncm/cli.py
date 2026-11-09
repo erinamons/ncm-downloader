@@ -1,7 +1,10 @@
 """命令行入口：ncm search / ncm dl / ncm url。"""
 from __future__ import annotations
 
+import configparser
+import json
 import os
+import sys
 import threading
 import time
 from collections import Counter
@@ -22,7 +25,13 @@ from rich.table import Table
 from . import downloader as dl
 from .backend import BackendError, LocalBackend
 from .models import QUALITY_LABEL, QUALITY_ORDER, Song, normalize_level
-from .store import DEFAULT_TEMPLATE, TEMPLATE_HELP, Store, render_template
+from .store import (
+    DEFAULT_TEMPLATE,
+    TEMPLATE_HELP,
+    Store,
+    build_template,
+    render_template,
+)
 from .targets import parse_target
 
 app = typer.Typer(
@@ -31,6 +40,114 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+
+# --json 模式下 stdout 只留一行 JSON，过程提示全部改走 stderr。
+# 这样外部的自动化（脚本、助手）可以直接 json.loads(stdout)，不会被进度条和历史遗留的
+# 中文提示干扰。
+_JSON = False
+
+
+def _use_json(enabled: bool) -> None:
+    global _JSON, console
+    _JSON = bool(enabled)
+    if _JSON:
+        console = Console(stderr=True)
+
+
+def _emit(payload: dict) -> None:
+    """输出结构化结果；非 --json 模式下静默，由人类可读的表格负责。"""
+    if not _JSON:
+        return
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def _json_error(exc: Exception | str, code: int = 2, **extra) -> typer.Exit:
+    """失败时两类读者都要照顾到：人看得到原因，程序拿得到 JSON。
+
+    只打印不返回 JSON，外部程序 json.loads(stdout) 会直接炸——之前不存在的
+    歌曲 id 就是这么漏的。
+    """
+    message = str(exc) or type(exc).__name__
+    console.print(f"[red]{message}[/red]")
+    _emit({"ok": False, "error": message, **extra})
+    return typer.Exit(code)
+
+
+def _gui_settings() -> dict[str, str]:
+    """读图形界面的 settings.ini（QSettings 写的 INI，值里的反斜杠被转义过）。"""
+    from . import paths
+
+    path = paths.settings_path()
+    if not path.is_file():
+        return {}
+    try:
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read(path, encoding="utf-8")
+        if not parser.has_section("General"):
+            return {}
+        return dict(parser.items("General"))
+    except (OSError, configparser.Error):
+        return {}
+
+
+def _gui_value(key: str, default: str = "") -> str:
+    raw = (_gui_settings().get(key) or "").strip()
+    if not raw:
+        return default
+    if len(raw) >= 2 and raw[0] == raw[-1] == '"':
+        raw = raw[1:-1]
+    return raw.replace("\\\\", "\\").strip() or default
+
+
+def _gui_out_dir() -> Path | None:
+    """图形界面里设置的保存目录。
+
+    CLI 和界面必须落到同一个目录，否则同一个下载记录库（.ncm-index.db）对不上，
+    同一首歌会被两边各下一遍。
+    """
+    raw = _gui_value("out_dir")
+    return Path(raw) if raw else None
+
+
+def _default_out() -> Path:
+    """未指定 --out 时的输出目录：与界面一致；设置里的路径不可用则回退。"""
+    from . import paths
+
+    candidate = _gui_out_dir()
+    if candidate is not None:
+        # 只在父目录已经存在时接受它。设置文件可能是从别的电脑带过来的，
+        # 里面的绝对路径在这台机器上并不存在——照着建会造出一整条幽灵目录
+        # （踩过：C:\Users\Administrator\WorkBuddy\... 被凭空创建出来）
+        if candidate.is_dir():
+            return candidate
+        if candidate.parent.is_dir():
+            try:
+                candidate.mkdir()
+                return candidate
+            except OSError:
+                pass
+    fallback = paths.downloads_dir()
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+def _init_level(value: str) -> str:
+    """音质：命令行给了就用它，没给就跟随图形界面里的选择。"""
+    return normalize_level(value or _gui_value("level", "exhigh"))
+
+
+def _init_template(value: str) -> str:
+    """命名模板：没显式指定时用界面的「歌手-歌曲名 / 按歌手专辑」组合。"""
+    if value:
+        return value
+    if not _gui_settings():
+        # 没有界面配置（比如从命令行第一次用），用带音轨号的完整模板
+        return DEFAULT_TEMPLATE
+    return build_template(
+        _gui_value("name_pattern", "artist_title"),
+        _gui_value("folder_pattern", "artist_album"),
+    )
 
 
 def _backend(cookie: str = "", source: str = "client") -> LocalBackend:
@@ -42,7 +159,7 @@ def _backend(cookie: str = "", source: str = "client") -> LocalBackend:
     )
 
 
-def _probe_sources(cookie: str) -> None:
+def _probe_sources(cookie: str) -> list[dict]:
     """对比两种接口身份与本地缓存，告诉用户每种音源能拿到什么。"""
     free_id, vip_id = 501468000, 1945894789
     table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
@@ -50,6 +167,7 @@ def _probe_sources(cookie: str) -> None:
     table.add_column("免费曲目", width=11, no_wrap=True)
     table.add_column("VIP 曲目", width=11, no_wrap=True)
     table.add_column("说明", style="dim")
+    rows: list[dict] = []
 
     for label, mode, desc in (
         ("客户端接口", True, "伪装客户端，可用账号的客户端权益"),
@@ -74,6 +192,9 @@ def _probe_sources(cookie: str) -> None:
         while len(cells) < 2:
             cells.append("-")
         table.add_row(label, cells[0], cells[1], desc)
+        rows.append(
+            {"source": label, "free": cells[0], "vip": cells[1], "note": desc}
+        )
 
     from . import cache as cm
 
@@ -82,14 +203,19 @@ def _probe_sources(cookie: str) -> None:
     if root:
         cached = sum(1 for e in cm.scan(root) if e.complete and e.size > 200_000)
     table.add_row("自动", "缓存优先", "缓存优先", "命中缓存零请求，否则回退客户端接口")
-    table.add_row(
-        "仅本地缓存",
-        f"{cached} 首" if cached else "无",
-        "-",
-        "只处理客户端缓存里已有的曲目",
+    rows.append(
+        {"source": "自动", "free": "缓存优先", "vip": "缓存优先",
+         "note": "命中缓存零请求，否则回退客户端接口"}
+    )
+    cache_cell = f"{cached} 首" if cached else "无"
+    table.add_row("仅本地缓存", cache_cell, "-", "只处理客户端缓存里已有的曲目")
+    rows.append(
+        {"source": "仅本地缓存", "free": cache_cell, "vip": "-",
+         "note": "只处理客户端缓存里已有的曲目"}
     )
     console.print(table)
     console.print("[dim]转 mp3 加 --to-mp3，需要系统装有 ffmpeg[/dim]")
+    return rows
 
 
 @app.command("login")
@@ -184,25 +310,54 @@ def cmd_logout() -> None:
 
 
 @app.command("whoami")
-def cmd_whoami() -> None:
+def cmd_whoami(
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
+) -> None:
     """查看当前登录账号与音质权限。"""
+    _use_json(json_out)
     from . import auth
 
     cookie = auth.load_cookie()
     if not cookie:
         console.print("[yellow]尚未登录[/yellow]，执行 [bold]ncm login[/bold] 扫码")
+        _emit({"ok": False, "logged_in": False, "error": "尚未登录"})
         raise typer.Exit(1)
 
-    account = auth.fetch_account(cookie)
+    try:
+        account = auth.fetch_account(cookie)
+    except Exception as exc:  # noqa: BLE001
+        raise _json_error(exc, logged_in=None) from exc
     if not account.user_id:
         console.print("[red]登录态已失效[/red]，请重新执行 [bold]ncm login[/bold]")
+        _emit({"ok": False, "logged_in": False, "error": "登录态已失效"})
         raise typer.Exit(1)
 
     console.print(
         f"[bold]{account.nickname}[/bold] · {account.vip_text} · uid {account.user_id}"
     )
     console.print()
-    _probe_sources(cookie)
+    rows = _probe_sources(cookie)
+    _emit(
+        {
+            "ok": True,
+            "logged_in": True,
+            "nickname": account.nickname,
+            "vip": account.vip_text,
+            "user_id": account.user_id,
+            "sources": rows,
+        }
+    )
+
+
+def _song_dict(song: Song) -> dict:
+    return {
+        "id": song.id,
+        "name": song.name,
+        "artists": song.artist_text,
+        "album": song.album,
+        "duration_ms": song.duration_ms,
+        "duration": song.duration_text,
+    }
 
 
 def _print_songs(songs: list[Song]) -> None:
@@ -244,17 +399,31 @@ def cmd_search(
     keyword: str = typer.Argument(..., help="关键词"),
     limit: int = typer.Option(20, "--limit", "-n", help="返回条数"),
     cookie: str = typer.Option("", "--cookie", help="登录 Cookie（可提升音质）"),
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON，便于外部程序解析"),
 ) -> None:
     """按关键词搜索歌曲。"""
+    _use_json(json_out)
     backend = _backend(cookie)
-    with console.status("搜索中…"):
-        songs = backend.search(keyword, limit=limit)
+    try:
+        with console.status("搜索中…"):
+            songs = backend.search(keyword, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        raise _json_error(exc) from exc
     if not songs:
         console.print("[yellow]没有找到结果[/yellow]")
+        _emit({"ok": True, "keyword": keyword, "count": 0, "songs": []})
         raise typer.Exit(1)
     _print_songs(songs)
     console.print(
         f"[dim]共 {len(songs)} 条。下载单曲：ncm dl <id>[/dim]", highlight=False
+    )
+    _emit(
+        {
+            "ok": True,
+            "keyword": keyword,
+            "count": len(songs),
+            "songs": [_song_dict(s) for s in songs],
+        }
     )
 
 
@@ -263,12 +432,17 @@ def cmd_url(
     target: str = typer.Argument(..., help="歌曲链接或 id"),
     level: str = typer.Option("exhigh", "--level", "-q", help="standard/higher/exhigh/lossless/hires"),
     cookie: str = typer.Option("", "--cookie"),
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
 ) -> None:
     """只解析播放地址，供排查用。"""
-    _, song_id = parse_target(target)
-    backend = _backend(cookie)
-    level = normalize_level(level)
-    src = backend.song_url(song_id, level)
+    _use_json(json_out)
+    try:
+        _, song_id = parse_target(target)
+        backend = _backend(cookie)
+        level = normalize_level(level)
+        src = backend.song_url(song_id, level)
+    except Exception as exc:  # noqa: BLE001
+        raise _json_error(exc, id=None) from exc
     table = Table(box=None, show_header=False, pad_edge=False)
     table.add_column(style="dim", width=12)
     table.add_column()
@@ -280,14 +454,30 @@ def cmd_url(
     table.add_row("试听片段", "是" if src.trial else "否")
     table.add_row("有效期", f"{src.expi}s")
     console.print(table)
+    _emit(
+        {
+            "ok": bool(src.url),
+            "id": song_id,
+            "url": src.url or "",
+            "ext": src.ext or "",
+            "br": src.br,
+            "size": src.size,
+            "quality": src.quality_label,
+            "degraded": bool(src.degraded),
+            "trial": bool(src.trial),
+            "expires_in": src.expi,
+        }
+    )
 
 
 @app.command("dl")
 def cmd_download(
     targets: list[str] = typer.Argument(..., help="歌曲/歌单链接或 id，可多个"),
-    out: Path = typer.Option(Path("downloads"), "--out", "-o", help="输出目录"),
-    level: str = typer.Option("exhigh", "--level", "-q", help="目标音质"),
-    template: str = typer.Option(DEFAULT_TEMPLATE, "--template", "-t", help="命名模板，--template-help 查看变量"),
+    out: Path = typer.Option(None, "--out", "-o", help="输出目录，默认跟界面里的保存目录一致"),
+    level: str = typer.Option("", "--level", "-q", help="目标音质，留空跟随界面设置"),
+    template: str = typer.Option(
+        "", "--template", "-t", help="命名模板，留空跟随界面设置；--template-help 查看变量"
+    ),
     workers: int = typer.Option(3, "--workers", "-w", help="并发数，建议不超过 5"),
     limit: int = typer.Option(0, "--limit", "-n", help="只下前 N 首，0 为全部"),
     cookie: str = typer.Option("", "--cookie", help="登录 Cookie，可解锁更高音质"),
@@ -306,25 +496,33 @@ def cmd_download(
     mp3_bitrate: str = typer.Option("auto", "--mp3-bitrate", help="转 mp3 码率，auto 表示跟随源码率"),
     dry_run: bool = typer.Option(False, "--dry-run", help="只列出待下载曲目"),
     template_help: bool = typer.Option(False, "--template-help", help="打印命名模板变量说明"),
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON 结果"),
 ) -> None:
     """下载歌曲或整个歌单。"""
+    _use_json(json_out)
     if template_help:
         console.print(TEMPLATE_HELP)
         raise typer.Exit()
 
-    level = normalize_level(level)
+    out = Path(out).expanduser() if out else _default_out()
+    level = _init_level(level)
+    template = _init_template(template)
     source = (source or "auto").lower()
     if source not in dl.SOURCES:
-        console.print(f"[red]未知音源 {source}[/red]，可选：{' / '.join(dl.SOURCES)}")
-        raise typer.Exit(2)
+        raise _json_error(
+            f"未知音源 {source}，可选：{' / '.join(dl.SOURCES)}"
+        )
     backend = _backend(cookie, source)
     songs: list[Song] = []
     seen: set[int] = set()
 
     for raw in targets:
         if search_mode:
-            with console.status(f"搜索「{raw}」…"):
-                found = backend.search(raw, limit=limit or 20)
+            try:
+                with console.status(f"搜索「{raw}」…"):
+                    found = backend.search(raw, limit=limit or 20)
+            except Exception as exc:  # noqa: BLE001
+                raise _json_error(exc, target=raw) from exc
             console.print(f"[dim]「{raw}」命中 {len(found)} 首[/dim]")
             for song in found:
                 if song.id not in seen:
@@ -335,22 +533,24 @@ def cmd_download(
         try:
             kind, ident = parse_target(raw)
         except ValueError as exc:
-            console.print(f"[red]{exc}[/red]")
-            raise typer.Exit(2) from exc
+            raise _json_error(exc, target=raw) from exc
 
         if kind == "song":
-            with console.status("读取歌曲信息…"):
-                song = backend.song_detail(ident)
+            try:
+                with console.status("读取歌曲信息…"):
+                    song = backend.song_detail(ident)
+            except Exception as exc:  # noqa: BLE001
+                raise _json_error(exc, target=raw) from exc
             if song is not None:
                 _add_unique(songs, seen, [song])
                 continue
             # 纯数字无法从链接判断类型，单曲取不到时按歌单再试一次
-            with console.status(f"按歌单读取 {ident}…"):
-                try:
+            try:
+                with console.status(f"按歌单读取 {ident}…"):
                     playlist = backend.playlist(ident)
-                except BackendError:
-                    console.print(f"[red]{ident} 既不是歌曲也不是歌单[/red]")
-                    continue
+            except BackendError:
+                console.print(f"[red]{ident} 既不是歌曲也不是歌单[/red]")
+                continue
             console.print(
                 f"[bold]{playlist.name}[/bold] "
                 f"[dim]{playlist.creator} · {playlist.track_count} 首[/dim]"
@@ -358,24 +558,24 @@ def cmd_download(
             _add_unique(songs, seen, playlist.songs)
         elif kind == "album":
             # 专辑必须走 /album 接口；拿专辑 id 查歌单只会得到空结果
-            with console.status(f"读取专辑 {ident}…"):
-                try:
+            try:
+                with console.status(f"读取专辑 {ident}…"):
                     playlist = backend.album(ident)
-                except BackendError as exc:
-                    console.print(f"[red]{exc}[/red]")
-                    continue
+            except BackendError as exc:
+                console.print(f"[red]{exc}[/red]")
+                continue
             console.print(
                 f"[bold]{playlist.name}[/bold] "
                 f"[dim]{playlist.creator} · {playlist.track_count} 首[/dim]"
             )
             _add_unique(songs, seen, playlist.songs)
         else:
-            with console.status(f"读取歌单 {ident}…"):
-                try:
+            try:
+                with console.status(f"读取歌单 {ident}…"):
                     playlist = backend.playlist(ident)
-                except BackendError as exc:
-                    console.print(f"[red]{exc}[/red]")
-                    continue
+            except BackendError as exc:
+                console.print(f"[red]{exc}[/red]")
+                continue
             console.print(
                 f"[bold]{playlist.name}[/bold] "
                 f"[dim]{playlist.creator} · {playlist.track_count} 首[/dim]"
@@ -384,6 +584,7 @@ def cmd_download(
 
     if not songs:
         console.print("[yellow]没有可下载的曲目[/yellow]")
+        _emit({"ok": False, "error": "没有可下载的曲目", "count": 0})
         raise typer.Exit(1)
 
     if limit > 0 and not search_mode:
@@ -397,6 +598,15 @@ def cmd_download(
 
     if dry_run:
         _print_songs(songs)
+        _emit(
+            {
+                "ok": True,
+                "dry_run": True,
+                "out_dir": str(out.resolve()),
+                "count": len(songs),
+                "songs": [_song_dict(s) for s in songs],
+            }
+        )
         raise typer.Exit()
 
     store = Store(out / ".ncm-index.db")
@@ -424,6 +634,7 @@ def cmd_download(
         TransferSpeedColumn(),
         console=console,
         transient=True,
+        disable=_JSON,
     )
     tasks: dict[int, int] = {}
     finished = [0]
@@ -468,11 +679,13 @@ def cmd_download(
                     line += f" [dim]{res.br // 1000}k {res.quality}[/dim]"
                 console.print(line + suffix, highlight=False)
 
-        results = engine.run(
-            songs, on_result=on_result, on_start=on_start, on_progress=on_progress
-        )
-
-    store.close()
+        try:
+            results = engine.run(
+                songs, on_result=on_result, on_start=on_start, on_progress=on_progress
+            )
+        finally:
+            # 中途异常也要把记录库关掉，不然留下的连接会锁住 .ncm-index.db
+            store.close()
 
     stats = Counter(r.status for r in results)
     total_bytes = sum(
@@ -487,6 +700,31 @@ def cmd_download(
     console.print(table)
 
     failed = stats.get(dl.FAILED, 0)
+    _emit(
+        {
+            "ok": failed == 0,
+            "out_dir": str(out.resolve()),
+            "total": len(results),
+            "failed": failed,
+            "total_bytes": total_bytes,
+            "counts": {dl.STATUS_TEXT[s]: c for s, c in stats.items()},
+            "results": [
+                {
+                    "id": r.song.id,
+                    "name": r.song.name,
+                    "artists": r.song.artist_text,
+                    "status": r.status,
+                    "status_text": dl.STATUS_TEXT.get(r.status, r.status),
+                    "path": str(r.path) if r.path else "",
+                    "size": r.path.stat().st_size if r.path and r.path.exists() else 0,
+                    "br": r.br,
+                    "quality": r.quality,
+                    "message": r.message,
+                }
+                for r in results
+            ],
+        }
+    )
     if failed:
         console.print(f"[red]{failed} 首失败[/red]，可重复执行，已完成的会自动跳过")
         raise typer.Exit(1)
@@ -495,11 +733,13 @@ def cmd_download(
 @app.command("cache")
 def cmd_cache(
     cache_dir: str = typer.Option("", "--dir", help="客户端缓存目录，留空自动定位"),
-    out: Path = typer.Option(Path("downloads"), "--out", "-o", help="输出目录"),
+    out: Path = typer.Option(None, "--out", "-o", help="输出目录，默认跟界面里的保存目录一致"),
     min_rate: int = typer.Option(
         128, "--min-rate", help="只处理不低于该档位的缓存（128/320/999）"
     ),
-    template: str = typer.Option(DEFAULT_TEMPLATE, "--template", "-t", help="命名模板"),
+    template: str = typer.Option(
+        "", "--template", "-t", help="命名模板，留空跟随界面设置"
+    ),
     cookie: str = typer.Option("", "--cookie", help="登录 Cookie，用于补齐元数据与歌词"),
     no_cover: bool = typer.Option(False, "--no-cover", help="不写入封面"),
     no_lyric: bool = typer.Option(False, "--no-lyric", help="不写入歌词"),
@@ -510,8 +750,13 @@ def cmd_cache(
     mp3_bitrate: str = typer.Option("auto", "--mp3-bitrate", help="转 mp3 码率，auto 表示跟随源码率"),
     dry_run: bool = typer.Option(False, "--dry-run", help="只列出，不解码"),
     limit: int = typer.Option(0, "--limit", "-n", help="只处理前 N 首"),
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
 ) -> None:
     """把客户端播放缓存解码成音频文件。"""
+    _use_json(json_out)
+    out = Path(out).expanduser() if out else _default_out()
+    template = _init_template(template)
+
     from . import cache as cache_mod
     from . import transcode
     from .downloader import fetch_cover, fetch_lyrics
@@ -588,11 +833,31 @@ def cmd_cache(
             )
         console.print(table)
         console.print("[dim]以上为待解码清单，去掉 --dry-run 开始转换[/dim]")
+        _emit(
+            {
+                "ok": True,
+                "dry_run": True,
+                "out_dir": str(out.resolve()),
+                "count": len(items),
+                "items": [
+                    {
+                        "id": e.song_id,
+                        "name": details[e.song_id].name if e.song_id in details else "",
+                        "artists": details[e.song_id].artist_text if e.song_id in details else "",
+                        "rate": e.rate,
+                        "rate_label": e.rate_label,
+                        "size": e.size,
+                    }
+                    for e in items
+                ],
+            }
+        )
         raise typer.Exit()
 
     out.mkdir(parents=True, exist_ok=True)
     done = skipped = failed = trial = 0
     written = 0
+    records: list[dict] = []
 
     from mutagen import File as MutagenFile
 
@@ -609,6 +874,10 @@ def cmd_cache(
             if target.exists() and not force:
                 scratch.unlink(missing_ok=True)
                 skipped += 1
+                records.append(
+                    {"id": song.id, "name": song.name, "status": "skipped",
+                     "path": str(target), "rate_label": entry.rate_label}
+                )
                 console.print(f"{tag} [dim]跳过 {song.name}[/dim]", highlight=False)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -623,6 +892,11 @@ def cmd_cache(
             if 0 < duration < 30:
                 target.unlink(missing_ok=True)
                 trial += 1
+                records.append(
+                    {"id": song.id, "name": song.name, "status": "trial",
+                     "path": "", "rate_label": entry.rate_label,
+                     "message": f"仅 {duration:.0f}s 试听片段"}
+                )
                 console.print(
                     f"{tag} [yellow]仅试听[/yellow] {song.name} "
                     f"[dim]{duration:.0f}s，已丢弃[/dim]",
@@ -648,6 +922,11 @@ def cmd_cache(
 
             done += 1
             written += target.stat().st_size
+            records.append(
+                {"id": song.id, "name": song.name, "status": "ok",
+                 "path": str(target), "size": target.stat().st_size,
+                 "rate_label": entry.rate_label}
+            )
             console.print(
                 f"{tag} [green]解码[/green] {song.name} "
                 f"[dim]- {song.artist_text} · {entry.rate_label}{converted} · "
@@ -656,6 +935,10 @@ def cmd_cache(
             )
         except Exception as exc:  # noqa: BLE001
             failed += 1
+            records.append(
+                {"id": song.id, "name": song.name, "status": "failed",
+                 "path": "", "rate_label": entry.rate_label, "message": str(exc)}
+            )
             console.print(f"{tag} [red]失败[/red] {song.name}: {exc}", highlight=False)
 
     table = Table(box=None, show_header=False, pad_edge=False, title="汇总")
@@ -668,6 +951,18 @@ def cmd_cache(
     table.add_row("失败", str(failed))
     table.add_row("合计", f"{done + skipped + failed + trial} 首 · {written / 1048576:.1f} MB")
     console.print(table)
+    _emit(
+        {
+            "ok": failed == 0 and done + skipped > 0,
+            "out_dir": str(out.resolve()),
+            "decoded": done,
+            "skipped": skipped,
+            "trial": trial,
+            "failed": failed,
+            "total_bytes": written,
+            "items": records,
+        }
+    )
 
 
 @app.command("qualities")

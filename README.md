@@ -34,6 +34,28 @@ Windows 桌面端下载工具：搜索、试听、下载、读取客户端缓存
 2. 选择保存目录、音质档位
 3. 输入歌名或粘贴歌曲 / 歌单链接搜索
 
+## 命令行：不开界面直接下载
+
+程序目录下的 `ncm-dl.bat` 是命令行入口，搜索、下载、导出缓存都不需要启动图形界面。
+脚本会自动挑一个装好依赖的 Python，缺依赖时自动安装（命令行不要求 PyQt5）。
+
+```bash
+ncm-dl.bat search "关键词" -n 10        # 搜索
+ncm-dl.bat dl 26093064                  # 下载单曲
+ncm-dl.bat dl "歌单或专辑链接"          # 下载整个歌单 / 专辑
+ncm-dl.bat dl 26093064 -q lossless      # 指定音质（standard/higher/exhigh/lossless/hires）
+ncm-dl.bat dl 26093064 --to-mp3         # 顺带转成 mp3
+ncm-dl.bat url 26093064                 # 只看播放地址与实际码率
+ncm-dl.bat cache                        # 把客户端播放缓存解码成文件
+ncm-dl.bat whoami                       # 登录态与各音源权限
+```
+
+- 不传 `-q`（音质）、`-o`（目录）、`-t`（命名模板）时**跟随图形界面里的设置**，
+  两个入口共用同一份下载记录，同一首歌不会被下载两遍。
+- 加 `--json` 后 stdout 只有一行 JSON（搜索结果、每个文件的完整路径与状态），
+  过程提示全部走 stderr；失败时同样输出 `{"ok": false, "error": "..."}`，
+  可以直接被脚本、自动化工具解析。
+
 ## 从源码运行
 
 ```bash

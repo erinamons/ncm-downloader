@@ -847,9 +847,7 @@ class MainWindow(QMainWindow):
         self.bars: dict[int, QProgressBar] = {}
         self._failed: list[Song] = []
         self._partial_skipped: list[Song] = []
-        self.out_dir = Path(
-            self.settings.value("out_dir", str(default_download_dir()), type=str)
-        )
+        self.out_dir = self._load_out_dir()
         # 缓存目录：设置里指定过就用它，否则自动探测客户端默认位置
         self.cache_dir = self._load_cache_dir()
 
@@ -1232,6 +1230,23 @@ class MainWindow(QMainWindow):
         bar.set_volume(volume)
         bar.set_repeat(self._repeat)
         self.player.set_volume(volume)
+
+    def _load_out_dir(self) -> Path:
+        """保存目录：设置里那个路径必须在这台机器上说得通。
+
+        settings.ini 会跟着程序文件夹一起被拷来拷去，里面的绝对路径未必还在。
+        照着一个不存在的路径一路 mkdir，会凭空造出整条目录（踩过：
+        ``C:\\Users\\Administrator\\WorkBuddy\\...`` 被建出来，用户根本找不到歌）。
+        所以父目录不存在就退回默认目录，并把设置改回来。
+        """
+        fallback = default_download_dir()
+        raw = self.settings.value("out_dir", str(fallback), type=str) or ""
+        path = Path(raw) if raw else fallback
+        if path.is_dir() or path.parent.is_dir():
+            return path
+        log.warning("保存目录 %s 不可用，改用默认 %s", path, fallback)
+        self.settings.setValue("out_dir", str(fallback))
+        return fallback
 
     def _load_cache_dir(self) -> Path | None:
         """设置里指定过就用它，否则自动探测；失效时再探测一次。"""
