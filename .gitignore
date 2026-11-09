@@ -22,6 +22,8 @@ tmp_test/
 test-gui/
 test-cancel*/
 play-cache/
+diagnostics/
+.write-test
 
 # 下载残留与索引
 *.part

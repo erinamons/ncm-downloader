@@ -215,13 +215,29 @@ class DevWindow(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(FLUSH_MS)
         self._timer.timeout.connect(self._flush)
-        self._timer.start()
-
-        self._handler = _QueueHandler(self._log_q)
-        self._handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(name)s: %(message)s", "%H:%M:%S"))
-        logging.getLogger().addHandler(self._handler)
-        trace_mod.add_listener(self._on_trace)
+        self._attach()
         self._refresh_env()
+
+    def _attach(self) -> None:
+        """挂到 root logger 和 trace 上；重复调用无副作用。
+
+        面板关掉时会摘掉，再次打开必须重新挂——否则窗口还在，但日志和步骤
+        永远停在关闭前那一屏（踩过：重开后面板是「死」的）。
+        """
+        if self._handler is None:
+            self._handler = _QueueHandler(self._log_q)
+            self._handler.setFormatter(
+                logging.Formatter("%(asctime)s %(levelname)-5s %(name)s: %(message)s", "%H:%M:%S")
+            )
+            logging.getLogger().addHandler(self._handler)
+        trace_mod.add_listener(self._on_trace)
+        if not self._timer.isActive():
+            self._timer.start()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        self._attach()
+        self._refresh_env()
+        super().showEvent(event)
 
     # ---------------- 构建 ----------------
 

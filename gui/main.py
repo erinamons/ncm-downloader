@@ -1402,6 +1402,24 @@ class MainWindow(QMainWindow):
 
         target_dir = cache_mod.player_cache_dir()
         target_dir.mkdir(parents=True, exist_ok=True)
+        # 同一份缓存解密过一次就够了：产物大小和 .uc 对得上、比 .uc 新就直接复用。
+        # 以前每次都重新解密，10 MB 的歌要白等半秒左右
+        try:
+            uc_mtime = entry.path.stat().st_mtime
+        except OSError:
+            uc_mtime = 0
+        for hint in ("m4a", "mp3", "flac", "wav"):
+            cand = target_dir / f"{song.id}.{hint}"
+            try:
+                st = cand.stat()
+            except OSError:
+                continue
+            if st.st_mtime < uc_mtime or st.st_size <= 0:
+                continue
+            if size and abs(st.st_size - size) > 1024:
+                continue
+            return cand
+
         scratch = target_dir / f"{song.id}.bin"
         try:
             ext = cache_mod.decode(entry.path, scratch)
@@ -2141,21 +2159,33 @@ class MainWindow(QMainWindow):
         win.raise_()
         win.activateWindow()
 
+    def _replay_song(self, force_remote: bool = False) -> None:
+        """重播刚才那首。
+
+        不能直接用 playlist[play_index]：队列里双击播放走的是 play_local，
+        那儿记的列表可能早就被换掉了，按索引重播会放成另一首歌。
+        """
+        song = self.player.song
+        if song is None:
+            self._play_current(force_remote=force_remote)
+            return
+        self.player.play_song(song, force_remote=force_remote)
+
     def _on_status_link(self, link: str) -> None:
         if link == "cache":
             self._open_settings()
         elif link == "retry":
             # 重试直接联网取：失败大多出在本地文件上，原路再走一遍没用
-            self._play_current(force_remote=True)
+            self._replay_song(force_remote=True)
         elif link == "remote":
-            self._play_current(force_remote=True)
+            self._replay_song(force_remote=True)
         elif link == "compat":
             # 用户点了「开启兼容播放」：写回设置并立刻重试当前这首。
             # 该格式已经在失败时记进 _bad_formats，重试会直接转换，不再失败一次
             self.settings.setValue("compat_play", True)
             self.player.compat_play = True
             self.status_label.setText("已开启兼容播放，正在重试…")
-            self._play_current()
+            self._replay_song()
 
     def _on_summary_link(self, link: str) -> None:
         if link == "retry":
@@ -2890,6 +2920,7 @@ class MainWindow(QMainWindow):
 
     def _on_task_error(self, message: str) -> None:
         log.warning("任务失败：%s", message)
+        trace("任务", "失败", "fail", detail={"error": message[:80]})
         if "缓存目录" in message:
             # 光在状态栏说一句没用，给个能点的入口
             self.status_label.setText(
@@ -2897,7 +2928,19 @@ class MainWindow(QMainWindow):
                 '<a href="cache" style="color:#e8554a;text-decoration:none">点此指定</a>'
             )
             return
-        self.status_label.setText(f"出错：{message}")
+        # 异常原文只进日志：状态栏给一句能看懂、能行动的话
+        low = message.lower()
+        if "timeout" in low or "timed out" in low or "超时" in message:
+            text = "网络超时了，检查一下网络再试"
+        elif "403" in message or "401" in message or "登录" in message:
+            text = "登录状态可能失效了，重新扫码登录再试"
+        elif any(k in message for k in ("502", "503", "504")) or "服务器" in message:
+            text = "服务器暂时不可用，稍后再试"
+        elif any(k in low for k in ("connection", "ssl", "proxy")) or "连接" in message:
+            text = "连不上服务器，可能是网络或代理的问题"
+        else:
+            text = "这一步没有完成，详情记在日志里了"
+        self.status_label.setText(text)
 
     def _keep_task(self, task) -> None:
         self._live_tasks.add(task)

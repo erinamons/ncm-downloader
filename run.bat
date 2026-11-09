@@ -9,7 +9,7 @@ set "ANY="
 
 if exist ".venv\Scripts\python.exe" call :try "%CD%\.venv\Scripts\python.exe"
 
-for /f "delims=" %%D in ('dir /b /ad /o-n "%USERPROFILE%\.workbuddy\binaries\python\versions" 2^>nul') do (
+for /f "delims=" %%D in ('dir /b /ad /o-d "%USERPROFILE%\.workbuddy\binaries\python\versions" 2^>nul') do (
     call :try "%USERPROFILE%\.workbuddy\binaries\python\versions\%%D\python.exe"
 )
 
