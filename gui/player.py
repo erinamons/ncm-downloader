@@ -39,6 +39,7 @@ from PyQt5.QtWidgets import (
 from gui import icons
 from gui.marquee import MarqueeText
 from ncm.models import Song
+from ncm.trace import trace
 
 BAR_H = 46
 ROW_H = 43
@@ -295,6 +296,9 @@ class PlayerEngine(QObject):
                 # 网络也没取到，退回本地：残片总比什么都没有强
                 path = self.local_provider(song)
                 self._used_local = path is not None
+            if path is not None:
+                trace("播放", "选到文件", "ok",
+                      detail={"src": "本地" if self._used_local else "网络", "file": path.name})
             if path is not None and self.compat_play:
                 # 这种格式本进程里已经确认放不了：直接转换，不再先失败一次
                 path = self._maybe_convert(path, song.id, token) or path
@@ -408,16 +412,21 @@ class PlayerEngine(QObject):
     def _convert_then_play(self, path: Path, song_id: int, token: int) -> None:
         """播放失败后的补救：转成 WAV 再交给播放器。"""
         dst = self._temp / f"{song_id or path.stem}.pcm.wav"
+        started = time.perf_counter()
         try:
             from ncm import transcode
 
             transcode.to_wav(path, dst)
         except Exception as exc:  # noqa: BLE001
             log.warning("兼容播放转换失败 %s：%s", path.name, exc)
+            trace("播放", "兼容转换", "fail", (time.perf_counter() - started) * 1000,
+                  {"file": path.name, "error": type(exc).__name__})
             if token == self._token:
                 self._safe(self.failed, "转换失败", "convert")
                 self._safe(self.state_changed, STOPPED)
             return
+        trace("播放", "兼容转换", "ok", (time.perf_counter() - started) * 1000,
+              {"file": path.name, "out": dst.name})
         if token != self._token:
             return
         self._prune_converted(dst)
@@ -453,6 +462,7 @@ class PlayerEngine(QObject):
 
     def _start_file(self, path: Path) -> None:
         self._current_path = Path(path)
+        trace("播放", "起播", "run", detail={"file": path.name, "size": path.stat().st_size if path.exists() else 0})
         self._player.setMedia(QMediaContent(QUrl.fromLocalFile(str(path))))
         self._player.play()
         if self._song is not None and self._song.cover_url:
@@ -549,6 +559,9 @@ class PlayerEngine(QObject):
             self.compat_play,
         )
         self.state_changed.emit(STOPPED)
+        trace("播放", "起播失败", "fail",
+              detail={"format": ext.lstrip(".") or "-", "error": int(self._player.error()),
+                      "file": path.name if path else "-"})
 
         if path is None:
             self.failed.emit(raw or "没能拿到可播放的音频", "network")

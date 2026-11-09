@@ -12,8 +12,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from .trace import trace
 
 _UC_RE = re.compile(r"^(\d+)-(\d+)-([0-9a-f]+)$", re.IGNORECASE)
 _XOR_TABLE = bytes(i ^ 0xA3 for i in range(256))
@@ -108,6 +111,7 @@ def scan(cache_dir: Path | str, max_depth: int = 3) -> list[CacheEntry]:
     只 glob 顶层会漏掉绝大多数文件，表现就是「缓存列表永远只有一首」。
     深度限制在 3 层，避免误选到磁盘根目录时遍历整块盘。
     """
+    started = time.perf_counter()
     root = Path(cache_dir)
     entries: list[CacheEntry] = []
     root_depth = len(root.parts)
@@ -149,6 +153,10 @@ def scan(cache_dir: Path | str, max_depth: int = 3) -> list[CacheEntry]:
                 )
             )
     entries.sort(key=lambda e: (e.song_id, -e.rate))
+    trace(
+        "缓存", "扫描", "ok", (time.perf_counter() - started) * 1000,
+        {"files": len(entries), "complete": sum(1 for e in entries if e.complete)},
+    )
     return entries
 
 

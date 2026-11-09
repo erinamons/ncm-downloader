@@ -14,6 +14,7 @@ import requests
 
 from .crypto import weapi
 from .models import AudioSource, Playlist, Song
+from .trace import trace
 
 BASE = "https://music.163.com"
 
@@ -103,17 +104,28 @@ class LocalBackend:
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         url = path if path.startswith("http") else BASE + path
         last: Exception | None = None
+        started = time.perf_counter()
         for attempt in range(self.retries + 1):
             try:
                 resp = self._session().request(
                     method, url, timeout=self.timeout, **kwargs
                 )
                 resp.raise_for_status()
+                trace(
+                    "接口", f"{method} {path}", "ok",
+                    (time.perf_counter() - started) * 1000,
+                    {"attempt": attempt + 1, "code": resp.status_code},
+                )
                 return resp.json()
             except Exception as exc:  # noqa: BLE001
                 last = exc
                 if attempt < self.retries:
                     time.sleep(0.6 * (attempt + 1))
+        trace(
+            "接口", f"{method} {path}", "fail",
+            (time.perf_counter() - started) * 1000,
+            {"error": type(last).__name__ if last else "unknown"},
+        )
         raise BackendError(f"请求失败 {path}: {last}")
 
     def _weapi(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:

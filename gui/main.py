@@ -63,6 +63,7 @@ from PyQt5.QtWidgets import (
 
 from ncm import LocalBackend, Store
 from ncm import auth
+from ncm.trace import trace
 from ncm import archive as archive_mod
 from ncm import cache as cache_mod
 from ncm.downloader import (
@@ -466,6 +467,23 @@ class SettingsDialog(RoundDialog):
         history_row.addWidget(btn_history)
         form.addRow("搜索历史", history_row)
 
+        # 藏在这里：普通用户不会误点，出问题时能一步打开现场
+        dev_row = QHBoxLayout()
+        dev_row.setSpacing(8)
+        dev_hint = QLabel("运行步骤、实时日志、错误详情")
+        dev_hint.setObjectName("muted")
+        dev_row.addWidget(dev_hint, 1)
+        btn_dev = QPushButton("开发者面板")
+        btn_dev.setFixedHeight(30)
+        btn_dev.setMinimumWidth(96)
+        btn_dev.setToolTip(
+            "实时查看搜索 / 缓存扫描 / 下载 / 播放的每一步耗时和错误，\n"
+            "可以复制诊断信息或导出诊断包"
+        )
+        btn_dev.clicked.connect(self._open_devtools)
+        dev_row.addWidget(btn_dev)
+        form.addRow("开发者", dev_row)
+
         layout.addLayout(form)
         self._refresh_dir_text()
         self._refresh_cache_text()
@@ -635,6 +653,11 @@ class SettingsDialog(RoundDialog):
         else:
             self.cache_store_state.setText("空")
 
+    def _open_devtools(self) -> None:
+        owner = self.parent()
+        if owner is not None and hasattr(owner, "open_devtools"):
+            owner.open_devtools()
+
     def _show_cache_report(self) -> None:
         from ncm import cache as cache_mod
 
@@ -798,6 +821,7 @@ class MainWindow(QMainWindow):
         # 活着的后台任务：只靠 self.task 一个引用不够，旧任务的 finished
         # 会把槽位清空，正在跑的新任务若没人引用就会被 GC，QThread 析构直接 abort
         self._live_tasks: set = set()
+        self._dev_window = None
         self._pending_query = ""
         # 切到「仅本地缓存」时若正有任务在跑，扫描请求排队等任务槽空出来；
         # 以前直接丢掉，界面会停在「音源=缓存但列表还是搜索结果」的死状态
@@ -2105,6 +2129,18 @@ class MainWindow(QMainWindow):
     def _open_help(self) -> None:
         HelpDialog(self).exec_()
 
+    def open_devtools(self) -> None:
+        """打开开发者面板（入口在设置里，不占主界面）。"""
+        from gui.devtools import DevWindow
+
+        win = getattr(self, "_dev_window", None)
+        if win is None:
+            win = DevWindow(self)
+            self._dev_window = win
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
     def _on_status_link(self, link: str) -> None:
         if link == "cache":
             self._open_settings()
@@ -2409,6 +2445,7 @@ class MainWindow(QMainWindow):
         # 结果落进「发起请求时」的音源池：用户中途切走，也不能把搜索结果
         # 塞进缓存池，否则缓存视图会出现一堆导出必失败的歌
         source = self._current_source()
+        trace("搜索", "开始", "run", detail={"keyword": keyword, "source": source})
         self.task = Task(
             lambda: (source, "搜索结果", self.backend.search(keyword, limit=PAGE_SIZE))
         )
@@ -2541,6 +2578,7 @@ class MainWindow(QMainWindow):
         # 落到发起请求时的音源池，而不是「到达时的音源」：中途切走也不会
         # 把接口结果塞进缓存池（那会让缓存视图出现导出必失败的歌）
         self._pools[source] = (list(songs), title, False)
+        trace("搜索", "完成", "ok", detail={"count": len(songs), "title": title})
         if source != self._current_source():
             self.status_label.setText(
                 f"已载入 {len(songs)} 首到「{SOURCE_LABEL.get(source, source)}」，切回去即可查看"
@@ -2659,6 +2697,7 @@ class MainWindow(QMainWindow):
 
     def _on_cache_loaded(self, payload: tuple[str, list[Song]]) -> None:
         title, songs = payload
+        trace("缓存", "列表就绪", "ok", detail={"count": len(songs)})
         self._scanning_cache = False
         # 刚扫过盘，之前那份「id → 缓存文件」的快照已经过期了；
         # 不置空的话，新缓存的歌播放时会按旧快照找不到文件，白走一趟网络
@@ -2682,6 +2721,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText("本地缓存里没有可用的曲目")
 
     def _on_cache_failed(self, message: str) -> None:
+        trace("缓存", "扫描失败", "fail", detail={"error": message[:80]})
         # 扫描失败后停掉自动刷新，否则缓存目录一有写入就重试，变成刷屏
         self._scanning_cache = False
         self._cache_scan_failed = True
@@ -3251,6 +3291,9 @@ class MainWindow(QMainWindow):
                     f"{partial_count} 首缓存未下完，将按设置跳过"
                 )
 
+        trace("下载", "批次开始", "run",
+              detail={"count": len(songs), "source": source,
+                      "level": self.level_box.currentData(), "workers": self.workers})
         self._prepare_queue(songs)
         self._batch_songs = list(songs)
         self._done_ids = set()
@@ -3514,6 +3557,9 @@ class MainWindow(QMainWindow):
 
     def _on_batch_done(self, results: list[TaskResult]) -> None:
         cancelled = sum(1 for r in results if r.status == CANCELLED)
+        trace("下载", "批次结束", "ok",
+              detail={"total": len(results), "cancelled": cancelled,
+                      "failed": sum(1 for r in results if r.status == FAILED)})
         self.batch = None
         if self.store:
             self.store.close()
@@ -3891,6 +3937,10 @@ class MainWindow(QMainWindow):
         self._apply_view()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        dev = getattr(self, "_dev_window", None)
+        if dev is not None:
+            dev.close()
+            self._dev_window = None
         if self.batch is not None:
             self.batch.wait(3000)
         self.settings.setValue("out_dir", str(self.out_dir))

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ from . import transcode
 from .backend import Backend, BackendError
 from .models import AudioSource, Song
 from .store import DEFAULT_TEMPLATE, Store, render_template
+from .trace import trace
 from .tagger import merge_lyrics, write_tags
 
 OK = "ok"
@@ -259,7 +261,9 @@ class Downloader:
     ) -> TaskResult:
         if self._cancel.is_set() or self._song_cancelled(song.id):
             return TaskResult(song, CANCELLED, message="已取消")
+        group = song.name[:18]
         if not self.force and self.store.done(song.id):
+            trace("下载", "已下载过，跳过", "skip", group=group, detail={"song": song.id})
             row = self.store.get(song.id)
             return TaskResult(
                 song, SKIPPED, path=Path(row["path"]) if row else None,
@@ -272,6 +276,8 @@ class Downloader:
             entry = self._cache.get(song.id)
             if entry is not None:
                 if entry.complete:
+                    trace("下载", "缓存命中", "ok", group=group,
+                          detail={"song": song.id, "rate": entry.rate})
                     return self._from_cache(song, entry)
                 # 缓存只写了一半（客户端边听边写，没听完就是半截）。
                 # 直接导出会得到一首残缺的歌，所以默认联网取完整版；
@@ -283,13 +289,18 @@ class Downloader:
                         message="缓存未下完，已跳过（未开启联网补齐）",
                     )
                 partial = True
+                trace("下载", "缓存未下完，联网补齐", "skip", group=group,
+                      detail={"song": song.id})
             elif self.source == "cache":
                 return TaskResult(song, CACHE_MISS, message="本地缓存里没有这首")
 
+        t0 = time.perf_counter()
         resolved = self._resolve(song)
         if isinstance(resolved, TaskResult):
             return resolved
         src = resolved
+        trace("下载", "取址", "ok", (time.perf_counter() - t0) * 1000, group=group,
+              detail={"song": song.id, "ext": src.ext, "br": src.br})
 
         target = self._target_path(song, src)
         if target.exists() and not self.force:
@@ -303,7 +314,10 @@ class Downloader:
         part = target.with_name(target.name + ".part")
 
         try:
+            t0 = time.perf_counter()
             expected = self._fetch_stream(src.url, part, src.size, on_progress, song.id)
+            trace("下载", "下载完成", "ok", (time.perf_counter() - t0) * 1000, group=group,
+                  detail={"song": song.id, "size": expected or part.stat().st_size})
         except InterruptedError:
             # 主动取消就把半成品删掉：留着也没人续传，只会占空间
             part.unlink(missing_ok=True)
@@ -332,10 +346,17 @@ class Downloader:
         note = "（缓存未完整，已联网补齐）" if partial else ""
         if src.degraded:
             note += f"（请求 {self.level}，实得 {src.br // 1000}k）"
+        t0 = time.perf_counter()
         target, extra = self._maybe_transcode(target)
+        if extra:
+            trace("下载", "转码", "ok", (time.perf_counter() - t0) * 1000, group=group,
+                  detail={"song": song.id})
         note += extra
         if self.with_lyric or self.with_cover:
+            t0 = time.perf_counter()
             note += self._tag(target, song)
+            trace("下载", "写入标签", "ok", (time.perf_counter() - t0) * 1000, group=group,
+                  detail={"song": song.id})
 
         self.store.record(
             song.id, src.br, target.suffix.lstrip("."), target, target.stat().st_size
