@@ -84,8 +84,14 @@ win.sort_desc = True
 win._update_header_sort_style()
 win._update_download_button()
 
-win.resize(1000, 740)
 win.show()
+app.processEvents()
+# 截图不能跟着用户的启动视图走：设置里选过「紧凑模式」的话，preview.png
+# 会截成 400 宽的窄窗口。先把启动期排队的切换跑完，再强制回到完整模式
+if getattr(win, "_mini", False):
+    win._exit_mini()
+    app.processEvents()
+win.resize(1000, 740)
 app.processEvents()
 
 out_dir = Path(__file__).resolve().parent.parent / "docs"
@@ -104,7 +110,8 @@ canvas.save(str(out_dir / "preview.png"))
 print("saved", out_dir / "preview.png", win.size())
 
 # 紧凑模式单独一张
-win.toggle_mini()
+if not win._mini:
+    win._enter_mini()
 app.processEvents()
 win._rebuild_shadow()
 app.processEvents()
@@ -118,7 +125,8 @@ q.drawPixmap(0, 0, compact)
 q.end()
 canvas2.save(str(out_dir / "mini.png"))
 print("saved", out_dir / "mini.png", compact.size())
-win.toggle_mini()
+if win._mini:
+    win._exit_mini()
 app.processEvents()
 
 from gui.main import SettingsDialog

@@ -198,6 +198,73 @@ painter.fillRect(QRectF(w - margin, margin, margin, h - margin*2), tint)
   `os.replace` 报 `WinError 5` → 表现为「播放失败」。现已固定在程序目录。
 - 打包目录里删上千个文件会被 safe-delete 拦，直接让 PyInstaller `--noconfirm` 覆盖即可。
 
+### Qt 控件与样式踩坑
+
+这一节的共同点：现象看着像「程序算错了」，实际是 Qt 的默认行为。
+
+#### 播放：Qt5 在 Windows 默认选 DirectShow，它没有 AAC / FLAC 解码器
+
+现象：缓存里的 m4a / flac 首播必失败，点「重试」走网络拿到 mp3 却能播。
+
+根因不是系统缺解码器——`MFTEnumEx` 能列出 AAC / FLAC 各一个，
+`MFCreateSourceReaderFromURL` 也能直接打开这些文件；是 Qt5 选了 DirectShow 后端，
+而 DirectShow 只认 mp3 / wav。
+
+修法：`QT_MULTIMEDIA_PREFERRED_PLUGINS=windows,dsengine`（优先 Media Foundation，
+插件不可用时回退）。必须在 QMediaPlayer 创建前设置，入口在 `run_gui.py` 和
+`gui/__init__.py`；用户可在开发者面板「组件」页改，写 `settings.ini` 的
+`playback_backend`，重启生效。
+
+排查顺序：先分后端（三种取值各跑一遍格式矩阵），再看系统解码器（`MFTEnumEx`），
+最后才怀疑文件本身。曾经因为跳过后端这一步，白写了一版自动转码。
+
+#### QSS：祖先样式表里的通用规则会压过子控件的 ID 选择器
+
+现象：给帮助卡片写 `QWidget#helpCard { background: #2a2a30; }`，放在对话框的
+`setStyleSheet()` 里，实测底色一直是窗口色（像素采样确认，改了三轮都没生效）。
+
+原因两层：普通 `QWidget` 不打开 `WA_StyledBackground` 就根本不画 QSS 背景；而
+`gui/style.py` 的 `QWidget { background: ... }` 是设在祖先上的，对这种「祖先通用规则
+vs 自身 ID 规则」的层叠，实际结果是通用规则赢。
+
+修法：两块都要——`card.setAttribute(Qt.WA_StyledBackground, True)`，并且用
+**控件自身**的 `setStyleSheet()` 写这条规则。
+
+#### QPalette.PlaceholderText 默认纯黑，QSS 改不了
+
+现象：深色输入框里的占位文字完全看不见（搜索框的「搜索歌名，或粘贴歌曲 / 歌单链接」）。
+
+QSS 没有 placeholder 相关属性，只能改 palette：
+
+```python
+palette = app.palette()
+palette.setColor(QPalette.PlaceholderText, QColor("#7d7d86"))
+app.setPalette(palette)
+```
+
+放在 `MainWindow.__init__` 里，从哪个入口启动都生效。
+
+#### QDialog 里按回车会点中「默认按钮」
+
+现象：在指令页按回车执行命令，同时把「导入回放」也点了一下，页面被切走。
+
+原因：QPushButton 被 reparent 进 QDialog 时，Qt 会自动把它设成 autoDefault，
+QDialog 的 Return 处理会去找这样的按钮。**布局刚建好时 setAutoDefault(False) 没用**，
+reparent 发生在之后。
+
+修法：在 `showEvent` 里再遍历一次 `findChildren(QPushButton)` 关掉。
+
+#### QTabWidget 标签一多就被挤掉
+
+6 个标签在约 600px 宽里放不下：Qt 会把第一个标签挤出可视区并出现 ◄► 滚动箭头，
+用户根本看不到还有第一页。开发者面板已改成「一行互斥按钮 + QStackedWidget」，
+以后加页也不会再挤。
+
+#### 非模态子窗口不会跟着父窗口关闭
+
+帮助窗口的 parent 是开发者面板，但面板 `close()` 时它仍留在屏幕上（Qt 只对
+window 类型的子控件在 parent 销毁时处理）。需要在面板的 `_detach()` 里显式关闭。
+
 ## 三、接口相关
 
 ### 音源与身份
@@ -226,9 +293,10 @@ painter.fillRect(QRectF(w - margin, margin, margin, h - margin*2), tint)
 ## 四、发布流程
 
 ```bash
-# 1. 改版本号（只有一处）
-#    gui/__init__.py: __version__
-#    pyproject.toml: version
+# 1. 改版本号（两处，必须一致）
+#    ncm/__init__.py:  __version__      ← 真正生效的那处
+#    pyproject.toml:   version
+#    （gui/__init__.py 只是 re-export，不用改）
 
 # 2. 回归
 python -m pyflakes gui/ ncm/ tools/ tests/
@@ -237,27 +305,40 @@ python tests/gui_smoke.py
 # 3. 更新截图（自动脱敏）
 python tools/preview.py
 
-# 4. 打包
-python -m PyInstaller --noconfirm --onefile --windowed ...   # 见 README
+# 4. 打包（文件夹版）
+python -m PyInstaller --noconfirm --onedir --windowed ^
+  --name "网易云下载器" --icon "gui/assets/app.ico" ^
+  --add-data "gui/assets;gui/assets" ^
+  --hidden-import PyQt5.QtMultimedia --hidden-import PyQt5.QtMultimediaWidgets ^
+  --distpath pack --workpath pack_build run_gui.py
 
-# 5. 实测（三项必做）
-#    启动 → 检查 %TEMP%\_MEI*\imageio_ffmpeg\binaries\ → 下载并转一首 mp3
+# 5. 回填 ffmpeg 与说明（build.bat 一条命令做完 4、5）
+mkdir "pack\网易云下载器\ffmpeg\binaries"
+copy "<site-packages>\imageio_ffmpeg\binaries\ffmpeg-win-*.exe" "pack\网易云下载器\ffmpeg\binaries\"
+copy "docs\使用说明.txt" "pack\网易云下载器\"
 
-# 6. 更新 CHANGELOG.md，提交
-git add -A && git commit -m "发布 v1.0.0"
-git tag v1.0.0
+# 6. 打 zip（自动排除日志、__pycache__、diagnostics）
+python tools/make_zip.py            # → dist\网易云下载器-vX.X.X-win64.zip
+
+# 7. 实测（三项必做）
+#    双击 exe 能开窗 → pack\...\ffmpeg\binaries\ 有 ffmpeg → 下载一首并转一次 mp3
+
+# 8. 更新 CHANGELOG.md，提交
+git add -A && git commit -m "发布 v1.3.0"
 ```
 
 ### 发布检查清单
 
-- [ ] 版本号两处一致
+- [ ] 版本号两处一致（`ncm/__init__.py` + `pyproject.toml`）
 - [ ] `pyflakes` 无输出
 - [ ] `gui_smoke.py` 退出码 0
 - [ ] 截图无真实账号、无真实登录二维码
-- [ ] exe 双击能开窗、标题正确
-- [ ] 内置 ffmpeg 存在（`_MEI` 目录）
+- [ ] exe 双击能开窗、标题与版本正确
+- [ ] `pack\网易云下载器\ffmpeg\binaries\` 有 ffmpeg
+- [ ] `pack\网易云下载器\使用说明.txt` 是当前版本
+- [ ] zip 里没有 `*.log`、`diagnostics`、`__pycache__`
 - [ ] 下载 + 转 mp3 实测通过
-- [ ] CHANGELOG 已更新
+- [ ] CHANGELOG 已更新为正式版本号（不是「未发布」）
 
 ## 五、还没做的（候选需求）
 
