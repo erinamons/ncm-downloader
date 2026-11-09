@@ -1365,19 +1365,6 @@ class MainWindow(QMainWindow):
 
         target_dir = cache_mod.player_cache_dir()
         target_dir.mkdir(parents=True, exist_ok=True)
-        # 上次因为系统缺解码器转过 mp3：缓存没更新就直接复用，
-        # 否则每次播放都要「解码 + 转码」走一遍，好几秒
-        converted = target_dir / f"{song.id}.qt.mp3"
-        try:
-            if (
-                converted.exists()
-                and converted.stat().st_size > 0
-                and converted.stat().st_mtime >= entry.path.stat().st_mtime
-            ):
-                return converted
-        except OSError:
-            pass
-
         scratch = target_dir / f"{song.id}.bin"
         try:
             ext = cache_mod.decode(entry.path, scratch)
