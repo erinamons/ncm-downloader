@@ -26,6 +26,8 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -33,7 +35,9 @@ from PyQt5.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizeGrip,
     QSplitter,
     QStackedWidget,
@@ -51,6 +55,10 @@ from ncm.paths import data_dir
 MAX_LOG = 3000
 MAX_ERRORS = 800
 FLUSH_MS = 140
+# 状态页最多画多少行队列。再多的部分只给汇总数字：批量下几百首时
+# 逐行刷新会白白卡界面，完整进度本来就在主窗口的表格里
+MAX_QUEUE_ROWS = 40
+ERROR_BANNER_SEC = 300
 
 _STATUS = {"ok": "完成", "fail": "失败", "skip": "跳过", "run": "进行中"}
 _LEVEL_NAME = {logging.INFO: "信息", logging.WARNING: "警告", logging.ERROR: "错误"}
@@ -86,6 +94,14 @@ QComboBox, QLineEdit {
     border-radius: 4px; padding: 3px 6px;
 }
 QCheckBox { color: #b9b9c2; }
+"""
+
+# 状态页两条进度条：正常绿色，失败红色。QSS 里用动态属性切，不重建控件
+_STATUS_BAR_CSS = """
+QProgressBar { background: #242428; border: none; border-radius: 3px; }
+QProgressBar::chunk { background: #4caf7d; border-radius: 3px; }
+QProgressBar[fail="true"]::chunk { background: #e8554a; }
+QProgressBar[dim="true"]::chunk { background: #5a5a64; }
 """
 
 
@@ -227,7 +243,7 @@ class DevWindow(RoundDialog):
         bar.addWidget(self.pause)
         rv.addLayout(bar)
 
-        self.status_view = self._make_view()
+        self.status_view = self._build_status_page()
         self.log_view = self._make_view()
         err_panel = QWidget()
         ev = QVBoxLayout(err_panel)
@@ -467,6 +483,7 @@ class DevWindow(RoundDialog):
             if level >= logging.WARNING:
                 line = f"{time.strftime('%H:%M:%S', time.localtime(created))} {_LEVEL_NAME.get(level, '信息')} {name}: {message}"
                 self._errors.append(_redact(line))
+                self._last_error_ts = time.time()
                 self.err_list.addItem(QListWidgetItem(self._errors[-1]))
                 while self.err_list.count() > MAX_ERRORS:
                     self.err_list.takeItem(0)
@@ -565,56 +582,321 @@ class DevWindow(RoundDialog):
             return
         self._render_status()
 
+    def _status_section(self, title: str) -> QWidget:
+        """状态页的小节标题：灰字 + 一条细分隔线。"""
+        box = QWidget()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(3)
+        label = QLabel(title)
+        label.setStyleSheet("color:#96969e;font-size:11px;")
+        lay.addWidget(label)
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet("background:#2a2a30;border:0;")
+        lay.addWidget(line)
+        box.title_label = label
+        return box
+
+    def _make_queue_slot(self) -> dict:
+        """队列里的一行：名称 / 进度条 / 状态词。行控件预先建好反复用。"""
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+        name = QLabel("")
+        name.setStyleSheet("color:#d8d8dc;font-size:11px;")
+        name.setMinimumWidth(40)
+        bar = QProgressBar()
+        bar.setRange(0, 1000)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(4)
+        bar.setFixedWidth(96)
+        bar.setStyleSheet(_STATUS_BAR_CSS)
+        tail = QLabel("")
+        tail.setStyleSheet("color:#96969e;font-size:11px;")
+        tail.setFixedWidth(52)
+        tail.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        h.addWidget(name, 1)
+        h.addWidget(bar)
+        h.addWidget(tail)
+        row.setVisible(False)
+        return {"row": row, "name": name, "bar": bar, "tail": tail, "_tail": None}
+
+    def _build_status_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(7)
+
+        self.st_player_head = self._status_section("播放器")
+        lay.addWidget(self.st_player_head)
+        self.st_song = QLabel("还没有播放")
+        self.st_song.setStyleSheet("color:#e8e8ea;font-size:13px;")
+        self.st_song.setWordWrap(True)
+        lay.addWidget(self.st_song)
+
+        self.st_bar = QProgressBar()
+        self.st_bar.setRange(0, 1000)
+        self.st_bar.setTextVisible(False)
+        self.st_bar.setFixedHeight(6)
+        self.st_bar.setStyleSheet(_STATUS_BAR_CSS)
+        lay.addWidget(self.st_bar)
+
+        state_row = QHBoxLayout()
+        state_row.setContentsMargins(0, 0, 0, 0)
+        state_row.setSpacing(8)
+        self.st_state = QLabel("已停止 · mediaStatus 1")
+        self.st_state.setStyleSheet("color:#96969e;font-size:11px;")
+        self.st_time = QLabel("— / —")
+        self.st_time.setStyleSheet("color:#96969e;font-size:11px;")
+        state_row.addWidget(self.st_state)
+        state_row.addStretch(1)
+        state_row.addWidget(self.st_time)
+        lay.addLayout(state_row)
+
+        self.st_meta = QLabel("兼容播放 —")
+        self.st_meta.setStyleSheet("color:#7a7a82;font-size:11px;")
+        self.st_meta.setWordWrap(True)
+        lay.addWidget(self.st_meta)
+
+        lay.addWidget(self._status_section("任务"))
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(2)
+        self.st_tasks: dict[str, QLabel] = {}
+        for index, (key, title) in enumerate(
+            (("batch", "批量下载"), ("search", "搜索"), ("scan", "缓存扫描"))
+        ):
+            name = QLabel(title)
+            name.setStyleSheet("color:#96969e;font-size:11px;")
+            name.setFixedWidth(56)
+            value = QLabel("空闲")
+            value.setStyleSheet("color:#d8d8dc;font-size:11px;")
+            value.setWordWrap(True)
+            grid.addWidget(name, index, 0, Qt.AlignTop)
+            grid.addWidget(value, index, 1)
+            self.st_tasks[key] = value
+        lay.addLayout(grid)
+
+        self.st_queue_head = self._status_section("队列")
+        lay.addWidget(self.st_queue_head)
+        holder = QWidget()
+        holder_lay = QVBoxLayout(holder)
+        holder_lay.setContentsMargins(0, 0, 0, 0)
+        holder_lay.setSpacing(4)
+        self.st_queue_rows: list[dict] = []
+        for _ in range(MAX_QUEUE_ROWS):
+            slot = self._make_queue_slot()
+            holder_lay.addWidget(slot["row"])
+            self.st_queue_rows.append(slot)
+        self.st_queue_empty = QLabel("空")
+        self.st_queue_empty.setStyleSheet("color:#6a6a72;font-size:11px;")
+        holder_lay.addWidget(self.st_queue_empty)
+        holder_lay.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(holder)
+        scroll.setStyleSheet(
+            "QScrollArea{background:transparent;border:0;}"
+            "QScrollArea>QWidget>QWidget{background:transparent;}"
+        )
+        scroll.setMinimumHeight(70)
+        lay.addWidget(scroll, 1)
+
+        self.st_queue_more = QLabel("")
+        self.st_queue_more.setStyleSheet("color:#7a7a82;font-size:11px;")
+        self.st_queue_more.setVisible(False)
+        lay.addWidget(self.st_queue_more)
+
+        self.st_error = QLabel("")
+        self.st_error.setWordWrap(True)
+        self.st_error.setStyleSheet(
+            "background:#241a1b;border-left:2px solid #e8554a;border-radius:4px;"
+            "padding:5px 8px;color:#f09595;font-size:11px;"
+        )
+        self.st_error.setVisible(False)
+        lay.addWidget(self.st_error)
+
+        self._status_plain = "== 播放器 ==\n  未初始化"
+        self._last_error_ts = 0.0
+        return page
+
+    @staticmethod
+    def _set_bar_state(bar: QProgressBar, state: str) -> None:
+        """改动态属性切颜色，比每次 setStyleSheet 便宜。state: normal/fail/dim。"""
+        want_fail = state == "fail"
+        want_dim = state == "dim"
+        if bar.property("fail") == want_fail and bar.property("dim") == want_dim:
+            return
+        bar.setProperty("fail", want_fail)
+        bar.setProperty("dim", want_dim)
+        bar.style().unpolish(bar)
+        bar.style().polish(bar)
+
+    def _last_event(self, scope: str, step: str) -> dict | None:
+        """从面板已经收到的事件里翻最近一条，用来显示「上次跑了什么」。"""
+        for event in reversed(self._steps):
+            if event["scope"] == scope and event["step"] == step:
+                return event
+        return None
+
     def _render_status(self) -> None:
         win = self._win
         player = getattr(win, "player", None)
-        out: list[str] = ["== 播放器 =="]
+        plain: list[str] = ["== 播放器 =="]
+
         if player is None:
-            out.append("  未初始化")
+            self.st_song.setText("播放器未初始化")
+            self.st_state.setText("—")
+            self.st_time.setText("— / —")
+            self.st_meta.setText("")
+            self.st_bar.setValue(0)
+            self._set_bar_state(self.st_bar, "dim")
+            plain.append("  未初始化")
         else:
             qp = player._player
-            state = {0: "已停止", 1: "播放中", 2: "已暂停"}.get(int(qp.state()), str(int(qp.state())))
+            state = {0: "已停止", 1: "播放中", 2: "已暂停"}.get(
+                int(qp.state()), str(int(qp.state()))
+            )
+            status = int(qp.mediaStatus())
             dur, pos = qp.duration(), qp.position()
-            # 没有媒体时 Qt 会给出离谱的 position（几千万毫秒），别直接显示
-            prog = f"{self._mmss(min(pos, dur))} / {self._mmss(dur)}" if dur > 0 else "— / —"
-            out.append(f"  状态 {state} · mediaStatus {qp.mediaStatus()} · 进度 {prog}")
             song = player.song
-            if song is not None:
-                out.append(f"  曲目 {song.name} - {song.artist_text}")
+            self.st_song.setText(
+                f"{song.name} - {song.artist_text}" if song is not None else "还没有播放"
+            )
+            self.st_state.setText(f"{state} · mediaStatus {status}")
+            if dur > 0:
+                pos = max(0, min(pos, dur))
+                self.st_bar.setValue(int(pos * 1000 / dur))
+                self.st_time.setText(f"{self._mmss(pos)} / {self._mmss(dur)}")
+                prog = f"{self._mmss(pos)} / {self._mmss(dur)}"
+                self._set_bar_state(self.st_bar, "normal")
+            else:
+                self.st_bar.setValue(0)
+                self.st_time.setText("— / —")
+                prog = "— / —"
+                # mediaStatus 8 = InvalidMedia：进度条变红，一眼看出放不了
+                self._set_bar_state(self.st_bar, "fail" if status == 8 else "dim")
+            meta: list[str] = []
             cur = player._current_path
             if cur is not None:
-                size = f"{cur.stat().st_size / 1048576:.1f} MB" if cur.exists() else "文件不存在"
-                out.append(f"  文件 {cur.name} · {size}")
+                size = (
+                    f"{cur.stat().st_size / 1048576:.1f} MB" if cur.exists() else "文件不存在"
+                )
+                src = "本地" if getattr(player, "_used_local", False) else "网络"
+                meta.append(f"{src} {cur.name} · {size}")
+            meta.append(f"兼容播放 {'开' if player.compat_play else '关'}")
             bad = ", ".join(sorted(player._bad_formats)) or "无"
-            out.append(
-                f"  兼容播放 {'开' if player.compat_play else '关'} · 已判定放不了的格式 {bad}"
-            )
-        out.append("")
-        out.append("== 任务 ==")
+            meta.append(f"放不了 {bad}")
+            self.st_meta.setText(" · ".join(meta))
+            plain.append(f"  状态 {state} · mediaStatus {status} · 进度 {prog}")
+            if song is not None:
+                plain.append(f"  曲目 {song.name} - {song.artist_text}")
+            if cur is not None:
+                plain.append(f"  文件 {cur.name}")
+
         batch = getattr(win, "batch", None)
         total = getattr(win, "_batch_total", 0)
         done = getattr(win, "_batch_done", 0)
         if batch is not None:
-            paused = "是" if getattr(win, "_paused", False) else "否"
-            out.append(f"  批量下载 进行中 {done}/{total} · 并发 {getattr(win, 'workers', '?')} · 已暂停 {paused}")
+            paused = " · 已暂停" if getattr(win, "_paused", False) else ""
+            batch_text = f"进行中 {done}/{total} · 并发 {getattr(win, 'workers', '?')}{paused}"
         else:
-            out.append("  批量下载 空闲")
-        out.append(f"  搜索 {'进行中' if getattr(win, 'task', None) is not None else '空闲'}")
-        out.append("")
-        out.append("== 队列 ==")
+            batch_text = "空闲" + (f" · 上批 {total} 首" if total else "")
+        self.st_tasks["batch"].setText(batch_text)
+
+        busy = getattr(win, "task", None) is not None
+        search_text = "进行中" if busy else "空闲"
+        last_search = None if busy else self._last_event("搜索", "完成")
+        if last_search:
+            count = last_search["detail"].get("count")
+            if count:
+                search_text += f" · 上次 {count} 首"
+        self.st_tasks["search"].setText(search_text)
+
+        scan_text = "空闲"
+        last_scan = self._last_event("缓存", "扫描")
+        if last_scan:
+            detail = last_scan["detail"]
+            files = detail.get("files", "?")
+            complete = detail.get("complete", "?")
+            head = (
+                f"上次 {last_scan['ms']:.0f} ms · " if last_scan.get("ms") else "上次 "
+            )
+            scan_text = f"{head}{files} 个文件（完整 {complete}）"
+        self.st_tasks["scan"].setText(scan_text)
+
+        plain.append("")
+        plain.append("== 任务 ==")
+        plain.append(f"  批量下载 {batch_text}")
+        plain.append(f"  搜索 {search_text}")
+        plain.append(f"  缓存扫描 {scan_text}")
+
         songs = list(getattr(win, "_queue_songs", []))
         bars = getattr(win, "bars", {})
-        if not songs:
-            out.append("  空")
-        else:
-            for song in songs[:12]:
-                bar = bars.get(song.id)
-                if bar is None:
-                    continue
+        failed_ids = {s.id for s in getattr(win, "_failed", [])}
+        self.st_queue_head.title_label.setText(
+            f"队列 · {len(songs)} 首" if songs else "队列"
+        )
+        self.st_queue_empty.setVisible(not songs)
+        plain.append("")
+        plain.append("== 队列 ==")
+        for index, slot in enumerate(self.st_queue_rows):
+            if index >= len(songs):
+                slot["row"].setVisible(False)
+                continue
+            song = songs[index]
+            bar = bars.get(song.id)
+            slot["name"].setText(song.name)
+            slot["name"].setToolTip(f"{song.name} - {song.artist_text}")
+            if bar is None:
+                slot["bar"].setValue(0)
+                self._set_bar_state(slot["bar"], "dim")
+                tail, color = "等待", "#7a7a82"
+            elif song.id in failed_ids:
+                slot["bar"].setValue(1000)
+                self._set_bar_state(slot["bar"], "fail")
+                tail, color = "失败", "#e8554a"
+            else:
                 mx, val = bar.maximum(), bar.value()
-                pct = f"{val * 100 // mx:>3}%" if mx else "  —"
-                out.append(f"  {song.name[:24]:<24} {pct}")
-        self.status_view.setPlainText("\n".join(out))
+                if mx <= 0:
+                    slot["bar"].setValue(0)
+                    self._set_bar_state(slot["bar"], "dim")
+                    tail, color = "取址中", "#7a7a82"
+                elif val >= mx:
+                    slot["bar"].setValue(1000)
+                    self._set_bar_state(slot["bar"], "normal")
+                    tail, color = "完成", "#4caf7d"
+                else:
+                    slot["bar"].setValue(int(min(val, mx) * 1000 / mx))
+                    self._set_bar_state(slot["bar"], "normal")
+                    tail, color = f"{val * 100 // mx}%", "#96969e"
+            if slot["_tail"] != (tail, color):
+                slot["_tail"] = (tail, color)
+                slot["tail"].setText(tail)
+                slot["tail"].setStyleSheet(f"color:{color};font-size:11px;")
+            slot["row"].setVisible(True)
+            plain.append(f"  {song.name[:28]:<28} {tail}")
+
+        extra = len(songs) - MAX_QUEUE_ROWS
+        if extra > 0:
+            self.st_queue_more.setText(f"另有 {extra} 首未显示，完整进度看主窗口")
+            self.st_queue_more.setVisible(True)
+            plain.append(f"  …另有 {extra} 首")
+        else:
+            self.st_queue_more.setVisible(False)
+
+        # 最近一条错误：只在 5 分钟内显示，否则旧的会一直挂着误导人
+        fresh = bool(self._errors) and (time.time() - self._last_error_ts) < ERROR_BANNER_SEC
+        self.st_error.setVisible(fresh)
+        if fresh:
+            self.st_error.setText(self._errors[-1])
+
+        self._status_plain = "\n".join(plain)
 
     @staticmethod
     def _mmss(ms: int) -> str:
@@ -922,6 +1204,7 @@ class DevWindow(RoundDialog):
         # 不走 _refresh_status：它有「只在状态页刷新」的节流，从指令页调
         # status 会拿到空文本
         self._render_status()
+        return self._status_plain
         return self.status_view.toPlainText()
 
     def _cmd_scan(self) -> str:

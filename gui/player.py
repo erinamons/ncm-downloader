@@ -223,7 +223,9 @@ class PlayerEngine(QObject):
         self._song = song
         # 和 play_song 一样重置回退状态：上一首残留的 _last_pos 会让
         # 「提前结束」检测虚高，_net_fallback 残留会吞掉该有的网络回退
-        self._used_local = False
+        # 这一轮播的确实是磁盘上的文件，_used_local 要为真：
+        # 文件被截断时才能按「播到一半就结束」改走网络，状态页也才显示得对
+        self._used_local = True
         self._net_fallback = False
         self._last_pos = 0
         self._current_path = None
