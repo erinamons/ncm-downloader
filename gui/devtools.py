@@ -384,16 +384,11 @@ class DevWindow(RoundDialog):
         if win is None:
             from gui.devhelp import DevHelpDialog
 
-            win = DevHelpDialog(self, on_goto=self._goto_page)
+            win = DevHelpDialog(self)
             self._help_window = win
         win.show()
         win.raise_()
         win.activateWindow()
-
-    def _goto_page(self, index: int) -> None:
-        """帮助里点「跳到该页」时切过去。"""
-        if 0 <= index < len(self.nav_buttons):
-            self.nav_buttons[index].click()
 
     def _detach(self) -> None:
         self._timer.stop()
@@ -402,6 +397,11 @@ class DevWindow(RoundDialog):
             logging.getLogger().removeHandler(self._handler)
             self._handler = None
         trace_mod.remove_listener(self._on_trace)
+        # 帮助窗口是非模态的独立窗口，面板关掉后它会留在屏幕上变成孤儿：
+        # 那时它已经没有父窗口可依附，用户只能自己找关闭按钮
+        help_win = getattr(self, "_help_window", None)
+        if help_win is not None and help_win.isVisible():
+            help_win.close()
 
     def done(self, result: int) -> None:
         # QDialog 的关闭按钮走 done()，不经过 closeEvent；两条路都要摘干净

@@ -763,6 +763,13 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        # Qt 默认的占位文字是纯黑，深色输入框上等于看不见——搜索框的
+        # 「搜索歌名或粘贴链接」就是这样。统一调成中性灰
+        app = QApplication.instance()
+        if app is not None:
+            palette = app.palette()
+            palette.setColor(QPalette.PlaceholderText, QColor("#7d7d86"))
+            app.setPalette(palette)
         _migrate_legacy_config()
         self.settings = _open_settings()
         # 旧版本会记住窗口几何，现在改成每次居中打开，把残留键清掉
