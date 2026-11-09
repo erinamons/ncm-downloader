@@ -32,6 +32,11 @@ pip install pyflakes pyinstaller        # 静态检查与打包
 - 颜色、字体、圆角统一写在 `gui/style.py`。新增界面代码应尽量避免裸色值；确实需要时
   集中在一个函数或常量里。
 - 流程埋点走 `ncm.trace.trace()`，不要直接 `print` 或往 UI 里塞日志字符串。
+- **不要用 `QMessageBox`**。提示、确认一律走 `gui.dialog.MessageDialog`：它和主窗口
+  同一套无边框圆角外观，`MessageDialog.info(...)` / `MessageDialog.ask(...)` 覆盖多数
+  场景；要分区展示就实例化后往 `add_heading / add_card / add_row` 里填，最后
+  `add_button` + `finish()` + `exec_()`。`QMessageBox` 在 Windows 上会画系统标题栏、
+  蓝色图标和浅色按钮，和深色界面明显不是一套。
 
 ## 代码风格
 
@@ -80,6 +85,8 @@ log.info("...")
 | 播放失败 | `PlayerEngine._on_error()` 的日志行（后端 / 格式 / error / 文件大小） |
 | 缓存列表为空 | `cache.default_cache_dir()` 是否命中；`cache.scan()` 是否有 `.uc` 文件 |
 | 界面卡顿 | 开发者面板「状态」页看队列与任务；时间线看是否有步骤耗时异常 |
+| 弹窗样式不对（白底/系统标题栏） | 是不是还在用 `QMessageBox`，改成 `MessageDialog` |
+| 弹窗底部多一块空白 | 内容里有开了 `wordWrap` 的 QLabel，见维护手册「Qt 控件与样式踩坑」 |
 
 ### 界面截图
 

@@ -45,7 +45,7 @@ ncm-dl.bat ──► ncm/cli.py  (同一条链路，无 GUI 依赖)
 | `gui/player.py` | `PlayerEngine`（QMediaPlayer 封装，含兼容播放兜底）+ `TopBar` |
 | `gui/table.py` | `FluidTable`：所有列可拖，剩余宽度给曲名列 |
 | `gui/workers.py` | `Task` / `BatchTask`：QThread 包装，结果用信号回主线程 |
-| `gui/dialog.py` | `RoundDialog`：对话框基类，复用圆角/阴影/标题栏 |
+| `gui/dialog.py` | `RoundDialog`：对话框基类，复用圆角/阴影/标题栏；`MessageDialog`：统一样式的提示 / 确认窗口（替代 `QMessageBox`） |
 | `gui/devtools.py` | 开发者面板：流程时间线、日志、问题、组件、指令台、环境、诊断包 |
 | `gui/devhelp.py` | 开发者面板的帮助（条目清单 + 搜索） |
 | `gui/help.py` | 面向用户的帮助（按钮图解，F1 打开） |
@@ -117,6 +117,7 @@ logging（root）   ──┴─► 队列 ──► QTimer(140ms) ──► 时
 | 历史浮层 | 主窗口内子控件，非 `Qt::Popup` | Popup 会占住鼠标 grab，打开设置等对话框会卡住 |
 | 列表列宽 | 全部 `Interactive`，手动分配余量 | Qt 的 `Stretch` 模式下列边界拖不动，且会反向挤占 |
 | 面板页签 | 一行互斥按钮 + `QStackedWidget` | 6 个标签在默认宽度下会被挤掉并出现滚动箭头 |
+| 提示窗口 | 一律走 `MessageDialog`，禁用 `QMessageBox` | `QMessageBox` 会画系统标题栏、蓝色图标和浅色按钮，和深色圆角界面不是一套 |
 | CLI 输出 | `--json` 时 stdout 单行 JSON，过程走 stderr | 既要人看得懂表格，也要程序能直接解析 |
 | 线程模型 | 所有网络/磁盘操作走 `Task`，UI 只收信号 | 保证主线程不阻塞，进度更新不会重入 |
 

@@ -331,9 +331,15 @@ def report(cache_dir: Path | str) -> dict[str, object]:
     recent: list[tuple[float, str]] = []
     for p in files:
         try:
-            recent.append((p.stat().st_mtime, f"{p.name}（{p.stat().st_size / 1048576:.1f} MB）"))
+            stat = p.stat()
         except OSError:
             continue
+        # 碎片文件用 MB 显示会变成 0.0 MB，小于 1 MB 的一律按 KB 说
+        if stat.st_size >= 1048576:
+            size_text = f"{stat.st_size / 1048576:.1f} MB"
+        else:
+            size_text = f"{stat.st_size / 1024:.0f} KB"
+        recent.append((stat.st_mtime, f"{p.name}（{size_text}）"))
     stats["recent"] = [text for _, text in sorted(recent, reverse=True)[:3]]
 
     # 按子目录分组：不同客户端版本会把缓存摊到不同层，

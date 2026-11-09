@@ -40,7 +40,6 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QMessageBox,
     QFileDialog,
     QFormLayout,
     QGraphicsOpacityEffect,
@@ -91,7 +90,7 @@ from ncm.targets import parse_target
 from ncm.transcode import ffmpeg_path
 from gui import icons
 from gui.combo import style_combo
-from gui.dialog import RoundDialog
+from gui.dialog import MessageDialog, RoundDialog
 from gui.help import HelpDialog
 from gui.inputs import HistoryLineEdit
 from gui.shadow import clip_outside_window, render_shadow
@@ -661,36 +660,139 @@ class SettingsDialog(RoundDialog):
         self.accept()
 
     def _show_cache_report(self) -> None:
+        dlg = self._build_cache_report()
+        if dlg is not None:
+            dlg.exec_()
+
+    def _build_cache_report(self) -> MessageDialog | None:
+        """构建诊断窗口但不显示——单独拿出来方便截图和测试。"""
         from ncm import cache as cache_mod
 
         root = self.cache_dir or cache_mod.default_cache_dir()
         if not root:
-            QMessageBox.information(self, "缓存诊断", "还没找到缓存目录，先点「自动检测」。")
-            return
+            dlg = MessageDialog(
+                self,
+                "缓存诊断",
+                "还没找到缓存目录。先点「自动检测」，或者手动指定客户端缓存所在的文件夹。",
+                tone="warn",
+            )
+            dlg.add_button("好", primary=True)
+            dlg.finish()
+            return dlg
+
         stats = cache_mod.report(root)
-        lines = [
-            f"目录：{stats['root']}",
-            f"是否存在：{'是' if stats['exists'] else '否'}",
-            "",
-            f".uc 文件：{stats['files']} 个",
-            f"可解析：{stats['parsed']} 个",
-            f"  已缓存完：{stats['complete']}",
-            f"  未缓存完：{stats['partial']}（仍会列出来，导出可能只有片段）",
-            f"  小于 100 KB：{stats['tiny']}（碎片，列表里会略过）",
-        ]
-        if stats.get("dirs"):
-            lines.append("")
-            lines.append("按子目录分布：")
-            lines.extend(f"  {rel}：{n} 个" for rel, n in stats["dirs"][:6])
-        if stats["unparsed"]:
-            lines.append("")
-            lines.append("文件名不符合 <id>-<档位>-<hash>.uc 的：")
-            lines.extend(f"  {name}" for name in stats["unparsed"])
-        if stats["recent"]:
-            lines.append("")
-            lines.append("最近改动的三个文件：")
-            lines.extend(f"  {name}" for name in stats["recent"])
-        QMessageBox.information(self, "缓存诊断", "\n".join(lines))
+        exists = bool(stats["exists"])
+        files = int(stats["files"])
+        parsed = int(stats["parsed"])
+        complete = int(stats["complete"])
+        partial = int(stats["partial"])
+        tiny = int(stats["tiny"])
+        unparsed = list(stats["unparsed"])
+        recent = list(stats["recent"])
+        dirs = list(stats.get("dirs") or [])
+
+        # 先给一句结论：大多数人是想知道「为什么列表里没歌」
+        extra = max(0, files - parsed)
+        if not exists:
+            tone = "warn"
+            summary = "这个目录不存在。可能还没在客户端下过歌，或者指定的位置不对。"
+        elif parsed == 0:
+            tone = "warn"
+            summary = (
+                f"目录里有 {files} 个 .uc 文件，但没有一个能解析，多半不是客户端的缓存目录。"
+            )
+        elif partial or tiny or extra:
+            tone = "warn"
+            reasons = []
+            if partial:
+                reasons.append(f"{partial} 首没下完")
+            if tiny:
+                reasons.append(f"{tiny} 个文件过小")
+            if extra:
+                reasons.append(f"{extra} 个文件名不符合规则")
+            summary = f"{parsed} 首可解析，" + "、".join(reasons) + "。"
+        else:
+            tone = "ok"
+            summary = f"{parsed} 首缓存文件都能解析，且已缓存完整。"
+
+        dlg = MessageDialog(self, "缓存诊断", summary, tone=tone, width=560)
+
+        dlg.add_heading("目录")
+        card = dlg.add_card()
+        # 路径单独占一行：塞进「名称 + 数值」两列会被挤成奇怪的折行
+        dlg.add_text(str(stats["root"]), mono=True, layout=card)
+        dlg.add_row(
+            card,
+            "状态",
+            "目录存在" if exists else "目录不存在",
+            color="#7fd0a2" if exists else "#e0b357",
+        )
+
+        if exists:
+            dlg.add_heading("文件统计")
+            card = dlg.add_card()
+            dlg.add_row(card, ".uc 文件", f"{files} 个", value_width=56)
+            dlg.add_row(card, "可解析", f"{parsed} 个", value_width=56)
+            dlg.add_row(
+                card,
+                "已缓存完",
+                str(complete),
+                color="#7fd0a2" if complete else "",
+                value_width=56,
+            )
+            dlg.add_row(
+                card,
+                "未缓存完",
+                str(partial),
+                "仍会列出来，导出可能只有片段",
+                color="#e0b357" if partial else "#6f6f78",
+                value_width=56,
+            )
+            dlg.add_row(
+                card,
+                "小于 100 KB",
+                str(tiny),
+                "碎片，列表里会略过",
+                color="#e0b357" if tiny else "#6f6f78",
+                value_width=56,
+            )
+
+            if dirs:
+                dlg.add_heading("按子目录分布")
+                card = dlg.add_card()
+                for rel, count in dirs[:6]:
+                    where = "缓存根目录" if rel in (".", "") else rel
+                    dlg.add_row(card, where, f"{count} 个")
+
+            if unparsed:
+                dlg.add_heading("文件名不符合 <id>-<档位>-<hash>.uc")
+                card = dlg.add_card()
+                for name in unparsed:
+                    dlg.add_text(name, mono=True, layout=card)
+
+            if recent:
+                dlg.add_heading("最近改动的文件")
+                card = dlg.add_card()
+                for name in recent:
+                    dlg.add_text(name, mono=True, layout=card)
+
+        dlg.add_button("打开缓存目录", action=self._open_cache_dir)
+        dlg.add_button("好", primary=True)
+        dlg.finish()
+        return dlg
+
+    def _open_cache_dir(self) -> None:
+        from ncm import cache as cache_mod
+
+        root = self.cache_dir or cache_mod.default_cache_dir()
+        if not root:
+            return
+        target = Path(root)
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
     def _clear_parts(self) -> None:
         """删掉保存目录里没下完的 .part。先算清楚再问，别一声不响删。"""
@@ -707,15 +809,15 @@ class SettingsDialog(RoundDialog):
                 total += path.stat().st_size
             except OSError:
                 continue
-        answer = QMessageBox.question(
+        ok = MessageDialog.ask(
             self,
             "清理下载残留",
             f"找到 {len(files)} 个未完成的临时文件，共 {total / 1048576:.1f} MB。\n"
             "删掉后这些歌下次要重新下载，确定清理吗？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            yes="清理",
+            tone="warn",
         )
-        if answer != QMessageBox.Yes:
+        if not ok:
             return
         removed = 0
         freed = 0
@@ -3325,12 +3427,13 @@ class MainWindow(QMainWindow):
         need = len(songs) * per_song * 1024 * 1024 + 256 * 1024 * 1024
         if free >= need:
             return True
-        QMessageBox.warning(
+        MessageDialog.info(
             self,
             "空间不够",
             f"目标盘剩余 {free / 1073741824:.1f} GB，按当前音质"
             f"（每首约 {per_song} MB）大约需要 {need / 1073741824:.1f} GB。\n"
             "请清理空间或换个保存目录。",
+            tone="warn",
         )
         self.status_label.setText("空间不足，已取消下载")
         return False
@@ -3892,15 +3995,14 @@ class MainWindow(QMainWindow):
                 f"已开启联网补齐；上一批有 {len(songs)} 首未缓存完，重新导出即可"
             )
             return
-        answer = QMessageBox.question(
+        ok = MessageDialog.ask(
             self,
             "联网补齐",
             f"上一批有 {len(songs)} 首因为缓存没下完被跳过了。\n"
             "现在联网补齐这些歌吗？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
+            yes="补齐",
         )
-        if answer != QMessageBox.Yes:
+        if not ok:
             return
         self._partial_skipped = []
         self._start_batch(songs)

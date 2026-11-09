@@ -265,6 +265,54 @@ reparent 发生在之后。
 帮助窗口的 parent 是开发者面板，但面板 `close()` 时它仍留在屏幕上（Qt 只对
 window 类型的子控件在 parent 销毁时处理）。需要在面板的 `_detach()` 里显式关闭。
 
+#### QMessageBox 会破坏整套深色界面
+
+现象：「缓存诊断」弹出来是白底 + 系统标题栏 + 蓝色信息图标 + 浅色按钮，和主窗口
+完全不像同一个程序。
+
+`QMessageBox` 是系统原生窗口，不走应用 QSS。所以提示 / 确认一律用
+`gui.dialog.MessageDialog`：
+
+```python
+MessageDialog.info(self, "空间不够", "……", tone="warn")
+if not MessageDialog.ask(self, "清理下载残留", "……", yes="清理", tone="warn"):
+    return
+```
+
+需要分区展示就实例化，`add_heading / add_card / add_row / add_text` 往里填，最后
+`add_button(...)` + `finish()` + `exec_()`。`tone` 取 `ok / info / warn / error`，
+只影响左上角那个状态徽标。`finish()` 会在内容超过 600px 时自动套滚动区。
+
+#### 开了 wordWrap 的 QLabel 会把窗口撑出一块空白
+
+现象：内容只有两行字，窗口却有近百像素的多余高度，按钮浮在中间。
+
+`QLabel::sizeHint()` 在 `wordWrap=True` 时按「很窄的宽度」估算行数。一行 15px 高的
+文件名会被报成 45px，卡片和窗口跟着虚高。
+
+修法：定稿尺寸前按真实可用宽度锁高度（见 `MessageDialog.finish()`）：
+
+```python
+shown = label.heightForWidth(available_width)
+if shown > 0:
+    label.setFixedHeight(shown)
+```
+
+只在能排成一行时才关掉换行并 `setFixedHeight`；确实要折行的长文本保持原样。
+
+#### PyQt 里 QLayout 的布尔值是 False
+
+现象：`add_text(text, layout=card_layout)` 里写成 `(layout or self.content_layout)`
+时，传进来的卡片布局被默默丢掉，文字全跑到卡片外面，卡片变成一个空框。
+
+```python
+target = layout if layout is not None else self.content_layout   # 正确
+target = layout or self.content_layout                            # 错误
+```
+
+PyQt 的 `QLayout` 没有 `__len__`，`bool()` 走的是 sip 的「底层对象是否有效」判断，
+结果是 False。同类坑也适用于部分 Qt 对象，判断「有没有传」时一律用 `is None`。
+
 ## 三、接口相关
 
 ### 音源与身份
