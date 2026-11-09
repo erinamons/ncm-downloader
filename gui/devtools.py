@@ -130,6 +130,7 @@ class DevWindow(RoundDialog):
         self._keyword = ""
         self._scope = "全部"
         self._only_fail = False
+        self._last_step: tuple | None = None  # (key, item, count, ts)
 
         body = self.body_layout
         body.setContentsMargins(14, 4, 14, 12)
@@ -166,6 +167,10 @@ class DevWindow(RoundDialog):
         self.count_label.setStyleSheet("color:#96969e;")
         filters.addWidget(self.count_label)
         filters.addStretch(1)
+        self.follow = QCheckBox("自动跟随")
+        self.follow.setToolTip("关闭后新事件不再把列表拉到底，方便往回翻")
+        self.follow.setChecked(True)
+        filters.addWidget(self.follow)
         btn_clear_steps = QPushButton("清空")
         btn_clear_steps.clicked.connect(self._clear_views)
         filters.addWidget(btn_clear_steps)
@@ -277,15 +282,20 @@ class DevWindow(RoundDialog):
         self._attach()
         self._refresh_env()
 
-    def reject(self) -> None:  # 标题栏的关闭按钮走这里
-        self.close()
-
-    def closeEvent(self, event) -> None:  # noqa: N802
+    def _detach(self) -> None:
         self._timer.stop()
         if self._handler is not None:
             logging.getLogger().removeHandler(self._handler)
             self._handler = None
         trace_mod.remove_listener(self._on_trace)
+
+    def done(self, result: int) -> None:
+        # QDialog 的关闭按钮走 done()，不经过 closeEvent；两条路都要摘干净
+        self._detach()
+        super().done(result)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._detach()
         super().closeEvent(event)
 
     # ---------------- 构建 ----------------
@@ -371,6 +381,7 @@ class DevWindow(RoundDialog):
         self.err_view.clear()
         self.tabs.setTabText(1, "问题 0")
         self.count_label.setText("0 步")
+        self._last_step = None
 
     def _flush(self) -> None:
         dirty_log = False
@@ -403,7 +414,8 @@ class DevWindow(RoundDialog):
                     self._append_step(event)
                     appended = True
             if appended:
-                self.tree.scrollToBottom()
+                if self.follow.isChecked():
+                    self.tree.scrollToBottom()
                 self.count_label.setText(f"{len(self._steps)} 步")
         else:
             while True:
@@ -454,6 +466,7 @@ class DevWindow(RoundDialog):
     def _rebuild_steps(self) -> None:
         self.tree.clear()
         self._groups.clear()
+        self._last_step = None
         for event in self._steps:
             if self._step_match(event):
                 self._append_step(event)
@@ -466,6 +479,15 @@ class DevWindow(RoundDialog):
         detail = " ".join(f"{k}={v}" for k, v in (event.get("detail") or {}).items())
         color = {"ok": "#6fbf8f", "fail": "#e8554a", "skip": "#c9a45c"}.get(event["status"], "#96969e")
         group = event.get("group") or ""
+        key = (event["scope"], event["step"], event["status"], detail, group)
+        last = self._last_step
+        if last is not None and last[0] == key and event["t"] - last[3] <= 8:
+            # 自动刷新这类重复事件：不新增行，改成在原行上标次数
+            item, count = last[1], last[2] + 1
+            item.setText(3, took)
+            item.setText(4, f"{detail} ×{count}".strip())
+            self._last_step = (key, item, count, event["t"])
+            return
         if group:
             key = f"{event['scope']}|{group}"
             top = self._groups.get(key)
@@ -480,10 +502,12 @@ class DevWindow(RoundDialog):
             child.setForeground(2, QColor(color))
             top.addChild(child)
             top.setExpanded(True)
+            item = child
         else:
             item = QTreeWidgetItem([clock, f"{event['scope']} · {event['step']}", status, took, detail])
             item.setForeground(2, QColor(color))
             self.tree.addTopLevelItem(item)
+        self._last_step = (key, item, 1, event["t"])
         if self.tree.topLevelItemCount() > 800:
             for _ in range(200):
                 gone = self.tree.takeTopLevelItem(0)

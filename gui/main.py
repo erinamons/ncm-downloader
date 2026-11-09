@@ -827,6 +827,7 @@ class MainWindow(QMainWindow):
         self._dl_progress: dict[int, int] = {}
         self._dl_totals: dict[int, int] = {}
         self._dl_sample = None
+        self._scan_log_sig = None
         self._pending_query = ""
         # 切到「仅本地缓存」时若正有任务在跑，扫描请求排队等任务槽空出来；
         # 以前直接丢掉，界面会停在「音源=缓存但列表还是搜索结果」的死状态
@@ -2809,14 +2810,19 @@ class MainWindow(QMainWindow):
             raw_files = len([p for p in Path(root).rglob("*.uc") if p.is_file()])
         except OSError:
             raw_files = -1
-        log.info(
-            "缓存扫描 %s：.uc 文件 %s 个，解析 %d，完整 %d，未完成 %d",
-            root,
-            raw_files,
-            len(entries),
-            len(entries) - len(self._cache_partial),
-            len(self._cache_partial),
-        )
+        # 自动刷新每两秒扫一次。结果没变化就不写日志，否则 app.log 和开发者
+        # 面板会被「缓存扫描」刷满，想找别的问题反而翻不到
+        summary = (str(root), raw_files, len(entries), len(self._cache_partial))
+        if summary != getattr(self, "_scan_log_sig", None):
+            self._scan_log_sig = summary
+            log.info(
+                "缓存扫描 %s：.uc 文件 %s 个，解析 %d，完整 %d，未完成 %d",
+                root,
+                raw_files,
+                len(entries),
+                len(entries) - len(self._cache_partial),
+                len(self._cache_partial),
+            )
         ids = [e.song_id for e in entries]
 
         # 详情走内存缓存：自动刷新每几秒就可能重扫一次，全量重请求接口太浪费，

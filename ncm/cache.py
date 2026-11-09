@@ -18,6 +18,8 @@ from pathlib import Path
 
 from .trace import trace
 
+# 自动刷新每两秒扫一次：结果没变就别往日志和流程里刷屏
+_last_scan_trace: tuple[tuple[int, int], float] = ((0, 0), 0.0)
 _UC_RE = re.compile(r"^(\d+)-(\d+)-([0-9a-f]+)$", re.IGNORECASE)
 _XOR_TABLE = bytes(i ^ 0xA3 for i in range(256))
 _CHUNK = 4 * 1024 * 1024
@@ -153,10 +155,15 @@ def scan(cache_dir: Path | str, max_depth: int = 3) -> list[CacheEntry]:
                 )
             )
     entries.sort(key=lambda e: (e.song_id, -e.rate))
-    trace(
-        "缓存", "扫描", "ok", (time.perf_counter() - started) * 1000,
-        {"files": len(entries), "complete": sum(1 for e in entries if e.complete)},
-    )
+    global _last_scan_trace
+    summary = (len(entries), sum(1 for e in entries if e.complete))
+    now = time.monotonic()
+    if summary != _last_scan_trace[0] or now - _last_scan_trace[1] > 120:
+        _last_scan_trace = (summary, now)
+        trace(
+            "缓存", "扫描", "ok", (time.perf_counter() - started) * 1000,
+            {"files": summary[0], "complete": summary[1]},
+        )
     return entries
 
 
