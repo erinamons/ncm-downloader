@@ -4,6 +4,10 @@
 
 ### 修复
 
+- **run.bat 启动自愈**：WorkBuddy 换了自带 Python 后，依赖会丢，双击直接报
+  `ModuleNotFoundError: No module named 'PyQt5'`。现在逐个候选解释器验证
+  `import PyQt5`，都没有就自动 `pip install -r requirements.txt` 再启动，
+  失败时给出明确的手动命令，不再甩一段 traceback。
 - **兼容播放开关（默认关闭）**：遇到系统放不了的格式（缓存里的 m4a、无损的 flac），
   可以在设置里勾选「兼容播放 → 放不了时自动转换」，由内置 ffmpeg 无损解码成 WAV
   再播放（首次 1~3 秒，临时占用磁盘，约 10 MB/分钟，超 1.2 GB 按最旧的清理）。
