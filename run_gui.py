@@ -1,7 +1,6 @@
 """图形界面启动入口：python run_gui.py"""
 from __future__ import annotations
 
-import logging
 import os
 import sys
 from pathlib import Path
@@ -12,7 +11,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # 客户端缓存解出来是 m4a、无损是 flac，默认后端下必然「播放失败」，只有 mp3/wav
 # 能放。Media Foundation（插件键 "windows"）直接用系统自带解码器，实测
 # m4a / flac / mp3 / wav 全通。必须在 QMediaPlayer 创建前设置。
-os.environ.setdefault("QT_MULTIMEDIA_PREFERRED_PLUGINS", "windows,dsengine")
+def _preferred_backend() -> str:
+    try:
+        from PyQt5.QtCore import QSettings
+
+        from ncm.paths import settings_path
+
+        store = QSettings(str(settings_path()), QSettings.IniFormat)
+        value = (store.value("playback_backend", "", type=str) or "").strip()
+        return value or "windows,dsengine"
+    except Exception:  # noqa: BLE001
+        return "windows,dsengine"
+
+
+os.environ.setdefault("QT_MULTIMEDIA_PREFERRED_PLUGINS", _preferred_backend())
 
 from PyQt5.QtCore import Qt  # noqa: E402
 from PyQt5.QtGui import QIcon  # noqa: E402

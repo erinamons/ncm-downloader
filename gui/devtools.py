@@ -11,6 +11,8 @@ import platform
 import queue
 import re
 import shutil
+import subprocess
+import threading
 import time
 import zipfile
 from collections import deque
@@ -22,6 +24,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -133,6 +136,10 @@ class DevWindow(RoundDialog):
         self._scope = "全部"
         self._only_fail = False
         self._last_step: tuple | None = None  # (key, item, count, ts)
+        self._replaying = False
+        self._cmd_q: queue.Queue = queue.Queue()
+        self._cmd_history: list[str] = []
+        self._cmd_pos = 0
 
         body = self.body_layout
         body.setContentsMargins(14, 4, 14, 12)
@@ -169,6 +176,10 @@ class DevWindow(RoundDialog):
         self.count_label.setStyleSheet("color:#96969e;")
         filters.addWidget(self.count_label)
         filters.addStretch(1)
+        self.replay_btn = QPushButton("导入回放")
+        self.replay_btn.setToolTip("读取诊断包里的 steps.txt，离线查看别人的现场")
+        self.replay_btn.clicked.connect(self._toggle_replay)
+        filters.addWidget(self.replay_btn)
         self.follow = QCheckBox("自动跟随")
         self.follow.setToolTip("关闭后新事件不再把列表拉到底，方便往回翻")
         self.follow.setChecked(True)
@@ -245,6 +256,8 @@ class DevWindow(RoundDialog):
         self.tabs.addTab(self.status_view, "状态")
         self.tabs.addTab(self.log_view, "日志")
         self.tabs.addTab(err_panel, "问题 0")
+        self.tabs.addTab(self._build_components(), "组件")
+        self.tabs.addTab(self._build_console(), "指令")
         self.tabs.addTab(self.env_view, "环境")
         self.tabs.currentChanged.connect(lambda _i: self._refresh_status())
         rv.addWidget(self.tabs, 1)
@@ -390,6 +403,8 @@ class DevWindow(RoundDialog):
     # ---------------- 数据入口 ----------------
 
     def _on_trace(self, event: dict) -> None:
+        if self._replaying:
+            return
         self._event_q.put(event)
 
     def _on_pause(self, state) -> None:
@@ -440,6 +455,11 @@ class DevWindow(RoundDialog):
                 dirty_log = True
         if dirty_err:
             self.tabs.setTabText(2, f"问题 {len(self._errors)}")
+        while True:
+            try:
+                self.cmd_out.appendPlainText(self._cmd_q.get_nowait())
+            except queue.Empty:
+                break
         appended = False
         if not self._paused:
             for _ in range(200):
@@ -645,6 +665,421 @@ class DevWindow(RoundDialog):
                 for key, value in list(self._groups.items()):
                     if value is gone:
                         del self._groups[key]
+
+    # ---------------- 组件 ----------------
+
+    def _build_components(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(10)
+
+        tip = QLabel("改动立即生效；播放后端是进程级设置，切换后需要重启程序。")
+        tip.setStyleSheet("color:#96969e;")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        self.ffmpeg_label = QLabel()
+        self.ffmpeg_label.setWordWrap(True)
+        lay.addWidget(self.ffmpeg_label)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        for label, slot in (
+            ("更换…", self._change_ffmpeg),
+            ("测试", self._test_current_ffmpeg),
+            ("恢复默认", self._reset_ffmpeg),
+        ):
+            btn = QPushButton(label)
+            btn.clicked.connect(slot)
+            row.addWidget(btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        back_row = QHBoxLayout()
+        back_row.setSpacing(8)
+        back_row.addWidget(QLabel("播放后端"))
+        self.backend_box = QComboBox()
+        for label, value in (
+            ("Media Foundation（推荐）", "windows,dsengine"),
+            ("仅 Media Foundation", "windows"),
+            ("仅 DirectShow", "dsengine"),
+        ):
+            self.backend_box.addItem(label, value)
+        self.backend_box.currentIndexChanged.connect(self._on_backend_changed)
+        back_row.addWidget(self.backend_box, 1)
+        lay.addLayout(back_row)
+        self.backend_hint = QLabel()
+        self.backend_hint.setStyleSheet("color:#96969e;")
+        self.backend_hint.setWordWrap(True)
+        lay.addWidget(self.backend_hint)
+
+        self.compat_check = QCheckBox("兼容播放（放不了时用 ffmpeg 转 WAV）")
+        self.compat_check.stateChanged.connect(self._on_compat_changed)
+        lay.addWidget(self.compat_check)
+        self.decode_label = QLabel()
+        self.decode_label.setStyleSheet("color:#96969e;")
+        self.decode_label.setWordWrap(True)
+        lay.addWidget(self.decode_label)
+        lay.addStretch(1)
+        self._refresh_components()
+        return page
+
+    def _refresh_components(self) -> None:
+        try:
+            from ncm import transcode
+
+            path = transcode.ffmpeg_path()
+        except Exception:  # noqa: BLE001
+            path = None
+        self.ffmpeg_label.setText(f"ffmpeg：{path or '未找到'}")
+        self.ffmpeg_label.setStyleSheet(
+            "color:#d8d8dc;" if path else "color:#e8554a;"
+        )
+        saved = (
+            self._win.settings.value("playback_backend", "", type=str)
+            or os.environ.get("QT_MULTIMEDIA_PREFERRED_PLUGINS", "")
+            or "windows,dsengine"
+        )
+        if saved not in ("windows,dsengine", "windows", "dsengine"):
+            saved = "windows,dsengine"
+        self.backend_box.blockSignals(True)
+        self.backend_box.setCurrentIndex(max(0, self.backend_box.findData(saved)))
+        self.backend_box.blockSignals(False)
+        self.backend_hint.setText(
+            f"当前进程使用 {os.environ.get('QT_MULTIMEDIA_PREFERRED_PLUGINS', '默认')}；"
+            "改完点关闭后重新打开程序生效。"
+        )
+        self.compat_check.blockSignals(True)
+        self.compat_check.setChecked(bool(getattr(self._win.player, "compat_play", False)))
+        self.compat_check.blockSignals(False)
+        bad = sorted(getattr(self._win.player, "_bad_formats", []) or [])
+        self.decode_label.setText(
+            "本机直放不了的格式：" + ("、".join(bad) if bad else "暂无（还没遇到过）")
+        )
+
+    def _test_ffmpeg(self, path: str) -> tuple[bool, str]:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            proc = subprocess.run(
+                [path, "-version"], capture_output=True, text=True,
+                timeout=6, creationflags=flags,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)[:80]
+        line = (proc.stdout or proc.stderr or "").strip().splitlines()
+        return proc.returncode == 0, (line[0][:90] if line else "无输出")
+
+    def _change_ffmpeg(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 ffmpeg", "", "ffmpeg (ffmpeg*.exe);;可执行文件 (*.exe)"
+        )
+        if not path:
+            return
+        if "ffmpeg" not in Path(path).name.lower():
+            self.status.setText("文件名里没有 ffmpeg，已拒绝")
+            return
+        ok, text = self._test_ffmpeg(path)
+        if not ok:
+            self.status.setText(f"不可用：{text}")
+            return
+        self._win.settings.setValue("ffmpeg_path", path)
+        from ncm import transcode
+
+        transcode.set_ffmpeg_override(path)
+        self._refresh_components()
+        self.status.setText(f"已替换：{text}")
+
+    def _test_current_ffmpeg(self) -> None:
+        from ncm import transcode
+
+        path = transcode.ffmpeg_path()
+        if not path:
+            self.status.setText("没有可用的 ffmpeg")
+            return
+        ok, text = self._test_ffmpeg(path)
+        self.status.setText(("可用：" if ok else "不可用：") + text)
+
+    def _reset_ffmpeg(self) -> None:
+        self._win.settings.setValue("ffmpeg_path", "")
+        from ncm import transcode
+
+        transcode.set_ffmpeg_override(None)
+        self._refresh_components()
+        self.status.setText("已恢复默认查找顺序")
+
+    def _on_backend_changed(self, *_args) -> None:
+        value = self.backend_box.currentData()
+        self._win.settings.setValue("playback_backend", value)
+        self.status.setText(f"已记录 {value}，重启程序后生效")
+
+    def _on_compat_changed(self, state) -> None:
+        enabled = state == Qt.Checked
+        self._win.settings.setValue("compat_play", enabled)
+        self._win.player.compat_play = enabled
+        self.status.setText("兼容播放已" + ("开启" if enabled else "关闭"))
+
+    # ---------------- 指令台 ----------------
+
+    def _build_console(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+        hint = QLabel("输入 help 查看可用命令；命令直接作用在当前窗口上，危险操作会二次确认。")
+        hint.setStyleSheet("color:#96969e;")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        self.cmd_out = self._make_view()
+        lay.addWidget(self.cmd_out, 1)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.cmd_in = QLineEdit()
+        self.cmd_in.setPlaceholderText("命令，如：url 585404")
+        self.cmd_in.returnPressed.connect(self._run_command)
+        row.addWidget(self.cmd_in, 1)
+        btn_run = QPushButton("执行")
+        btn_run.clicked.connect(self._run_command)
+        row.addWidget(btn_run)
+        btn_clear = QPushButton("清空")
+        btn_clear.clicked.connect(lambda: self.cmd_out.clear())
+        row.addWidget(btn_clear)
+        lay.addLayout(row)
+        return page
+
+    def _commands(self) -> dict:
+        return {
+            "help": (self._cmd_help, "列出命令"),
+            "status": (lambda a: self._status_text(), "打印当前状态"),
+            "scan": (lambda a: self._cmd_scan(), "重新扫描缓存"),
+            "cache": (self._cmd_cache, "cache clear：清空播放缓存"),
+            "compat": (self._cmd_compat, "compat on|off"),
+            "backend": (lambda a: self._cmd_backend(), "显示后端与格式能力"),
+            "source": (self._cmd_source, "source client|web|cache"),
+            "log": (self._cmd_log, "log debug|info"),
+            "diag": (lambda a: self._cmd_diag(), "导出诊断包"),
+            "open": (self._cmd_open, "open cache|download|data|log"),
+            "url": (self._cmd_url, "url <歌曲id>：打印取址结果"),
+            "clear": (lambda a: self.cmd_out.clear() or "", "清空输出"),
+        }
+
+    def _cmd_help(self, _args) -> str:
+        return "\n".join(f"{name:<8}{desc}" for name, (_fn, desc) in self._commands().items())
+
+    def _run_command(self) -> None:
+        text = self.cmd_in.text().strip()
+        if not text:
+            return
+        self.cmd_in.clear()
+        self.cmd_out.appendPlainText(f"> {text}")
+        parts = text.split()
+        name, args = parts[0].lower(), parts[1:]
+        entry = self._commands().get(name)
+        if entry is None:
+            self.cmd_out.appendPlainText("未知命令，输入 help 查看")
+            return
+        try:
+            out = entry[0](args)
+        except Exception as exc:  # noqa: BLE001
+            out = f"执行失败：{type(exc).__name__}: {exc}"
+        if out:
+            self.cmd_out.appendPlainText(out)
+
+    def _status_text(self) -> str:
+        self._refresh_status()
+        return self.status_view.toPlainText()
+
+    def _cmd_scan(self) -> str:
+        self._win.on_load_cache()
+        return "已触发缓存重扫"
+
+    def _cmd_cache(self, args) -> str:
+        if args and args[0] != "clear":
+            return "用法：cache clear"
+        from ncm import cache as cache_mod
+
+        count, freed = cache_mod.clear_player_cache()
+        return f"已清理播放缓存 {count} 个（{freed / 1048576:.0f} MB）"
+
+    def _cmd_compat(self, args) -> str:
+        if not args or args[0] not in ("on", "off"):
+            return f"当前：{'开' if self._win.player.compat_play else '关'}；用法：compat on|off"
+        enabled = args[0] == "on"
+        self._win.settings.setValue("compat_play", enabled)
+        self._win.player.compat_play = enabled
+        self._refresh_components()
+        return "兼容播放已" + ("开启" if enabled else "关闭")
+
+    def _cmd_backend(self) -> str:
+        import os as _os
+
+        backend = _os.environ.get("QT_MULTIMEDIA_PREFERRED_PLUGINS", "默认")
+        bad = sorted(getattr(self._win.player, "_bad_formats", []) or [])
+        return (
+            f"后端 {backend}\n放不了的格式：{', '.join(bad) if bad else '无'}\n"
+            f"ffmpeg：{self._ffmpeg_line()}"
+        )
+
+    def _ffmpeg_line(self) -> str:
+        try:
+            from ncm import transcode
+
+            return transcode.ffmpeg_path() or "未找到"
+        except Exception:  # noqa: BLE001
+            return "未知"
+
+    def _cmd_source(self, args) -> str:
+        if not args:
+            return f"当前音源 {self._win._current_source()}"
+        mapping = {"client": "client", "web": "web", "cache": "cache"}
+        if args[0] not in mapping:
+            return "用法：source client|web|cache"
+        idx = self._win.source_box.findData(mapping[args[0]])
+        if idx < 0:
+            return "界面里没有这个音源"
+        self._win.source_box.setCurrentIndex(idx)
+        return f"已切到 {args[0]}"
+
+    def _cmd_log(self, args) -> str:
+        if not args or args[0] not in ("debug", "info"):
+            return f"当前 {logging.getLevelName(logging.getLogger().level)}；用法：log debug|info"
+        logging.getLogger().setLevel(logging.DEBUG if args[0] == "debug" else logging.INFO)
+        return f"日志级别改为 {args[0]}"
+
+    def _cmd_diag(self) -> str:
+        self._export_diagnostics()
+        return self.status.text()
+
+    def _cmd_open(self, args) -> str:
+        if not args:
+            return "用法：open cache|download|data|log"
+        key = args[0]
+        if key == "cache":
+            self._open_dir(getattr(self._win, "cache_dir", None))
+        elif key == "download":
+            self._open_dir(getattr(self._win, "out_dir", None))
+        elif key == "data":
+            self._open_dir(data_dir())
+        elif key == "log":
+            self._open_log_file()
+        else:
+            return "用法：open cache|download|data|log"
+        return f"已打开 {key}"
+
+    def _cmd_url(self, args) -> str:
+        if not args:
+            return "用法：url <歌曲id>"
+        try:
+            sid = int(args[0])
+        except ValueError:
+            return "歌曲 id 必须是数字"
+        level = args[1] if len(args) > 1 else (self._win.level_box.currentData() or "exhigh")
+        threading.Thread(target=self._url_worker, args=(sid, level), daemon=True).start()
+        return f"查询中：{sid}（{level}）"
+
+    def _url_worker(self, sid: int, level: str) -> None:
+        try:
+            src = self._win.backend.song_url(sid, level)
+            text = f"{sid}: ext={src.ext} br={src.br} size={src.size}\n  {src.url[:160]}"
+        except Exception as exc:  # noqa: BLE001
+            text = f"{sid}: 失败 {type(exc).__name__}: {exc}"
+        self._cmd_q.put(text)
+
+    # ---------------- 回放 ----------------
+
+    def _toggle_replay(self) -> None:
+        if self._replaying:
+            self._exit_replay()
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入回放", "", "诊断包 (*.zip);;文本 (*.txt)"
+        )
+        if not path:
+            return
+        try:
+            if path.lower().endswith(".zip"):
+                with zipfile.ZipFile(path) as zf:
+                    text = zf.read("steps.txt").decode("utf-8", "replace")
+            else:
+                text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:  # noqa: BLE001
+            self.status.setText(f"读取失败：{exc}")
+            return
+        events = self._parse_steps(text)
+        if not events:
+            self.status.setText("文件里没有可回放的步骤")
+            return
+        self._replaying = True
+        self._steps.clear()
+        self._groups.clear()
+        self.tree.clear()
+        self._last_step = None
+        for event in events:
+            self._steps.append(event)
+        self._rebuild_steps()
+        self.replay_btn.setText("退出回放")
+        self.status.setText(f"回放中 · {len(events)} 步（实时事件已暂停）")
+
+    def _exit_replay(self) -> None:
+        self._replaying = False
+        self.replay_btn.setText("导入回放")
+        self._steps.clear()
+        self._groups.clear()
+        self.tree.clear()
+        self._last_step = None
+        self.count_label.setText("0 步")
+        self.status.setText("已退出回放，恢复实时事件")
+
+    @staticmethod
+    def _parse_steps(text: str) -> list[dict]:
+        events: list[dict] = []
+        now = time.localtime()
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("---"):
+                continue
+            parts = line.split(None, 2)
+            if len(parts) < 3:
+                continue
+            clock, scope, rest = parts
+            try:
+                hh, mm, ss = (int(x) for x in clock.split(":"))
+            except ValueError:
+                continue
+            group = ""
+            if rest.startswith("[") and "]" in rest:
+                group, rest = rest[1:].split("]", 1)
+                rest = rest.strip()
+            tokens = rest.split()
+            if len(tokens) < 2:
+                continue
+            step, status = tokens[0], tokens[1]
+            idx = 2
+            ms = None
+            if idx < len(tokens) and tokens[idx].endswith("ms"):
+                try:
+                    ms = float(tokens[idx][:-2])
+                except ValueError:
+                    ms = None
+                idx += 1
+            detail = {}
+            for token in tokens[idx:]:
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    detail[key] = value
+            events.append(
+                {
+                    "t": time.mktime(
+                        (now.tm_year, now.tm_mon, now.tm_mday, hh, mm, ss, 0, 0, -1)
+                    ),
+                    "scope": scope,
+                    "step": step,
+                    "status": status,
+                    "ms": ms,
+                    "detail": detail,
+                    "group": group,
+                }
+            )
+        return events
 
     # ---------------- 诊断 ----------------
 

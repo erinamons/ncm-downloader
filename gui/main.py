@@ -824,6 +824,13 @@ class MainWindow(QMainWindow):
         # 会把槽位清空，正在跑的新任务若没人引用就会被 GC，QThread 析构直接 abort
         self._live_tasks: set = set()
         self._dev_window = None
+        from ncm import transcode as transcode_mod
+        from ncm.paths import settings_path as _settings_path
+
+        _store = QSettings(str(_settings_path()), QSettings.IniFormat)
+        transcode_mod.set_ffmpeg_override(
+            _store.value("ffmpeg_path", "", type=str) or None
+        )
         self._dl_progress: dict[int, int] = {}
         self._dl_totals: dict[int, int] = {}
         self._dl_sample = None

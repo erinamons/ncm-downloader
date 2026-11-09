@@ -51,8 +51,19 @@ def _bundled_ffmpeg() -> str | None:
     return None
 
 
+_override: str | None = None
+
+
+def set_ffmpeg_override(path: str | None) -> None:
+    """开发者面板里手动指定的 ffmpeg；None/空 表示恢复默认查找顺序。"""
+    global _override
+    _override = path or None
+
+
 def ffmpeg_path() -> str | None:
-    # 顺序：程序自带 → PATH → Python 包自带
+    # 顺序：手动指定 → 程序自带 → PATH → Python 包自带
+    if _override and Path(_override).is_file():
+        return _override
     bundled = _bundled_ffmpeg()
     if bundled:
         return bundled
