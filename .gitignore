@@ -32,6 +32,10 @@ run-state.json.tmp
 .ncm-index.db
 .ncm-index.db-*
 
+# 本地音乐扫描索引（只是缓存，含本机路径，不入库）
+local-index.json
+local-index.tmp
+
 # 便携模式下的用户数据（含登录 cookie，绝不能提交）
 config.json
 settings.ini

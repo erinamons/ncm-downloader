@@ -15,7 +15,9 @@ _ARROW = (_ASSET_DIR / "arrow_down.png").as_posix()
 _CHECK = (_ASSET_DIR / "check.png").as_posix()
 
 
-def scrollbar_qss(top_margin: int = 5, hide_handle: bool = False) -> str:
+def scrollbar_qss(
+    top_margin: int = 5, hide_handle: bool = False, right_margin: int = 2
+) -> str:
     """竖向滚动条样式。``top_margin`` 是滑槽距控件顶端的像素，用来避开表头。
 
     单独抽成函数是因为：给某个滚动条设了 widget 级样式表之后，应用级 QSS 里
@@ -24,14 +26,18 @@ def scrollbar_qss(top_margin: int = 5, hide_handle: bool = False) -> str:
 
     ``hide_handle`` 给空表用：滚动条仍占着位置（这样视口不会盖住表格圆角），
     但滑块透明，看起来就是「没有滚动条」。
+
+    ``right_margin`` 给卡片内的表格用：滑块往左缩几像素，不压住卡片的圆角。
+    缩进去多少就把滚动条本身加宽多少，滑块宽度保持不变（否则会被挤成一条线）。
     """
     handle_bg = "transparent" if hide_handle else "#55555f"
+    bar_w = 11 + max(0, right_margin - 2)
     return f"""
 QScrollBar:vertical {{
     /* 悬浮式：只留滑块，槽透明。槽带底色会糊住表格右上/右下角的 1px 边框 */
     background: transparent;
-    width: 11px;
-    margin: {top_margin}px 2px 5px 2px;
+    width: {bar_w}px;
+    margin: {top_margin}px {right_margin}px 5px 2px;
     border: none;
 }}
 QScrollBar::handle:vertical {{
@@ -164,6 +170,23 @@ QCheckBox::indicator:checked {{
     border: 1px solid {ACCENT};
     image: url({_CHECK});
 }}
+QRadioButton {{
+    spacing: 7px;
+}}
+QRadioButton::indicator {{
+    width: 14px;
+    height: 14px;
+    border: 1px solid #4a4a52;
+    border-radius: 7px;
+    background: {PANEL};
+}}
+QRadioButton::indicator:hover {{
+    border: 1px solid #6a6a74;
+}}
+QRadioButton::indicator:checked {{
+    background: {ACCENT};
+    border: 1px solid {ACCENT};
+}}
 QComboBox:hover {{
     border: 1px solid #4a4a52;
 }}
@@ -269,6 +292,41 @@ QProgressBar::chunk {{
 /* 进度条的容器默认会继承 QWidget 的实色底，在表格行里形成一块突兀的深色矩形 */
 QWidget#barHolder {{
     background: transparent;
+}}
+
+/* 紧凑模式的下载队列：标题和列表合并成一张卡，圆角/边框只画一次。
+   card 是动态属性：on=有任务（画卡）、empty=空队列（一行提示，不画框）、
+   off=标准窗口（队列是独立表格，自己带框）。
+   有任务时和上面的结果表焊成一块：卡片顶边不出边框、顶角改直角，接缝那条线
+   由结果表的底边框提供——两条 1px 叠起来是 2px，两个圆角贴在一起还会各切
+   一个口，看着就是「两张卡硬挤在一条线上」。 */
+QWidget#queuePanel[card="on"] {{
+    background: {PANEL};
+    border: 1px solid {BORDER};
+    border-top: 0px solid transparent;
+    border-top-left-radius: 0px;
+    border-top-right-radius: 0px;
+    border-bottom-left-radius: 8px;
+    border-bottom-right-radius: 8px;
+}}
+/* 焊死时上面的结果表下半截也得是直角，否则接缝两侧弧度对不上 */
+QTableWidget#resultTable[seam="on"] {{
+    border-bottom-left-radius: 0px;
+    border-bottom-right-radius: 0px;
+}}
+QWidget#queuePanel[card="empty"] {{
+    background: transparent;
+    border: 1px solid transparent;
+}}
+/* 标题行在卡里，不能带自己的实色底 */
+QWidget#queueHeader {{
+    background: transparent;
+}}
+/* 卡里的表格只是内容的载体：边框和底色都交给外面的卡 */
+QTableWidget#queueCardBody {{
+    background: transparent;
+    border: none;
+    border-radius: 0;
 }}
 
 {scrollbar_qss()}

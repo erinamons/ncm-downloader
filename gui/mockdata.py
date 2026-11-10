@@ -229,6 +229,7 @@ class MockData(QObject):
         # 紧凑模式的停靠条/折叠标题、浮层都要一起清，否则还显示「6/6 · 100%」
         win._close_queue_sheet()
         win._update_mini_queue(force=True)
+        win._apply_queue_layout()
         self._switch_source("client")
         # 池子已清空，重画一次视图：标题回到「输入关键词开始搜索」，表格、空提示、
         # 下载按钮一起归位。只清表格的话标题还留着「模拟数据 · 搜索结果 · 共 6 首」

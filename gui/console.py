@@ -126,7 +126,7 @@ VALUE_ALIASES = {
         "hi-res": "hires",
         "高清": "hires",
     },
-    "source": {"客户端": "client", "网页": "web", "缓存": "cache"},
+    "source": {"客户端": "client", "网页": "web", "缓存": "cache", "本地": "local"},
     "compat": {"开": "on", "开启": "on", "关": "off", "关闭": "off"},
     "log": {"调试": "debug", "信息": "info"},
     "open": {
@@ -138,6 +138,7 @@ VALUE_ALIASES = {
     },
     "queue": {"重试": "retry", "清空": "clear", "确认": "yes", "是": "yes"},
     "cache": {"清理": "clear", "清空": "clear"},
+    "history": {"清空": "clear", "清除": "clear"},
     "mock": {
         "歌曲": "songs",
         "搜索": "songs",
@@ -324,7 +325,7 @@ class CommandConsole(QObject):
             "cache": (self._cmd_cache, "cache clear：清空播放缓存"),
             "compat": (self._cmd_compat, "compat on|off"),
             "backend": (lambda a: self._cmd_backend(), "显示后端与格式能力"),
-            "source": (self._cmd_source, "source client|web|cache"),
+            "source": (self._cmd_source, "source client|web|cache|local"),
             "workers": (self._cmd_workers, "workers <1-8>：下载并发"),
             "get": (self._cmd_get, "get <设置键>"),
             "set": (self._cmd_set, "set <设置键> <值>"),
@@ -357,8 +358,8 @@ class CommandConsole(QObject):
         for name, (_fn, desc) in self._commands().items():
             lines.append(f"  {name:<{width}}{desc}")
         lines.append("")
-        lines.append("中文写法举例：帮助 / 统计 / 队列 / 播放 3 / 音量 40 / 音质 无损 / 并发 3")
-        lines.append("            兼容播放 开 / 音源 缓存 / 设置 音质 无损 / 打开 下载 / 模拟数据 队列")
+        lines.append("中文写法：命令名和参数都能写中文，如 帮助 / 队列 重试 / 设置 音质 无损")
+        lines.append("完整对照表：帮助窗口 →「命令行手册」→ 中文写法 / 设置键 / 参数值")
         return "\n".join(lines)
 
     def _cmd_clear(self) -> str:
@@ -610,8 +611,8 @@ class CommandConsole(QObject):
         if not args:
             return f"当前音源 {self._win._current_source()}"
         word = alias_value("source", args[0])
-        if word not in ("client", "web", "cache"):
-            return "用法：source client|web|cache（客户端|网页|缓存）"
+        if word not in ("client", "web", "cache", "local"):
+            return "用法：source client|web|cache|local（客户端|网页|缓存|本地）"
         idx = self._win.source_box.findData(word)
         if idx < 0:
             return "界面里没有这个音源"
@@ -651,7 +652,11 @@ class CommandConsole(QObject):
             sid = int(args[0])
         except ValueError:
             return "歌曲 id 必须是数字"
-        level = args[1] if len(args) > 1 else (self._win.level_box.currentData() or "exhigh")
+        level = (
+            alias_value("level", args[1])
+            if len(args) > 1
+            else (self._win.level_box.currentData() or "exhigh")
+        )
         threading.Thread(target=self._url_worker, args=(sid, level), daemon=True).start()
         return f"查询中：{sid}（{level}）"
 

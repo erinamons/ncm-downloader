@@ -11,14 +11,55 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 
-from PyQt5.QtCore import QAbstractNativeEventFilter, QObject, pyqtSignal
+from PyQt5.QtCore import QAbstractNativeEventFilter, QObject, Qt, pyqtSignal
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QMenu, QSystemTrayIcon
+
+from gui import icons
 
 WM_HOTKEY = 0x0312
 VK_MEDIA_NEXT_TRACK = 0xB0
 VK_MEDIA_PREV_TRACK = 0xB1
 VK_MEDIA_PLAY_PAUSE = 0xB3
+
+# 托盘菜单：圆角深色面板 + 图标 + 分隔线。菜单是独立弹窗，圆角要透出去，
+# 必须同时关掉系统投影并开半透明，否则四角会露出方形黑底。
+_MENU_QSS = """
+QMenu {
+    background: #232327;
+    border: 1px solid #3a3a42;
+    border-radius: 8px;
+    padding: 6px;
+    font-size: 12px;
+}
+QMenu::item {
+    background: transparent;
+    color: #d8d8dc;
+    padding: 7px 26px 7px 8px;
+    margin: 1px 2px;
+    border-radius: 6px;
+}
+QMenu::item:selected {
+    background: #2e2e36;
+    color: #ffffff;
+}
+QMenu::item:disabled {
+    color: #83838d;
+}
+QMenu::icon {
+    left: 8px;
+}
+QMenu::separator {
+    height: 1px;
+    background: #34343c;
+    margin: 5px 8px;
+}
+"""
+
+
+def _elide(text: str, limit: int = 24) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
 
 _HOTKEY_ACTIONS = {
     1: "play_pause",
@@ -75,14 +116,38 @@ class Tray(QObject):
 
     def _build_menu(self) -> QMenu:
         menu = QMenu()
-        menu.addAction("显示主窗口", self.show_window.emit)
+        menu.setStyleSheet(_MENU_QSS)
+        # 菜单是顶层弹窗：不设这两项，系统会画一圈方形阴影，圆角外面就是直角
+        menu.setAttribute(Qt.WA_TranslucentBackground, True)
+        menu.setWindowFlags(
+            menu.windowFlags() | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint
+        )
+
+        # 顶部一行当前曲目：不可点，只当抬头
+        self.now_action = menu.addAction(
+            icons.icon("music", "#8f8f99", 15), "未在播放"
+        )
+        self.now_action.setEnabled(False)
         menu.addSeparator()
-        menu.addAction("播放 / 暂停", self.play_pause.emit)
-        menu.addAction("上一首", self.previous.emit)
-        menu.addAction("下一首", self.next.emit)
+        menu.addAction(
+            icons.icon("maximize-2", "#c8c8d0", 15), "显示主窗口", self.show_window.emit
+        )
         menu.addSeparator()
-        menu.addAction("命令行…", self.console.emit)
-        menu.addAction("退出", self.quit_app.emit)
+        menu.addAction(
+            icons.icon("play", "#c8c8d0", 15), "播放 / 暂停", self.play_pause.emit
+        )
+        menu.addAction(
+            icons.icon("skip-back", "#c8c8d0", 15), "上一首", self.previous.emit
+        )
+        menu.addAction(
+            icons.icon("skip-forward", "#c8c8d0", 15), "下一首", self.next.emit
+        )
+        menu.addSeparator()
+        menu.addAction(
+            icons.icon("terminal", "#c8c8d0", 15), "命令行…", self.console.emit
+        )
+        menu.addSeparator()
+        menu.addAction(icons.icon("power", "#e8554a", 15), "退出", self.quit_app.emit)
         return menu
 
     def _on_activated(self, reason) -> None:
@@ -124,6 +189,10 @@ class Tray(QObject):
 
     def set_now_playing(self, text: str) -> None:
         """托盘悬停提示带上当前曲目，最小化时也能确认在放什么。"""
+        action = getattr(self, "now_action", None)
+        if action is not None:
+            # 菜单抬头跟着换；太长会撑宽整个菜单，截断
+            action.setText(_elide(text) if text else "未在播放")
         if not self.available:
             return
         self.icon.setToolTip(

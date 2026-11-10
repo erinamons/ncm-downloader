@@ -93,6 +93,9 @@ class FluidTable(QTableWidget):
         # 「30 + 固定列 + 160」超过视口宽，最右边的进度列会被裁掉半截
         self.min_fluid = MIN_FLUID
         self._filling = False
+        # 滚动条距右边的像素。标准表格贴着边框就行；紧凑模式的队列把表格
+        # 塞进一张圆角卡里，滑块要往里缩，否则会压在卡的圆角上。
+        self.scroll_right = 2
 
         header = self.horizontalHeader()
         for col in range(cols):
@@ -178,20 +181,28 @@ class FluidTable(QTableWidget):
                 container._ncm_clear_bg = True
 
         # 贴着右边框内侧（右边留 1px 给边框），顶边也让 1px
-        rect = (max(1, self.width() - 1 - bar_w), 1, bar_w, max(1, header_h))
-        if self._corner.geometry().getRect() != rect:
-            self._corner.setGeometry(*rect)
-        if not self._corner.isVisible():
-            self._corner.show()
+        if header_h > 0:
+            rect = (max(1, self.width() - 1 - bar_w), 1, bar_w, max(1, header_h))
+            if self._corner.geometry().getRect() != rect:
+                self._corner.setGeometry(*rect)
+            if not self._corner.isVisible():
+                self._corner.show()
+        elif self._corner.isVisible():
+            # 表头藏起来了（紧凑窗口的队列表）：这块补丁本来只补表头右端的
+            # 那条缝，留着就是卡片右上角一个 1px 的深色点，直接收掉
+            self._corner.hide()
 
         # 真正让滚动条「从表头下面开始」的是它自己的上边距：QScrollBar 的
         # margin 决定了滑槽的起止，把上边距设成表头高度，滑块就整段落在表头
         # 下方，位置是真的在下面而不是被盖住或削断。改容器几何会被 Qt 排版
         # 摆回去，setMask 又会留下一个平口。
         empty = self.rowCount() == 0
-        if getattr(bar, "_ncm_inset", None) != (header_h, empty):
-            bar.setStyleSheet(scrollbar_qss(header_h + 2, hide_handle=empty))
-            bar._ncm_inset = (header_h, empty)
+        right = max(0, int(getattr(self, "scroll_right", 2)))
+        if getattr(bar, "_ncm_inset", None) != (header_h, empty, right):
+            bar.setStyleSheet(
+                scrollbar_qss(header_h + 2, hide_handle=empty, right_margin=right)
+            )
+            bar._ncm_inset = (header_h, empty, right)
 
     def scrollContentsBy(self, dx: int, dy: int) -> None:
         super().scrollContentsBy(dx, dy)

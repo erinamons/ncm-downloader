@@ -47,6 +47,7 @@ from PyQt5.QtWidgets import (
 )
 
 from gui import icons
+from gui.combo import style_combo
 from gui.console import ConsolePanel
 from gui.dialog import RoundDialog, SHADOW
 from gui.style import QSS
@@ -190,6 +191,8 @@ class DevWindow(RoundDialog):
         filters.setSpacing(6)
         self.scope_box = QComboBox()
         self.scope_box.addItems(_SCOPES)
+        # 和主窗口的下拉框用同一套浮层处理：不加就会闪一帧浅色、圆角外露直角
+        style_combo(self.scope_box)
         self.scope_box.currentTextChanged.connect(self._on_scope_changed)
         filters.addWidget(self.scope_box)
         self.only_fail = QCheckBox("只看失败")
@@ -240,6 +243,7 @@ class DevWindow(RoundDialog):
         self.level_box = QComboBox()
         for label, value in (("信息以上", logging.INFO), ("只看警告", logging.WARNING), ("只看错误", logging.ERROR)):
             self.level_box.addItem(label, value)
+        style_combo(self.level_box)
         self.level_box.currentIndexChanged.connect(self._on_filter_changed)
         bar.addWidget(self.level_box)
         self.search = QLineEdit()
@@ -1220,6 +1224,7 @@ class DevWindow(RoundDialog):
             ("仅 DirectShow", "dsengine"),
         ):
             self.backend_box.addItem(label, value)
+        style_combo(self.backend_box)
         self.backend_box.currentIndexChanged.connect(self._on_backend_changed)
         back_row.addWidget(self.backend_box, 1)
         lay.addLayout(back_row)

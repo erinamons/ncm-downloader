@@ -390,21 +390,77 @@ COMMAND_DOCS = [
     },
     {
         "name": "中文写法",
-        "desc": "命令名、设置键、参数值都能用中文写，不用记英文；大小写不敏感，"
-        "全角空格也能识别。下面是最常用的对照。",
-        "usage": "统计 / 概览            stats\n"
-        "队列 / 播放 3 / 停止    queue / play / stop\n"
-        "音量 40 / 音质 无损     volume / level\n"
-        "兼容播放 开             compat on\n"
-        "并发 3                  workers 3\n"
-        "音源 缓存               source cache\n"
-        "设置 音质 极高          set level exhigh\n"
-        "模拟数据 队列           mock queue\n"
-        "帮助 队列               help queue",
-        "example": "> 设置 文件名 歌曲名\nname_pattern = 'title'\n> 设置 分类 按歌手\nfolder_pattern = 'artist'",
-        "notes": "音质档位可写：标准 / 较高 / 极高 / 无损 / 高清；队列形态可写：面板 / 停靠 / 不显示；"
-        "开关类可写：开 / 关 / 是 / 否。也可以中英混着写，例如 设置 level 无损。",
-        "keys": "中文 别名 对照 设置 音质 并发 队列 开关",
+        "desc": "每条命令都有中文写法，参数值也认中文；大小写不敏感，全角空格也能识别。"
+        "下面按「英文命令 → 中文写法」列全，照着抄就行。",
+        "usage": "help     帮助 · 帮助 队列\n"
+        "status   状态\n"
+        "stats    统计 · 概览\n"
+        "queue    队列 · 队列 重试 · 队列 清空 确认\n"
+        "play     播放 3\n"
+        "stop     停止\n"
+        "volume   音量 · 音量 40\n"
+        "level    音质 · 音质 无损\n"
+        "pause    暂停\n"
+        "resume   继续\n"
+        "trace    轨迹 · 事件 · 轨迹 5\n"
+        "mock     模拟数据 队列 · 模拟数据 全部 · 模拟数据 清除\n"
+        "scan     扫描 · 重扫\n"
+        "cache    缓存 清理\n"
+        "compat   兼容 · 兼容播放 开 · 兼容播放 关\n"
+        "backend  后端\n"
+        "source   音源 · 音源 客户端 · 音源 网页 · 音源 缓存 · 音源 本地\n"
+        "workers  并发 · 并发 3 · 线程 3\n"
+        "get      读取 音质 · 读取 并发\n"
+        "set      设置 音质 无损 · 设置 并发 3 · 设置 文件名 歌曲名\n"
+        "log      日志 · 日志 调试 · 日志 信息\n"
+        "reload   重载 · 样式\n"
+        "diag     诊断 · 诊断包\n"
+        "open     打开 下载 · 打开 缓存 · 打开 配置 · 打开 日志\n"
+        "url      取址 585404 · 取址 585404 无损\n"
+        "history  历史 · 历史 清空\n"
+        "copy     复制\n"
+        "clear    清空",
+        "example": "> 队列 清空 确认\n队列已清空\n> 模拟数据 队列 3\n已生成 3 首模拟下载队列，正在跑进度…",
+        "notes": "中英可以混写（设置 level 无损、音源 cache 都能跑）。设置键和参数值的完整中文"
+        "对照见下面「中文 · 设置键」「中文 · 参数值」两张卡片。",
+        "keys": "中文 别名 对照 全部命令 设置 音质 并发 队列 开关",
+    },
+    {
+        "name": "中文 · 设置键",
+        "desc": "get / set 能写的 9 个键都有中文名，键名和值都可以写中文。每个键的含义、"
+        "默认值、可选值在「设置项」分组里。",
+        "usage": "compat_play      兼容播放 / 兼容        设置 兼容播放 开\n"
+        "partial_fallback 未缓存完 / 补齐        设置 未缓存完 关\n"
+        "keep_cache       缓存存档 / 保留缓存     设置 缓存存档 开\n"
+        "to_mp3           转mp3 / 输出格式       设置 输出格式 开\n"
+        "workers          并发 / 线程            设置 并发 3\n"
+        "level            音质                  设置 音质 无损\n"
+        "name_pattern     文件名 / 命名          设置 文件名 歌曲名\n"
+        "folder_pattern   分类 / 文件夹          设置 分类 按歌手\n"
+        "mini_queue       紧凑队列 / 队列形态      设置 紧凑队列 停靠",
+        "example": "> 读取 文件名\nname_pattern = 'artist_title'\n"
+        "> 设置 分类 按歌手/专辑\nfolder_pattern = 'artist_album'",
+        "notes": "只认这 9 个键，写别的会被拒绝；布尔值写 开 / 关，或 true / false 都行。",
+        "keys": "设置键 中文 兼容播放 未缓存完 缓存存档 输出格式 并发 音质 文件名 分类 紧凑队列",
+    },
+    {
+        "name": "中文 · 参数值",
+        "desc": "各命令能写的中文取值。写错时命令会当场列出可选值，不会静默失败。",
+        "usage": "音质      标准 / 较高 / 极高 / 无损 / 高清\n"
+        "音源      客户端 / 网页 / 缓存 / 本地\n"
+        "开关      开 / 开启 / 是 / 启用 · 关 / 关闭 / 否 / 停用\n"
+        "打开      缓存 / 下载 / 配置 / 数据 / 日志\n"
+        "队列      重试 · 清空 确认 · 是\n"
+        "播放缓存  清理 / 清空\n"
+        "模拟数据  歌曲 / 搜索 · 队列 / 下载 · 缓存 · 全部 · 停止 / 清除\n"
+        "文件名    歌手-歌曲名 · 歌曲名 · 歌曲名-歌手\n"
+        "分类      按歌手/专辑 · 按歌手 · 不分文件夹 / 不分类\n"
+        "队列形态  面板 / 折叠面板 · 停靠 / 单行停靠 · 不显示 / 隐藏\n"
+        "日志级别  调试 / 信息",
+        "example": "> 音质 高清\n音质已切到 hires\n> 打开 数据\n已打开 data",
+        "notes": "音质五档对应 standard / higher / exhigh / lossless / hires；"
+        "命名和分类模板只影响之后下载的文件名与目录。",
+        "keys": "参数值 中文 音质 音源 开关 打开 队列 缓存 模拟数据 模板 队列形态 日志",
     },
     {
         "name": "help",
@@ -514,7 +570,7 @@ COMMAND_DOCS = [
         "keys": "scan 扫描 缓存 刷新",
     },
     {
-        "name": "cache clear",
+        "name": "cache",
         "desc": "清空 play-cache 里的解码 / 转码产物，返回清理个数和释放空间。",
         "usage": "cache clear",
         "example": "> cache clear\n已清理播放缓存 12 个（86 MB）",
@@ -540,9 +596,10 @@ COMMAND_DOCS = [
     {
         "name": "source",
         "desc": "切换音源；不带参数时显示当前音源。",
-        "usage": "source\nsource client|web|cache",
+        "usage": "source\nsource client|web|cache|local",
         "example": "> source cache\n已切到 cache",
-        "notes": "等价于主界面的音源下拉框；切到 cache 会立即触发本地扫描。",
+        "notes": "等价于主界面的音源下拉框；切到 cache 会立即触发本地缓存扫描，"
+        "切到 local 会扫描下载目录和本地音乐目录（只读），本地视图没有下载队列。",
         "keys": "source 音源 client web cache",
     },
     {
@@ -606,6 +663,14 @@ COMMAND_DOCS = [
         "keys": "url 取址 地址 码率 大小 探针",
     },
     {
+        "name": "history",
+        "desc": "列出最近的命令历史（最多 20 条）；带 clear 清空历史。",
+        "usage": "history\nhistory clear",
+        "example": "> 历史\n最近 2 条（↑↓ 取用，history clear 清空）\n   1. 队列\n   2. 设置 音质 无损",
+        "notes": "历史存在设置里，关掉窗口再开也能用 ↑↓ 翻；只留最近 50 条。",
+        "keys": "history 历史 记录 清空",
+    },
+    {
         "name": "copy / clear",
         "desc": "copy 把整段输出复制到剪贴板；clear 清空输出框。",
         "usage": "copy\nclear",
@@ -615,13 +680,47 @@ COMMAND_DOCS = [
     },
 ]
 
+# 每条命令的中文写法：拼到对应卡片的语法块末尾，一张卡里就能看到中英对照。
+# 键是 COMMAND_DOCS 里的 name（合并命令按合并后的写法）。
+ZH_EXAMPLES = {
+    "help": "帮助 · 帮助 队列",
+    "status": "状态",
+    "stats": "统计 · 概览",
+    "queue": "队列 · 队列 重试 · 队列 清空 确认",
+    "play": "播放 3",
+    "stop": "停止",
+    "volume": "音量 · 音量 40",
+    "level": "音质 · 音质 无损",
+    "pause / resume": "暂停 · 继续",
+    "trace": "轨迹 · 事件 · 轨迹 5",
+    "mock / 模拟数据": "模拟数据 队列 · 模拟数据 全部 · 模拟数据 清除",
+    "scan": "扫描 · 重扫",
+    "cache": "缓存 清理",
+    "compat": "兼容 · 兼容播放 开 · 兼容播放 关",
+    "backend": "后端",
+    "source": "音源 · 音源 客户端 · 音源 网页 · 音源 缓存 · 音源 本地",
+    "workers": "并发 · 并发 3 · 线程 3",
+    "get / set": "读取 音质 · 设置 音质 无损 · 设置 并发 3",
+    "log": "日志 · 日志 调试 · 日志 信息",
+    "reload": "重载 · 样式",
+    "diag": "诊断 · 诊断包",
+    "open": "打开 下载 · 打开 缓存 · 打开 配置 · 打开 日志",
+    "url": "取址 585404 · 取址 585404 无损",
+    "history": "历史 · 历史 清空",
+    "copy / clear": "复制 · 清空",
+}
+
 HELP_ITEMS.extend(
     {
         "group": "命令行手册",
         "where": "命令行",
         "name": doc["name"],
         "desc": doc["desc"],
-        "usage": doc.get("usage", ""),
+        "usage": (
+            f"{doc.get('usage', '')}\n\n中文写法：{ZH_EXAMPLES[doc['name']]}".strip()
+            if ZH_EXAMPLES.get(doc["name"])
+            else doc.get("usage", "")
+        ),
         "example": doc.get("example", ""),
         "notes": doc.get("notes", ""),
         "keys": doc.get("keys", ""),
@@ -720,11 +819,12 @@ SETTING_DOCS = [
     {
         "name": "mini_queue",
         "desc": "紧凑模式（400px 窄窗口）里下载队列长什么样。界面在「设置 → 紧凑队列」。",
-        "usage": "取值：panel（底部折叠面板，默认）\n"
+        "usage": "取值：panel（底部卡片，默认；按窗口高度显示 3～5 行）\n"
         "　　　dock（单行停靠，点开看全部）\n"
         "　　　off（不显示）",
         "example": "> set mini_queue dock",
-        "notes": "只影响紧凑模式；标准窗口的队列永远是完整表格。改完立刻生效，不用重启。",
+        "notes": "只影响紧凑模式；标准窗口的队列永远是完整表格。改完立刻生效，不用重启。"
+        "卡片顶栏点一下折叠/展开，全部完成后会收成一行「N 首已完成」并给出清空入口。",
         "keys": "mini_queue 紧凑 队列 面板 停靠 隐藏",
     },
 ]

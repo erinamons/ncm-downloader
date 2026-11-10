@@ -44,6 +44,7 @@ SOURCE_LABEL = {
     "client": "客户端接口",
     "web": "网页接口",
     "cache": "仅本地缓存",
+    "local": "本地音乐",
 }
 # 界面里空间紧张，用短标签
 SOURCE_SHORT = {
@@ -51,6 +52,7 @@ SOURCE_SHORT = {
     "client": "客户端",
     "web": "网页",
     "cache": "仅缓存",
+    "local": "本地",
 }
 
 _UA = (

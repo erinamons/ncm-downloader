@@ -21,6 +21,9 @@ EXCLUDE_NAMES = {
     "app.log.2",
     # 上一运行是否正常退出的状态，属于本机数据
     "run-state.json",
+    # 本地音乐扫描索引：只是缓存，还带着本机路径
+    "local-index.json",
+    "local-index.tmp",
 }
 # crash.log 是 windowed 模式的崩溃栈，随包发出去既没用又难看
 EXCLUDE_SUFFIXES = {".log"}

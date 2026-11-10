@@ -28,6 +28,9 @@ MAX_ROWS = 8
 ROW_H = 26
 SHEET_GAP = 6
 CHEVRON_SIZE = 16
+CHECK_SIZE = 14
+# 卡片顶栏高度：和列表行共用一条左基线，行高 28 更透气
+HEAD_H = 32
 CHEVRON_COLOR = "#9a9aa4"
 
 
@@ -138,25 +141,29 @@ class MiniQueueDock(QWidget):
 
 
 class QueueHeader(QWidget):
-    """紧凑模式队列的标题行：红色徽标 + 名称 + 进度 + 小三角。
+    """紧凑模式队列的卡片顶栏：徽标 + 名称 + 进度 + 清空 + 小三角。
 
     整行都能点，点一下折叠/展开。徽标里是「正在下载的条数」，
     右侧数字是「已完成/总数 · 总百分比」。
+
+    全部完成之后切成汇总态：绿勾 + 「N 首已完成」+ 清空，不再逐行重复「完成」。
     """
 
     clicked = pyqtSignal()
+    cleared = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("queueHeader")
         self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setFixedHeight(26)
+        self.setFixedHeight(HEAD_H)
         self.setCursor(Qt.PointingHandCursor)
+        self._summary = 0
 
         row = QHBoxLayout(self)
-        # 右边留 4px：小三角贴着窗口边缘会被裁掉半个
-        row.setContentsMargins(0, 0, 4, 0)
-        row.setSpacing(6)
+        # 左右留 10px：顶栏和列表行用同一条左基线（卡片的 1px 边框在布局外边）
+        row.setContentsMargins(10, 0, 8, 0)
+        row.setSpacing(7)
 
         self.badge = QLabel("0")
         self.badge.setFixedSize(16, 16)
@@ -168,8 +175,14 @@ class QueueHeader(QWidget):
         self.badge.hide()
         row.addWidget(self.badge)
 
+        self.check = QLabel()
+        self.check.setFixedSize(CHECK_SIZE, CHECK_SIZE)
+        self.check.setPixmap(icons.pixmap("check", "#4caf7d", CHECK_SIZE))
+        self.check.hide()
+        row.addWidget(self.check)
+
         self.title = QLabel("下载队列")
-        self.title.setStyleSheet("color:#b6b6c0; font-size:11px;")
+        self.title.setStyleSheet("color:#c3c3cc; font-size:11.5px;")
         row.addWidget(self.title)
 
         self.counts = QLabel("")
@@ -178,15 +191,27 @@ class QueueHeader(QWidget):
 
         row.addStretch(1)
 
+        # 清空挂在顶栏右侧：完成态才有，点这一小块只清空，不折叠
+        self.clear_link = QLabel("清空")
+        self.clear_link.setStyleSheet("color:#8b8b95; font-size:11px; padding:2px 6px;")
+        self.clear_link.setCursor(Qt.PointingHandCursor)
+        # 交给父级判断点击位置，免得 QLabel 吃掉鼠标事件
+        self.clear_link.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.clear_link.hide()
+        row.addWidget(self.clear_link)
+
         self.chevron = QLabel()
         self.chevron.setFixedSize(CHEVRON_SIZE, CHEVRON_SIZE)
         self.chevron.setAlignment(Qt.AlignCenter)
         self.chevron.setPixmap(_chevron_pixmap(False))
         row.addWidget(self.chevron)
 
+    # ---------------- 状态 ----------------
+
     def update_state(
         self, done: int, total: int, percent: int, active: int, opened: bool
     ) -> None:
+        self._set_summary_mode(False)
         if active > 0:
             self.badge.setText(str(active))
             self.badge.show()
@@ -194,6 +219,7 @@ class QueueHeader(QWidget):
             # 文字也要清掉：只 hide 的话队列清空后再显示会闪一下上一批的数字
             self.badge.setText("")
             self.badge.hide()
+        self.title.setText("下载队列")
         if total:
             tail = f"{done}/{total}"
             if percent:
@@ -203,15 +229,37 @@ class QueueHeader(QWidget):
         else:
             self.counts.setText("")
             self.counts.hide()
+        # 空队列没有可展开的内容，箭头留着点了也没反应
+        self.chevron.setVisible(bool(total))
         self.set_open(opened)
 
+    def set_summary(self, done: int) -> None:
+        """全部完成：绿勾 + 「N 首已完成」+ 清空，箭头还在（点开能看明细）。"""
+        self._set_summary_mode(True)
+        self.title.setText(f"{done} 首已完成")
+        self.counts.setText("")
+        self.counts.hide()
+        self.badge.hide()
+        self.chevron.setVisible(True)
+
+    def _set_summary_mode(self, on: bool) -> None:
+        self._summary = 1 if on else 0
+        self.check.setVisible(on)
+        self.clear_link.setVisible(on)
+
     def set_open(self, opened: bool) -> None:
-        # 底部面板：收起时向下指（点开），展开时向上指（收起）
+        # 卡片顶栏：收起时向下指（点开），展开时向上指（收起）
         self.chevron.setPixmap(_chevron_pixmap(opened))
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton:
-            self.clicked.emit()
+            if (
+                self.clear_link.isVisible()
+                and self.clear_link.geometry().contains(event.pos())
+            ):
+                self.cleared.emit()
+            else:
+                self.clicked.emit()
             event.accept()
             return
         super().mouseReleaseEvent(event)

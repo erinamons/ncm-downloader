@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -19,6 +20,7 @@ from PyQt5.QtCore import (
     Qt,
     QTimer,
     QUrl,
+    pyqtSignal,
 )
 from PyQt5.QtGui import (
     QColor,
@@ -51,6 +53,7 @@ from PyQt5.QtWidgets import (
     QMenu,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QShortcut,
     QSpinBox,
     QSplitter,
@@ -67,6 +70,7 @@ from ncm.trace import trace
 from ncm.runlog import runlog
 from ncm import archive as archive_mod
 from ncm import cache as cache_mod
+from ncm import local as local_mod
 from ncm.downloader import (
     CANCELLED,
     CACHE_MISS,
@@ -96,6 +100,7 @@ from gui.dialog import MessageDialog, RoundDialog
 from gui.help import HelpDialog
 from gui.inputs import HistoryLineEdit
 from gui.console import CommandConsole, ConsoleWindow
+from gui.mini_queue import HEAD_H as QUEUE_HEAD_H
 from gui.mini_queue import MiniQueueDock, QueueHeader, QueueSheet
 from gui.mockdata import MockData
 from gui.shadow import clip_outside_window, render_shadow
@@ -138,7 +143,7 @@ SORT_KEYS = {
 }
 
 # 界面上只给三种明确选择，「自动」留在命令行用
-GUI_SOURCES = ("client", "web", "cache")
+GUI_SOURCES = ("client", "web", "cache", "local")
 
 # 接口单次返回上限，翻页也按这个步长走
 PAGE_SIZE = 50
@@ -236,6 +241,15 @@ MINI_SOURCE_W = 80
 # QSS 里的 min-width 会把 setFixedWidth 顶回去（78 + padding + 边框 = 96），
 # 紧凑模式用控件级样式临时解除，退出时置空即回到全局规则
 _NARROW_COMBO_QSS = "QComboBox { min-width: 0; }"
+# 紧凑模式队列卡：行高 28（比标准表格的 30 紧一点，4 行也不占地方），
+# 卡片内边距只留 1px 上边和 4px 下边（左右 1px 给 QSS 边框让位）
+QUEUE_ROW_H = 28
+QUEUE_CARD_PAD_TOP = 1
+QUEUE_CARD_PAD_BOTTOM = 4
+QUEUE_EMPTY_H = 46
+# 空队列提示：标准窗口跟在标题下面；紧凑模式是卡内的一整行，左基线要对齐列表
+_QUEUE_HINT_STD_QSS = "color:#7a7a82; font-size:11px; padding:2px 2px 4px 2px;"
+_QUEUE_HINT_CARD_QSS = "color:#7f7f89; font-size:11.5px; padding-left:10px;"
 
 
 def _bar_qss(color: str) -> str:
@@ -380,6 +394,34 @@ class SettingsDialog(RoundDialog):
         cache_row.addWidget(btn_report)
         form.addRow("缓存目录", cache_row)
 
+        # 本地音乐：下载目录固定包含，这里再挂一个装歌的文件夹
+        saved_local = settings.value("local_dir", "", type=str)
+        self.local_dir: Path | None = (
+            Path(saved_local)
+            if saved_local and Path(saved_local).is_dir()
+            else None
+        )
+        local_row = QHBoxLayout()
+        local_row.setSpacing(8)
+        self.local_value = QLabel()
+        self.local_value.setObjectName("muted")
+        self.local_value.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        local_row.addWidget(self.local_value, 1)
+        btn_local = QPushButton("选择")
+        btn_local.setFixedHeight(30)
+        btn_local.setMinimumWidth(58)
+        btn_local.setToolTip("除了下载目录，再扫一个放音乐的文件夹（只读，不会改动里面的文件）")
+        btn_local.clicked.connect(self._pick_local)
+        local_row.addWidget(btn_local)
+        btn_local_clear = QPushButton("清除")
+        btn_local_clear.setFixedHeight(30)
+        btn_local_clear.setMinimumWidth(58)
+        btn_local_clear.setToolTip("只扫下载目录")
+        btn_local_clear.clicked.connect(self._clear_local)
+        local_row.addWidget(btn_local_clear)
+        form.addRow("本地音乐", local_row)
+        self._refresh_local_text()
+
         # 未登录时听 VIP 歌会缓存成试听片段，登录后仍是残片；给个入口清掉
         play_row = QHBoxLayout()
         play_row.setSpacing(8)
@@ -491,6 +533,25 @@ class SettingsDialog(RoundDialog):
         )
         style_combo(self.mini_queue)
         form.addRow("紧凑队列", self.mini_queue)
+
+        # 关闭行为：只影响点右上角 ×。最小化始终是普通最小化，不进托盘
+        close_row = QHBoxLayout()
+        close_row.setSpacing(14)
+        self.close_tray = QRadioButton("最小化到系统托盘")
+        self.close_quit = QRadioButton("退出程序")
+        saved_close = settings.value("close_action", "quit", type=str)
+        if saved_close == "tray":
+            self.close_tray.setChecked(True)
+        else:
+            self.close_quit.setChecked(True)
+        self.close_tray.setToolTip(
+            "点 × 时收进托盘：下载、播放都继续，托盘菜单里可以真正退出"
+        )
+        self.close_quit.setToolTip("点 × 时直接退出程序")
+        close_row.addWidget(self.close_tray)
+        close_row.addWidget(self.close_quit)
+        close_row.addStretch(1)
+        form.addRow("关闭主面板", close_row)
 
         history_row = QHBoxLayout()
         history_row.setSpacing(8)
@@ -639,6 +700,28 @@ class SettingsDialog(RoundDialog):
         if chosen:
             self.out_dir = Path(chosen)
             self._refresh_dir_text()
+
+    def _refresh_local_text(self) -> None:
+        if self.local_dir is None:
+            self.local_value.setText("只扫下载目录")
+            self.local_value.setToolTip("选一个放音乐的文件夹，会和下载目录一起列出来")
+            return
+        text = str(self.local_dir)
+        if len(text) > 28:
+            text = "…" + text[-27:]
+        self.local_value.setText(text)
+        self.local_value.setToolTip(f"{self.local_dir}\n只读扫描，不会改动里面的文件")
+
+    def _pick_local(self) -> None:
+        start = str(self.local_dir or self.out_dir)
+        chosen = QFileDialog.getExistingDirectory(self, "选择本地音乐目录", start)
+        if chosen:
+            self.local_dir = Path(chosen)
+            self._refresh_local_text()
+
+    def _clear_local(self) -> None:
+        self.local_dir = None
+        self._refresh_local_text()
 
     def _refresh_cache_text(self) -> None:
         path = self.cache_dir
@@ -900,8 +983,15 @@ class MainWindow(QMainWindow):
     RADIUS = 12
     EDGE = 6       # 边缘多少像素内触发缩放
 
+    # 扫描/拖拽都在工作线程里做，结果必须用信号封送回主线程：
+    # QTimer.singleShot 在普通 Python 线程里没有事件循环，回调永远不触发
+    local_ready = pyqtSignal(object, object)  # tracks, error
+    drop_ready = pyqtSignal(object)  # tracks
+
     def __init__(self) -> None:
         super().__init__()
+        self.local_ready.connect(self._local_ready)
+        self.drop_ready.connect(self._drop_ready)
         # Qt 默认的占位文字是纯黑，深色输入框上等于看不见——搜索框的
         # 「搜索歌名或粘贴链接」就是这样。统一调成中性灰
         app = QApplication.instance()
@@ -958,6 +1048,12 @@ class MainWindow(QMainWindow):
         self._shadow_timer.setSingleShot(True)
         self._shadow_timer.setInterval(150)
         self._shadow_timer.timeout.connect(self._rebuild_shadow)
+        # 本地 / 缓存列表边打字边过滤：列表大时逐字重建表格会卡，
+        # 停手 180ms 再筛一次
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(180)
+        self._filter_timer.timeout.connect(self._apply_view)
         self._row_paths: dict[int, Path] = {}
         self._cache_rates: dict[int, str] = {}
         # 缓存没下完的曲目 id，列表里要标注，免得用户以为能直接导出
@@ -989,6 +1085,9 @@ class MainWindow(QMainWindow):
         # 进紧凑模式前的分栏比例；_mini_transition 用于挡住切换过程中的
         # resize 事件，不然「恢复标准窗口」会被当成用户把窗口拉宽而重入
         self._splitter_sizes: list[int] | None = None
+        # 队列空的时候收成一行提示，这里记「有任务时的分栏比例」用于还原
+        self._queue_sizes: list[int] | None = None
+        self._queue_collapsed = False
         self._mini_transition = False
         self._pending_query = ""
         # 切到「仅本地缓存」时若正有任务在跑，扫描请求排队等任务槽空出来；
@@ -1005,6 +1104,11 @@ class MainWindow(QMainWindow):
         self.out_dir = self._load_out_dir()
         # 缓存目录：设置里指定过就用它，否则自动探测客户端默认位置
         self.cache_dir = self._load_cache_dir()
+        # 本地音乐：下载目录 + 设置里选的一个目录；id -> 文件路径在扫描后填
+        self._local_dir = self._load_local_dir()
+        self._local_paths: dict[int, Path] = {}
+        self._local_scanning = False
+        self._local_error = ""
 
         # 旧版本把播放缓存放在系统临时目录，这里顺手清一次
         try:
@@ -1021,6 +1125,8 @@ class MainWindow(QMainWindow):
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMouseTracking(True)
+        # 拖音频文件 / 文件夹到窗口上直接播放（见 dropEvent）
+        self.setAcceptDrops(True)
         self.setMinimumSize(840, 600)
         # 窗口位置不再记忆：每次都在主屏居中，固定 1000×740。
         # 记住位置在多显示器切换、改分辨率之后经常把窗口丢到屏幕外，
@@ -1077,6 +1183,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._enter_mini_from_startup)
         # 上次停在「仅本地缓存」时，启动就把列表载入
         self._update_compact_mode()
+        # 空队列启动时也要收成一行；分栏尺寸要等布局算完，所以推迟一拍
+        QTimer.singleShot(0, self._apply_queue_layout)
         if self._current_source() == "cache":
             self.on_load_cache()
 
@@ -1145,7 +1253,11 @@ class MainWindow(QMainWindow):
         for child in self.findChildren(QWidget):
             child.setMouseTracking(True)
         # 建完界面先按当前音源渲染一次：否则「音质」列会一直显到第一次搜索为止
-        self._apply_view()
+        if self._is_local_view():
+            self._apply_source_chrome()
+            self.on_load_local()
+        else:
+            self._apply_view()
 
     def _init_tray(self) -> None:
         """托盘 + 媒体键。放最后初始化：winId 这时候才是有效的 HWND。"""
@@ -1160,7 +1272,11 @@ class MainWindow(QMainWindow):
         self.tray.quit_app.connect(self._quit_from_tray)
 
     def _restore_from_tray(self) -> None:
-        self.showNormal()
+        # 收进托盘前是最大化的，回来还是最大化；否则按普通窗口恢复
+        if getattr(self, "_hidden_maximized", False):
+            self.showMaximized()
+        else:
+            self.showNormal()
         self.raise_()
         self.activateWindow()
         # 面板是独立窗口，收进托盘时一起藏了，恢复时按原状态带回来
@@ -1208,10 +1324,35 @@ class MainWindow(QMainWindow):
         if self._console_was_visible:
             con.hide()
 
+    def _should_hide_on_close(self) -> bool:
+        """点 × 时是否收进托盘。
+
+        只有「关闭」可能进托盘；最小化永远是普通最小化。退出流程会先把
+        ``_quitting`` 置真，避免托盘菜单的「退出」又被这里拦下来。
+        """
+        if getattr(self, "_quitting", False):
+            return False
+        if self.settings.value("close_action", "quit", type=str) != "tray":
+            return False
+        tray = getattr(self, "tray", None)
+        return tray is not None and tray.available
+
+    def _hide_to_tray(self) -> None:
+        """收进托盘：主窗口和独立窗口一起藏，后台继续下载 / 播放。"""
+        self._hidden_maximized = self.isMaximized()
+        self._hide_dev_with_window()
+        self.hide()
+        tray = getattr(self, "tray", None)
+        if tray is not None and not getattr(self, "_tray_hinted", False):
+            # 只提示第一次，之后每次关闭都弹一条会烦
+            self._tray_hinted = True
+            tray.notify("仍在后台运行", "点托盘图标打开主窗口；退出用托盘菜单")
+
     def _quit_from_tray(self) -> None:
-        if getattr(self, "tray", None) is not None:
-            self.tray.detach()
-        QApplication.quit()
+        # 走 close() 而不是 QApplication.quit()：批量下载收尾、设置落盘、
+        # 播放器关闭、热键注销都在 closeEvent 里，直接 quit 会整段跳过
+        self._quitting = True
+        self.close()
 
     def changeEvent(self, event) -> None:  # noqa: N802
         if event.type() == QEvent.WindowStateChange:
@@ -1219,15 +1360,8 @@ class MainWindow(QMainWindow):
                 self._apply_window_frame()
             if hasattr(self, "topbar"):
                 self.topbar.sync_window()
-            # 最小化时收进托盘，别占着任务栏；关闭仍然是退出
-            if (
-                self.isMinimized()
-                and getattr(self, "tray", None) is not None
-                and self.tray.available
-            ):
-                self._hide_dev_with_window()
-                QTimer.singleShot(0, self.hide)
-                self.tray.notify("已收进托盘", "点托盘图标可以叫回来")
+            # 最小化就是普通最小化，不进托盘：托盘只跟「关闭」绑定。
+            # 命令行 / 开发者面板是独立顶层窗口，主窗口最小化时它们不动。
         super().changeEvent(event)
 
     def _apply_window_frame(self) -> None:
@@ -1309,6 +1443,21 @@ class MainWindow(QMainWindow):
             and self.width() >= self.MIN_STANDARD_WIDTH
         ):
             self._exit_mini(restore_geometry=False)
+        # 紧凑队列卡的可见行数跟着窗口高度走（3 / 4 / 5 行），高度跨过
+        # 阈值时要重新摆一次；行数没变就不动，免得拖动窗口时反复重排
+        if (
+            getattr(self, "_mini", False)
+            and getattr(self, "_mini_queue_mode", "") == "panel"
+            and not getattr(self, "_mini_transition", False)
+        ):
+            self._sync_mini_queue_rows()
+
+    def _sync_mini_queue_rows(self) -> None:
+        if self._is_local_view() or not (self._mini and self._mini_queue_mode == "panel"):
+            return
+        if getattr(self, "_queue_rows_shown", 0) == self._mini_queue_rows():
+            return
+        self._apply_mini_queue_collapse()
 
     # 7 列完整布局的最小总宽约 764px（30+160+160+200+64+70+80），
     # 阈值要盖住它，否则 700~764 之间会出现横向滚动条
@@ -1340,13 +1489,15 @@ class MainWindow(QMainWindow):
         t.setColumnHidden(3, c)
         header_item = t.horizontalHeaderItem(4)
         if header_item is not None:
-            header_item.setText("时长 · 音质" if c else "时长")
+            # 只有缓存视图在紧凑模式里会把码率并进时长列
+            merged = c and self._current_source() == "cache"
+            header_item.setText("时长 · 音质" if merged else "时长")
         vh = t.verticalHeader()
         if c:
             vh.setDefaultSectionSize(self._compact_row_h)
             # 时长并了音质，64px 放不下「2:35 · 320k」；还要关 wordWrap，
             # 否则这个宽度下 Qt 会把合并文本折成两行
-            t.setColumnWidth(4, 88)
+            t.setColumnWidth(4, 88 if merged else 64)
             t.setWordWrap(False)
             t.setItemDelegateForColumn(1, self._name_delegate)
             # 曲名列保底让到 116px：mini 窗口视口 ~358px，若保底 160，
@@ -1487,6 +1638,13 @@ class MainWindow(QMainWindow):
         if saved and Path(saved).is_dir():
             return Path(saved)
         return cache_mod.default_cache_dir()
+
+    def _load_local_dir(self) -> Path | None:
+        """可选的本地音乐目录；目录不在了就当没设置，下载目录始终会扫。"""
+        saved = self.settings.value("local_dir", "", type=str)
+        if saved and Path(saved).is_dir():
+            return Path(saved)
+        return None
 
     def _watch_cache_dir(self, path) -> None:
         """只盯当前缓存目录，换目录时先把旧的摘掉。"""
@@ -1729,13 +1887,91 @@ class MainWindow(QMainWindow):
 
     def _play_current(self, force_remote: bool = False) -> None:
         if 0 <= self.play_index < len(self.playlist):
-            self.player.play_song(
-                self.playlist[self.play_index], force_remote=force_remote
-            )
+            song = self.playlist[self.play_index]
+            # 本地曲目（含拖进来的文件）直接播磁盘上的文件，不走取地址
+            path = self._local_paths.get(song.id)
+            if path is not None and path.exists():
+                self.player.play_local(song, path)
+                return
+            self.player.play_song(song, force_remote=force_remote)
 
     def _play_row(self, index) -> None:
         row = index.row() if hasattr(index, "row") else int(index)
         self._play_from_list(self.songs, row)
+
+    # ---------------- 拖拽播放 ----------------
+
+    def _drop_paths(self, mime, limit: int = 300) -> list[Path]:
+        """把拖进来的 URL 展开成音频文件：文件夹递归找，最多 limit 个。"""
+        if mime is None or not mime.hasUrls():
+            return []
+        found: list[Path] = []
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if path.is_dir():
+                for sub in local_mod.iter_audio(path):
+                    found.append(sub)
+                    if len(found) >= limit:
+                        break
+            elif local_mod.is_audio(path):
+                found.append(path)
+            if len(found) >= limit:
+                break
+        seen: set[str] = set()
+        unique: list[Path] = []
+        for path in found:
+            key = str(path).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+        return unique
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if self._drop_paths(event.mimeData(), limit=1):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if self._drop_paths(event.mimeData(), limit=1):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        paths = self._drop_paths(event.mimeData())
+        if not paths:
+            return
+        event.acceptProposedAction()
+        self.status_label.setText(f"正在读取 {len(paths)} 个文件…")
+        threading.Thread(
+            target=self._drop_worker, args=(paths,), daemon=True
+        ).start()
+
+    def _drop_worker(self, paths: list[Path]) -> None:
+        tracks = local_mod.read_files(paths)
+        self.drop_ready.emit(tracks)
+
+    def _drop_ready(self, tracks) -> None:
+        if not tracks:
+            self.status_label.setText("拖进来的文件里没有能播放的音频")
+            return
+        songs = [
+            Song(track.id, track.name, list(track.artists), track.album, track.duration)
+            for track in tracks
+        ]
+        # 拖进来的文件可能不在扫描目录里，先把 id → 路径记上，播放时直接走本地
+        self._local_paths.update({track.id: track.path for track in tracks})
+        self.playlist = songs
+        self.play_index = 0
+        self._play_current()
+        first = songs[0]
+        self.status_label.setText(
+            f"拖入 {len(songs)} 首，开始播放：{first.name}（{first.artist_text}）"
+        )
 
     def _stop_playback(self) -> None:
         """停止当前播放，回到「没有在播」的干净状态。"""
@@ -1913,12 +2149,12 @@ class MainWindow(QMainWindow):
         # 400px 放不下队列的「大小」列，留着只会出横向滚动条；
         # 表头也收掉，省下的 24px 刚好能多显示一行
         self.queue_table.setColumnHidden(3, True)
-        self.queue_table.setColumnWidth(1, 84)
+        self.queue_table.setColumnWidth(1, 52)
         self.queue_table.setColumnWidth(2, 84)
         # 紧凑窗口里进度条放前面、状态词收在右边缘，和结果表一样「先看进度再看结果」
         self._reorder_queue_columns([0, 2, 1, 3])
         self.queue_table.horizontalHeader().setVisible(False)
-        self.queue_table.verticalHeader().setDefaultSectionSize(26)
+        self.queue_table.verticalHeader().setDefaultSectionSize(QUEUE_ROW_H)
         self.result_table.refit()
         # 窗口尺寸还在收尾，等布局稳定后再拉一次，否则会差出一个滚动条的宽度
         QTimer.singleShot(80, self.result_table.refit)
@@ -1937,7 +2173,11 @@ class MainWindow(QMainWindow):
         self.btn_search.setText("")
         self.btn_search.setIcon(icons.icon("search", "#ffffff", 16))
         self.btn_search.setFixedWidth(38)
-        self.input.setPlaceholderText("搜索歌名或粘贴链接")
+        self.btn_rescan.setText("")
+        self.btn_rescan.setFixedWidth(38)
+        self.input.setPlaceholderText(
+            "在本地音乐中筛选" if self._is_local_view() else "搜索歌名或粘贴链接"
+        )
         # 状态栏三段并排会挤到截字，紧凑时让账号信息让位
         self.account_label.hide()
         self.btn_help.hide()
@@ -1990,6 +2230,10 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(80, self.result_table.refit)
         self.level_label.show()
         self.source_label.show()
+        # 本地视图没有音质选择，别在还原标准窗口时把标签放回来
+        if self._is_local_view():
+            self.level_label.hide()
+            self.level_box.hide()
         # 解除紧凑时的定宽与样式覆盖，回到 QSS 的 min-width 与内容自适应
         for box in (self.level_box, self.source_box):
             box.setStyleSheet("")
@@ -2003,7 +2247,14 @@ class MainWindow(QMainWindow):
         self.btn_search.setIcon(icons.icon("search", "#ffffff", 18))
         self.btn_search.setMinimumWidth(88)
         self.btn_search.setMaximumWidth(16777215)
-        self.input.setPlaceholderText("搜索歌名，或粘贴歌曲 / 歌单链接")
+        self.btn_rescan.setText("重新扫描")
+        self.btn_rescan.setMinimumWidth(0)
+        self.btn_rescan.setMaximumWidth(16777215)
+        self.input.setPlaceholderText(
+            "在本地音乐中筛选"
+            if self._is_local_view()
+            else "搜索歌名，或粘贴歌曲 / 歌单链接"
+        )
         self.account_label.show()
         self.btn_help.show()
         self.btn_folder.show()
@@ -2037,6 +2288,9 @@ class MainWindow(QMainWindow):
             return
         if self.splitter.height() > 0:
             self.splitter.setSizes(sizes)
+        # 还原的是「有任务时」的比例；队列空着就还是收成一行
+        if self._queue_is_empty():
+            self._apply_queue_std_layout()
 
     def _toggle_play(self) -> None:
         self.player.toggle()
@@ -2118,6 +2372,8 @@ class MainWindow(QMainWindow):
 
         # 所有列都能拖动；窗口变宽时余量给曲名（见 FluidTable）
         self.result_table = FluidTable(0, 7, fluid_col=1)
+        # 紧凑模式的队列卡要和这张表焊成一块，接缝靠这个 ID 单独调圆角
+        self.result_table.setObjectName("resultTable")
         self.result_table.setHorizontalHeaderLabels(HEADERS)
         self._style_table(self.result_table)
         header = self.result_table.horizontalHeader()
@@ -2197,7 +2453,13 @@ class MainWindow(QMainWindow):
         arrow = ""
         if active >= 0:
             arrow = "\u25bc" if self.sort_desc else "\u25b2"
-        for col, base in enumerate(HEADERS):
+        # 本地视图第 5 列是文件大小，不是音质；紧凑模式只有缓存会把码率并进时长
+        labels = list(HEADERS)
+        if self._is_local_view():
+            labels[5] = "大小"
+        if self._compact_mode and self._current_source() == "cache":
+            labels[4] = "时长 · 音质"
+        for col, base in enumerate(labels):
             item = self.result_table.horizontalHeaderItem(col)
             if item is None:
                 item = QTableWidgetItem()
@@ -2235,7 +2497,12 @@ class MainWindow(QMainWindow):
 
     def _build_queue_panel(self) -> QWidget:
         panel = QWidget()
+        panel.setObjectName("queuePanel")
+        # 紧凑模式下这块面板本身就是队列卡（圆角 + 边框），必须让它画 QSS 底色
+        panel.setAttribute(Qt.WA_StyledBackground, True)
+        panel.setProperty("card", "off")
         layout = QVBoxLayout(panel)
+        self._queue_layout = layout
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
@@ -2248,9 +2515,17 @@ class MainWindow(QMainWindow):
         # 紧凑模式专用：红色徽标 + 「2/5 · 62%」+ 小三角，整行可点
         self.mini_header = QueueHeader(panel)
         self.mini_header.clicked.connect(self._toggle_mini_queue)
+        self.mini_header.cleared.connect(self._clear_queue)
         self.mini_header.hide()
         head.addWidget(self.mini_header, 1)
         layout.addLayout(head)
+
+        # 空队列时只显示这一句，不画空表格（之前那个空圆角框就是这么来的）
+        self.queue_hint = QLabel("暂无下载任务 · 搜索后点下载即可")
+        self.queue_hint.setStyleSheet(_QUEUE_HINT_STD_QSS)
+        self.queue_hint.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.queue_hint.hide()
+        layout.addWidget(self.queue_hint)
 
         self.queue_table = FluidTable(0, 4, fluid_col=0)
         self.queue_table.setHorizontalHeaderLabels(["曲名", "状态", "进度", "大小"])
@@ -2288,6 +2563,12 @@ class MainWindow(QMainWindow):
 
     def _apply_mini_queue(self) -> None:
         """按设置切换紧凑模式的队列形态：折叠面板 / 单行停靠 / 不显示。"""
+        if self._is_local_view():
+            # 本地音乐没有下载队列，紧凑模式也不摆
+            self.queue_sheet.hide()
+            self.queue_dock.hide()
+            self.queue_panel.hide()
+            return
         mode = self.settings.value("mini_queue", "panel", type=str)
         if mode not in ("panel", "dock", "off"):
             mode = "panel"
@@ -2300,7 +2581,11 @@ class MainWindow(QMainWindow):
             self.mini_header.hide()
             self.queue_info.show()
             self.queue_panel.show()
-            self.queue_panel.setMaximumHeight(16777215)
+            # 卡片形态是紧凑模式专用的，回到标准窗口必须整套还回去
+            self._set_queue_card("off")
+            self._set_queue_body(False)
+            self._reset_queue_metrics()
+            self._apply_queue_std_layout()
             return
 
         if mode == "off":
@@ -2308,44 +2593,221 @@ class MainWindow(QMainWindow):
             self.queue_dock.hide()
             self.mini_header.hide()
             self.queue_panel.hide()
+            # 没有卡片了，结果表的底角要恢复圆角
+            self._set_queue_card("off")
             return
 
         if mode == "dock":
             self.queue_panel.hide()
             self.mini_header.hide()
             self.queue_panel.setMaximumHeight(16777215)
+            self._set_queue_card("off")
             self.queue_dock.show()
             self._update_mini_queue(force=True)
             return
 
-        # panel：底部折叠面板
+        # panel：标题 + 列表合成一张卡，贴在窗口底部
         self.queue_dock.hide()
         self.queue_sheet.hide()
         self.queue_panel.show()
         self.queue_info.hide()
         self.mini_header.show()
+        # 卡里的表格只是内容载体：去掉自己的边框，行高收紧，状态贴右，
+        # 滚动条往里缩 6px 不压圆角
+        self._set_queue_body(True)
+        self.queue_table.verticalHeader().setDefaultSectionSize(QUEUE_ROW_H)
+        self.queue_table.setColumnWidth(1, 52)
+        self.queue_table.scroll_right = 6
+        self.queue_table._place_corner()
+        self._align_queue_status()
+        self.splitter.setHandleWidth(0)
         self._apply_mini_queue_collapse()
         self._update_mini_queue(force=True)
 
+    # ---------------- 紧凑队列卡的尺寸与样式 ----------------
+
+    def _set_queue_card(self, mode: str) -> None:
+        """卡片的三种形态：on（有任务）/ empty（空队列）/ off（标准窗口）。"""
+        panel = self.queue_panel
+        if panel.property("card") != mode:
+            panel.setProperty("card", mode)
+            panel.style().unpolish(panel)
+            panel.style().polish(panel)
+            panel.update()
+        # 有卡时结果表的下半截也改直角：接缝两侧都是直角，才对得上那一条线
+        seam = "on" if mode == "on" else "off"
+        table = self.result_table
+        if table.property("seam") != seam:
+            table.setProperty("seam", seam)
+            table.style().unpolish(table)
+            table.style().polish(table)
+            table.update()
+
+    def _set_queue_body(self, compact: bool) -> None:
+        """卡内表格用 queueCardBody 这个 ID 去掉 QSS 的边框和圆角。"""
+        name = "queueCardBody" if compact else ""
+        table = self.queue_table
+        if table.objectName() == name:
+            return
+        table.setObjectName(name)
+        table.style().unpolish(table)
+        table.style().polish(table)
+        table.update()
+
+    def _set_panel_margins(self, l: int, t: int, r: int, b: int, spacing: int) -> None:
+        layout = self._queue_layout
+        m = layout.contentsMargins()
+        if (
+            (m.left(), m.top(), m.right(), m.bottom()) == (l, t, r, b)
+            and layout.spacing() == spacing
+        ):
+            return
+        layout.setContentsMargins(l, t, r, b)
+        layout.setSpacing(spacing)
+
+    def _reset_queue_metrics(self) -> None:
+        """还原被紧凑卡改过的尺寸/样式，标准窗口照旧是「标题 + 独立表格」。"""
+        self.queue_panel.setMinimumHeight(0)
+        self.queue_panel.setMaximumHeight(16777215)
+        self.queue_hint.setMinimumHeight(0)
+        self.queue_hint.setMaximumHeight(16777215)
+        self.queue_hint.setStyleSheet(_QUEUE_HINT_STD_QSS)
+        self.queue_table.setMinimumHeight(0)
+        self.queue_table.setMaximumHeight(16777215)
+        self.queue_table.verticalHeader().setDefaultSectionSize(30)
+        self.queue_table.setColumnWidth(1, 84)
+        if getattr(self.queue_table, "scroll_right", 2) != 2:
+            self.queue_table.scroll_right = 2
+            self.queue_table._place_corner()
+        self._set_panel_margins(0, 0, 0, 0, 6)
+        self.splitter.setHandleWidth(6)
+        self._align_queue_status()
+
+    def _align_queue_status(self) -> None:
+        """紧凑窗口里状态贴右边缘，不再和进度条之间空出一大截。"""
+        align = (Qt.AlignRight if self._mini else Qt.AlignLeft) | Qt.AlignVCenter
+        for row in range(self.queue_table.rowCount()):
+            item = self.queue_table.item(row, 1)
+            if item is not None:
+                item.setTextAlignment(align)
+
+    def _mini_queue_rows(self) -> int:
+        """卡里放几行：按窗口高度给 3 / 4 / 5，再多就滚动。
+
+        以前写死 3 行，窗口拉高也不多给一行，旁边全是空白。
+        """
+        cap = 3 if self.height() <= 540 else 4 if self.height() <= 660 else 5
+        return max(1, min(cap, len(self._queue_songs) or 1))
+
+    def _fit_queue_pane(self, h: int) -> None:
+        """把队列卡钉在 h 像素，剩下的高度全给上面的结果区。
+
+        面板已经是固定高，这里 setSizes 只是让分栏自己也算清楚一次；
+        哪怕总数对不上，多出来的空间也进不到卡里。
+        """
+        total = self.splitter.height()
+        if total <= 0:
+            return
+        self.splitter.setSizes([max(160, total - h), h])
+
+    def _queue_is_empty(self) -> bool:
+        return self.queue_table.rowCount() == 0 and self.batch is None
+
+    def _refresh_queue_hint_text(self) -> None:
+        # 缓存视图的动作叫「导出」，别在提示里写死「下载」
+        self.queue_hint.setText(f"队列是空的 · 搜索后点「{self._verb()}」开始")
+
+    def _queue_hint_height(self) -> int:
+        """收起态的高度：标题一行 + 那句提示。用 sizeHint 算，别写死。"""
+        self.queue_hint.show()
+        self.queue_table.hide()
+        hint = self.queue_panel.sizeHint().height()
+        return max(42, hint)
+
+    def _apply_queue_layout(self) -> None:
+        """队列行数变了（开始下载 / 清空 / 批次结束）之后重排一次。
+
+        空队列收起成「标题 + 一句提示」，有任务时还原之前记住的分栏比例。
+        """
+        self._refresh_queue_hint_text()
+        if self._is_local_view():
+            # 本地视图不显示队列，别把它又摆回来
+            return
+        if self._mini:
+            if self._mini_queue_mode == "panel":
+                self._apply_mini_queue_collapse()
+            return
+        self._apply_queue_std_layout()
+
+    def _apply_queue_std_layout(self) -> None:
+        """标准窗口：空队列压到一行，有任务还原比例。"""
+        total = sum(self.splitter.sizes()) or self.height()
+        if self._queue_is_empty():
+            if not self._queue_collapsed:
+                sizes = self.splitter.sizes()
+                if len(sizes) == 2 and sizes[1] > 80:
+                    self._queue_sizes = sizes
+                self._queue_collapsed = True
+            h = self._queue_hint_height()
+            self.queue_hint.show()
+            self.splitter.setSizes([max(200, total - h), h])
+            return
+
+        self.queue_hint.hide()
+        self.queue_table.show()
+        if self._queue_collapsed:
+            self._queue_collapsed = False
+            sizes = getattr(self, "_queue_sizes", None)
+            if not sizes or len(sizes) != 2 or sizes[1] < 80:
+                sizes = [max(200, int(total * 0.55)), max(160, int(total * 0.45))]
+            self.splitter.setSizes(sizes)
+
     def _apply_mini_queue_collapse(self) -> None:
-        # 高度按行数算死：留半行会像被裁掉，看起来像 bug
-        rows = max(1, min(3, len(self._queue_songs) or 1))
-        row_h = self.queue_table.verticalHeader().defaultSectionSize()
-        table_h = rows * row_h + 2
-        head_h = self.mini_header.height() + 6
+        """紧凑模式：标题和列表是同一张卡，高度按窗口算行数并固定住。
+
+        以前这里靠 ``splitter.height() or 430`` 分空间：布局还没结算时读到 0
+        就退回 430，实际比 430 高，QSplitter 会把多出来的高度全给最后一个
+        面板；面板里标题和表格都是固定高，多余空间被 QVBoxLayout 均分成
+        「上 / 中 / 下」三段，表现就是标题悬在半空、列表浮在中间。现在面板
+        自己 setFixedHeight，多出来的高度只能留给上面的结果区。
+        """
+        if self._is_local_view():
+            # 本地视图没有队列：批次结束、窗口改高都不能再动分栏比例
+            return
+        if self._queue_is_empty():
+            # 空队列只留一句提示：不画框，也不占一个空标题行
+            self._queue_rows_shown = 0
+            self._set_queue_card("empty")
+            self.mini_header.hide()
+            self.queue_table.hide()
+            self._set_panel_margins(0, 0, 0, 0, 0)
+            self.queue_hint.setStyleSheet(_QUEUE_HINT_CARD_QSS)
+            self.queue_hint.setFixedHeight(QUEUE_EMPTY_H)
+            self.queue_hint.show()
+            self.queue_panel.setFixedHeight(QUEUE_EMPTY_H)
+            self._fit_queue_pane(QUEUE_EMPTY_H)
+            return
+
+        self._set_queue_card("on")
+        self._set_panel_margins(1, 0, 1, QUEUE_CARD_PAD_BOTTOM, 0)
+        self.queue_hint.hide()
+        self.mini_header.show()
+        rows = self._mini_queue_rows()
+        self._queue_rows_shown = rows
+        table_h = rows * QUEUE_ROW_H
         self.queue_table.setFixedHeight(table_h)
-        total = self.splitter.height() or 430
+        head_h = QUEUE_HEAD_H + QUEUE_CARD_PAD_TOP
         if self._mini_queue_open:
             self.queue_table.show()
-            self.queue_panel.setMaximumHeight(16777215)
-            self.splitter.setSizes([max(160, total - head_h - table_h), head_h + table_h])
+            self.mini_header.set_open(True)
+            h = head_h + table_h + QUEUE_CARD_PAD_BOTTOM
         else:
-            # 表格有固定高度，光靠 maximumHeight 压不住：子控件会溢出到操作栏上，
-            # 所以收起时直接 hide，展开再 show
+            # 表格高度是固定的，收起时只压面板高度会让子控件溢出到操作栏上
             self.queue_table.hide()
-            self.queue_panel.setMaximumHeight(head_h)
-            self.splitter.setSizes([max(160, total - head_h), head_h])
-        self.mini_header.set_open(self._mini_queue_open)
+            self.mini_header.set_open(False)
+            h = head_h + QUEUE_CARD_PAD_BOTTOM
+        self.queue_panel.setFixedHeight(h)
+        self._fit_queue_pane(h)
 
     def _toggle_mini_queue(self) -> None:
         if not (self._mini and self._mini_queue_mode == "panel"):
@@ -2405,20 +2867,29 @@ class MainWindow(QMainWindow):
             # 刚起任务、还没收到第一段进度：徽标至少显示 1，别看起来像没在跑
             active = 1
         pct = 0
-        if self._dl_totals:
-            all_bytes = sum(self._dl_totals.values())
-            got = sum(self._dl_progress.values())
-            if all_bytes:
-                pct = min(100, int(got * 100 / all_bytes))
-        elif total:
-            pct = min(100, int(done * 100 / total))
+        if total:
+            pct = int(done * 100 / total)
+            # 只把「正在跑的那一首」的字节算成小数部分。以前是把所有出现过的
+            # 字节相加，已完成的那几首本来就算进 done 了，会算出「2/6 · 100%」
+            # 这种自相矛盾的百分比。
+            for sid, tot in self._dl_totals.items():
+                if tot <= 0:
+                    continue
+                got = self._dl_progress.get(sid, 0)
+                if 0 <= got < tot:
+                    pct = min(100, int((done + got / tot) * 100 / total))
+                    break
 
         if self._mini_queue_mode == "dock":
             self.queue_dock.update_state(current, pct, done, total, busy)
         elif self._mini_queue_mode == "panel":
-            self.mini_header.update_state(
-                done, total, pct, active, self._mini_queue_open
-            )
+            # 全跑完了就切汇总态：绿勾 + 「N 首已完成」+ 清空，别再逐行重复「完成」
+            if total and done >= total and not busy and not self._failed and not self._paused:
+                self.mini_header.set_summary(done)
+            else:
+                self.mini_header.update_state(
+                    done, total, pct, active, self._mini_queue_open
+                )
 
         if self.queue_sheet.isVisible():
             self.queue_sheet.refresh(self._queue_snapshot())
@@ -2474,12 +2945,24 @@ class MainWindow(QMainWindow):
             "移动端开启免费听歌后，VIP 音乐也能下载。\n"
             "网页接口：以网页身份请求，区别在于音质和无法使用免费听歌，"
             "不是 VIP 无法下载完整版。\n"
-            "仅本地缓存：完全不发请求，只列出客户端已经缓存的歌曲，没网络也能用。"
+            "仅本地缓存：完全不发请求，只列出客户端已经缓存的歌曲，没网络也能用。\n"
+            "本地：列出下载目录和本地音乐目录里的音频文件，只负责播放，没有下载队列。"
         )
         style_combo(self.source_box)
         self.source_box.setFixedHeight(ACTION_BTN_H)
         self.source_box.currentIndexChanged.connect(self._on_source_changed)
         bar.addWidget(self.source_box)
+
+        # 本地音乐专用：目录里刚加了文件时手动重扫，不用来回切音源
+        self.btn_rescan = QPushButton("重新扫描")
+        self.btn_rescan.setIcon(icons.icon("refresh-cw", "#c8c8d0", 15))
+        self.btn_rescan.setIconSize(QSize(15, 15))
+        self.btn_rescan.setFixedHeight(ACTION_BTN_H)
+        self.btn_rescan.setFocusPolicy(Qt.NoFocus)
+        self.btn_rescan.setToolTip("重新读取本地音乐目录（有索引，通常很快）")
+        self.btn_rescan.clicked.connect(self.on_load_local)
+        self.btn_rescan.hide()
+        bar.addWidget(self.btn_rescan)
 
         bar.addStretch(1)
 
@@ -2777,12 +3260,22 @@ class MainWindow(QMainWindow):
     def _pool(self) -> tuple[list[Song], str, bool] | None:
         return self._pools.get(self._current_source())
 
+    def _is_local_view(self) -> bool:
+        box = getattr(self, "source_box", None)
+        return box is not None and box.currentData() == "local"
+
     def _is_cache_view(self) -> bool:
+        return self._current_source() == "cache"
+
+    def _is_inplace_view(self) -> bool:
+        """缓存 / 本地这类「数据已在本地、只需原地筛选」的视图。"""
         pool = self._pool()
         return bool(pool and pool[2])
 
     def on_search(self) -> None:
         text = self.input.text().strip()
+        # 回车立刻筛，别等防抖那 180ms
+        self._filter_timer.stop()
         if self.task is not None:
             if self._scanning_cache:
                 # 扫描只写缓存池，不冲突；先记下这次输入，扫完自动接着办
@@ -2792,6 +3285,10 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("正在处理上一个任务，稍等一下再回车")
             return
         if not text:
+            self._apply_view()
+            return
+        if self._is_local_view():
+            # 本地音乐不发请求：输入框就是筛选器
             self._apply_view()
             return
         if self._looks_like_link(text):
@@ -2821,16 +3318,18 @@ class MainWindow(QMainWindow):
             self.songs = []
             self._fill_result_table()
             self.result_info.setText("输入关键词开始搜索")
+            # 表头也要跟着音源还原（本地视图第 5 列叫「大小」）
+            self._update_header_sort_style()
             self._update_empty_hint()
             self._update_download_button()
             return
 
-        songs, title, is_cache = pool
+        songs, title, in_place = pool
         self._list_cleared = False
         kw = self.input.text().strip().lower()
-        # 只有缓存视图才在本地按关键词筛：接口搜索的结果本来就是匹配过的，
+        # 缓存 / 本地这类本地列表才按关键词筛：接口搜索的结果本来就是匹配过的，
         # 再筛一遍会把「搜到的但标题里没这个词」的歌误删
-        filtering = is_cache and bool(kw) and not self._looks_like_link(kw)
+        filtering = in_place and bool(kw) and not self._looks_like_link(kw)
         items = songs
         if filtering:
             items = [
@@ -2848,8 +3347,10 @@ class MainWindow(QMainWindow):
             self.result_info.setText(f"{title} · 匹配 {len(items)} 首")
         else:
             self.result_info.setText(f"{title} · 共 {len(items)} 首")
-        # 「加载更多」只对接口搜索有意义：缓存视图和链接解析出来的列表是完整的
-        self.btn_more.setVisible(self._has_more and not is_cache and not filtering)
+        # 「加载更多」只对接口搜索有意义：本地列表和链接解析出来的结果是完整的
+        self.btn_more.setVisible(self._has_more and not in_place and not filtering)
+        if hasattr(self, "queue_hint"):
+            self._refresh_queue_hint_text()
         self._update_empty_hint()
         self._update_header_sort_style()
         self._update_download_button()
@@ -2872,7 +3373,20 @@ class MainWindow(QMainWindow):
             self.empty_hint.setText("列表已清空\n点状态栏的刷新按钮重新载入")
             self.empty_hint.show()
             return
-        if self._is_cache_view():
+        if self._is_local_view():
+            if self._local_scanning:
+                self.empty_hint.setText("正在扫描本地音乐…\n第一次会慢一点，之后走索引")
+            elif self._local_error:
+                self.empty_hint.setText(
+                    f"扫描本地音乐失败\n{self._local_error}\n"
+                    "到「设置 → 本地音乐」确认目录还在不在"
+                )
+            else:
+                self.empty_hint.setText(
+                    "本地音乐还是空的\n"
+                    "到「设置 → 本地音乐目录」选一个目录，或者把音频文件拖进窗口"
+                )
+        elif self._is_cache_view():
             if self._cache_scan_failed:
                 self.empty_hint.setText(
                     "没能读到本地缓存\n"
@@ -2906,12 +3420,12 @@ class MainWindow(QMainWindow):
         self.input.set_history(history)
 
     def _on_input_changed(self, text: str) -> None:
-        # 只有缓存视图才边打字边过滤，接口搜索结果不这么做
-        if not self._is_cache_view():
+        # 缓存 / 本地视图边打字边过滤，接口搜索结果不这么做
+        if not self._is_inplace_view():
             return
         if self._looks_like_link(text.strip()):
             return
-        self._apply_view()
+        self._filter_timer.start()
 
     def _clear_current(self) -> None:
         """清空当前音源的结果，不影响其他音源已载入的内容。"""
@@ -3191,6 +3705,87 @@ class MainWindow(QMainWindow):
         self._update_empty_hint()
         self._update_download_button()
         self.status_label.setText("列表已清空")
+
+    # ---------------- 本地音乐 ----------------
+
+    def _local_dirs(self) -> list[Path]:
+        dirs = [self.out_dir]
+        if self._local_dir is not None:
+            dirs.append(self._local_dir)
+        return dirs
+
+    def _apply_source_chrome(self) -> None:
+        """本地音乐：收掉下载队列和下载相关控件；切回在线 / 缓存再还原。"""
+        local = self._is_local_view()
+        if local:
+            self.queue_sheet.hide()
+            self.queue_dock.hide()
+            self.queue_panel.hide()
+            self.level_label.hide()
+            self.level_box.hide()
+            self.btn_download.hide()
+            self.btn_rescan.show()
+            self.input.setPlaceholderText("在本地音乐中筛选")
+            return
+        self.btn_download.show()
+        self.btn_rescan.hide()
+        self.level_box.show()
+        if not self._mini:
+            self.level_label.show()
+        self.input.setPlaceholderText(
+            "搜索歌名或粘贴链接" if self._mini else "搜索歌名，或粘贴歌曲 / 歌单链接"
+        )
+        # 队列按当前模式和设置重新摆一次（本地视图期间它是被强制藏起来的）
+        self._apply_mini_queue()
+
+    def on_load_local(self) -> None:
+        """扫描下载目录 + 本地音乐目录，结果放进 local 池。"""
+        if self._local_scanning:
+            return
+        self._local_scanning = True
+        self._local_error = ""
+        self._pools.pop("local", None)
+        self.songs = []
+        self._fill_result_table()
+        self.result_info.setText("本地音乐 · 正在扫描")
+        self.btn_more.hide()
+        self._update_empty_hint()
+        self._update_download_button()
+        self.status_label.setText("正在扫描本地音乐…（第一次会慢一点）")
+        threading.Thread(
+            target=self._local_worker, args=(self._local_dirs(),), daemon=True
+        ).start()
+
+    def _local_worker(self, dirs: list[Path]) -> None:
+        from ncm.paths import data_dir
+
+        try:
+            tracks = local_mod.scan(dirs, local_mod.index_path(data_dir()))
+        except Exception as exc:  # noqa: BLE001
+            self.local_ready.emit([], f"{type(exc).__name__}: {exc}")
+            return
+        self.local_ready.emit(tracks, None)
+
+    def _local_ready(self, tracks, error) -> None:
+        self._local_scanning = False
+        if error is not None:
+            self._local_error = str(error)
+            self.status_label.setText(f"扫描本地音乐失败：{error}")
+            self._update_empty_hint()
+            return
+        self._local_error = ""
+        songs = [
+            Song(track.id, track.name, list(track.artists), track.album, track.duration)
+            for track in tracks
+        ]
+        self._local_paths = {track.id: track.path for track in tracks}
+        self._pools["local"] = (songs, "本地音乐", True)
+        if self._is_local_view():
+            self._apply_view()
+            self.status_label.setText(
+                f"本地音乐 · {len(songs)} 首"
+                + ("" if self._local_dir is None else f"（含 {self._local_dir.name}）")
+            )
 
     def on_load_cache(self) -> None:
         """扫描客户端缓存并列出结果。
@@ -3521,14 +4116,22 @@ class MainWindow(QMainWindow):
         # 紧凑模式下音质并入时长列，音质列一律隐藏；进度列仍只看音源
         compact = self._compact_mode
         is_cache = self._current_source() == "cache"
+        is_local = self._current_source() == "local"
         show_quality = is_cache and not compact
-        table.setColumnHidden(5, not show_quality)
+        show_size = is_local and not compact
+        table.setColumnHidden(5, not (show_quality or show_size))
         table.setColumnHidden(6, not is_cache)
+        # 本地音乐没有勾选/批量下载，勾选列直接收掉，曲名从最左边开始
+        table.setColumnHidden(0, is_local)
         btn_sort = getattr(self, "btn_sort", None)
         if btn_sort is not None:
             btn_sort.setVisible(show_quality)  # 排序按钮同理
-        self._ensure_audio_store()
-        store = self._audio_store
+        if is_local:
+            # 本地曲目用负数 id 和在线/缓存隔开，没必要去查下载索引
+            store = None
+        else:
+            self._ensure_audio_store()
+            store = self._audio_store
         table.blockSignals(True)
         table.setRowCount(len(self.songs))
         for row, song in enumerate(self.songs):
@@ -3562,15 +4165,27 @@ class MainWindow(QMainWindow):
             album.setToolTip(song.album)
             table.setItem(row, 3, album)
 
-            # 音质单列：只有缓存视图知道码率，其它视图留空
+            # 音质单列：缓存视图是码率；本地视图这一列改成文件大小
             rate_text = self._cache_rates.get(song.id, "")
-            quality = QTableWidgetItem(rate_text)
+            size_text = ""
+            if is_local:
+                local_path = self._local_paths.get(song.id)
+                try:
+                    size_text = _fmt_size(local_path.stat().st_size) if local_path else ""
+                except OSError:
+                    size_text = ""
+            cell_text = size_text if is_local else rate_text
+            quality = QTableWidgetItem(cell_text)
             quality.setForeground(QColor(MUTED))
             quality.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            quality.setToolTip(f"缓存音质 {rate_text}" if rate_text else "")
+            if is_local:
+                quality.setToolTip(f"文件大小 {size_text}" if size_text else "")
+            else:
+                quality.setToolTip(f"缓存音质 {rate_text}" if rate_text else "")
             table.setItem(row, 5, quality)
 
-            # 时长列：紧凑模式下音质并进来（完整模式音质有独立列）
+            # 时长列：紧凑模式下缓存视图把音质并进来（完整模式另有独立列）。
+            # 本地视图不并：88px 放不下「4:18 · 4.5 MB」，会截成半截
             if compact and is_cache and rate_text:
                 duration = QTableWidgetItem(f"{song.duration_text} · {rate_text}")
                 duration.setToolTip(f"缓存音质 {rate_text}")
@@ -3656,6 +4271,11 @@ class MainWindow(QMainWindow):
         return "导出" if self._current_source() == "cache" else "下载"
 
     def _update_download_button(self, *_args) -> None:
+        # 本地音乐没有下载动作，主按钮整只收起来（下载中的批次仍可在别的音源里取消）
+        if self._is_local_view():
+            self.btn_download.hide()
+            return
+        self.btn_download.show()
         if self.batch is not None:
             return
         # 暂停后主按钮接着下：以前这里会变回「下载选中」，点下去把整批
@@ -3692,6 +4312,8 @@ class MainWindow(QMainWindow):
         self.on_download()
 
     def _build_context_menu(self, song: Song) -> QMenu:
+        if self._is_local_view():
+            return self._build_local_menu(song)
         menu = QMenu(self)
         picked = len(self._selected_songs())
         idle = self.batch is None
@@ -3742,6 +4364,23 @@ class MainWindow(QMainWindow):
         menu.addAction("在浏览器打开").setData("open")
         return menu
 
+    def _build_local_menu(self, song: Song) -> QMenu:
+        """本地音乐没有下载/链接/ID 这些在线概念，只留播放和文件操作。"""
+        menu = QMenu(self)
+        menu.addAction("播放").setData("play")
+        menu.addAction("仅播放此曲").setData("play_one")
+        menu.addSeparator()
+        act_reveal = menu.addAction("在文件夹中显示")
+        act_reveal.setData("reveal")
+        act_reveal.setEnabled(bool(self._song_path(song)))
+        menu.addAction("复制「歌名 - 歌手」").setData("copy_text")
+        act_path = menu.addAction("复制文件路径")
+        act_path.setData("copy_path")
+        act_path.setEnabled(bool(self._song_path(song)))
+        menu.addSeparator()
+        menu.addAction("清空当前结果").setData("clear")
+        return menu
+
     def _show_context_menu(self, pos) -> None:
         index = self.result_table.indexAt(pos)
         if not index.isValid():
@@ -3773,6 +4412,11 @@ class MainWindow(QMainWindow):
         elif key == "copy_text":
             QApplication.clipboard().setText(f"{song.name} - {song.artist_text}")
             self.status_label.setText("已复制歌名与歌手")
+        elif key == "copy_path":
+            path = self._song_path(song)
+            if path is not None:
+                QApplication.clipboard().setText(str(path))
+                self.status_label.setText("已复制文件路径")
         elif key == "copy_id":
             QApplication.clipboard().setText(str(song.id))
             self.status_label.setText(f"已复制 ID {song.id}")
@@ -3994,6 +4638,7 @@ class MainWindow(QMainWindow):
         self._dl_totals = {}
         self._close_queue_sheet()
         self._update_mini_queue(force=True)
+        self._apply_queue_layout()
         self._update_download_button()
 
     def _close_queue_sheet(self) -> None:
@@ -4073,10 +4718,16 @@ class MainWindow(QMainWindow):
 
             status = QTableWidgetItem("等待")
             status.setForeground(QColor(MUTED))
+            # 紧凑卡里状态贴右边缘，标准表格里跟在进度条后面左对齐
+            status.setTextAlignment(
+                (Qt.AlignRight if self._mini else Qt.AlignLeft) | Qt.AlignVCenter
+            )
             table.setItem(row, 1, status)
 
             bar = QProgressBar()
-            bar.setRange(0, 0)
+            # 等待中的行是空条，不要跑马灯：一排红色滑块看着像同时在下载
+            bar.setRange(0, 1000)
+            bar.setValue(0)
             bar.setTextVisible(False)
             bar.setFixedHeight(6)
             holder = QWidget()
@@ -4096,6 +4747,8 @@ class MainWindow(QMainWindow):
         self.queue_info.setText(f"下载队列 · {len(songs)} 首")
         self.summary_label.setText("")
         self._cache_missing = []
+        # 有任务了：从「空态一行」展开回正常高度
+        self._apply_queue_layout()
         # 开始下载时把折叠面板拉开，别让用户以为没在动
         if self._mini and self._mini_queue_mode == "panel" and not self._mini_queue_open:
             self._mini_queue_open = True
@@ -4330,6 +4983,17 @@ class MainWindow(QMainWindow):
                 text = cache_link if self._mini else text + "　" + cache_link
             self.status_label.setText(text)
         self.queue_info.setText(f"下载队列 · 已完成 {len(results)} 首")
+        # 全部跑完又没有失败：明细已经没什么可看的，卡片自动收成
+        # 「N 首已完成 · 清空」；想看明细节点击顶栏还能展开
+        if (
+            self._mini
+            and self._mini_queue_mode == "panel"
+            and not self._failed
+            and not self._paused
+            and not cancelled
+        ):
+            self._mini_queue_open = False
+            self._apply_mini_queue_collapse()
         self._update_mini_queue(force=True)
 
         log.info("批量完成：%s，共 %.1f MB", dict(stats), total_bytes / 1048576)
@@ -4433,6 +5097,9 @@ class MainWindow(QMainWindow):
             keep_before = self.settings.value("keep_cache", False, type=bool)
             self.settings.setValue("startup_view", dialog.startup_view.currentData())
             self.settings.setValue("mini_queue", dialog.mini_queue.currentData())
+            self.settings.setValue(
+                "close_action", "tray" if dialog.close_tray.isChecked() else "quit"
+            )
             if self._mini:
                 # 形态换了立刻生效，不用退出紧凑模式
                 self._apply_mini_queue()
@@ -4457,6 +5124,14 @@ class MainWindow(QMainWindow):
             self.settings.setValue(
                 "cache_dir", str(self.cache_dir) if self.cache_dir else ""
             )
+            # 本地音乐目录：换了目录且正停在本地视图，立刻重扫
+            local_before = self._local_dir
+            self._local_dir = dialog.local_dir
+            self.settings.setValue(
+                "local_dir", str(self._local_dir) if self._local_dir else ""
+            )
+            if self._local_dir != local_before and self._is_local_view():
+                self.on_load_local()
             # 设置里可能刚清空过搜索历史，回去要立刻反映出来
             self.input.set_history(self._load_history())
             if dialog.changed:
@@ -4589,11 +5264,14 @@ class MainWindow(QMainWindow):
             self.account_label.setToolTip("在「设置」里扫码登录")
 
     def _song_path(self, song: Song) -> Path | None:
-        """这首歌在本机的文件：已下载 → 缓存存档 → 客户端缓存。
+        """这首歌在本机的文件：本地音乐 → 已下载 → 缓存存档 → 客户端缓存。
 
         缓存列表里的歌大多只有客户端那份 .uc，之前只查下载记录，
         右键「在文件夹中显示」永远是灰的。
         """
+        local = self._local_paths.get(song.id)
+        if local is not None and local.exists():
+            return local
         self._ensure_audio_store()
         if self._audio_store is not None:
             row = self._audio_store.get(song.id)
@@ -4643,20 +5321,33 @@ class MainWindow(QMainWindow):
         key = self.source_box.currentData()
         self.settings.setValue("source", key)
         self.status_label.setText(f"音源：{SOURCE_LABEL.get(key, key)}")
-        # 文案跟着音源走（缓存是「导出」），扫缓存是异步的，先立刻换掉按钮字
+        # 本地音乐没有下载队列，先把界面切成对应的形态
+        self._apply_source_chrome()
         self._update_download_button()
         # 每次切到「仅本地缓存」都重扫：客户端那边可能刚缓存了新歌，
         # 或者用户清过缓存，吃旧结果会显示已经不存在的东西
         if key == "cache":
             self.on_load_cache()
             return
+        if key == "local":
+            self.on_load_local()
+            return
         self._apply_view()
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        # 设成「关闭到托盘」时，点 × 只是收起来，不退出
+        if self._should_hide_on_close():
+            event.ignore()
+            self._hide_to_tray()
+            return
         dev = getattr(self, "_dev_window", None)
         if dev is not None:
             dev.close()
             self._dev_window = None
+        con = getattr(self, "_console_window", None)
+        if con is not None:
+            con.close()
+            self._console_window = None
         if self.batch is not None:
             self.batch.wait(3000)
         self.settings.setValue("out_dir", str(self.out_dir))
