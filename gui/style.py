@@ -14,6 +14,45 @@ _ASSET_DIR = Path(__file__).parent / "assets"
 _ARROW = (_ASSET_DIR / "arrow_down.png").as_posix()
 _CHECK = (_ASSET_DIR / "check.png").as_posix()
 
+
+def scrollbar_qss(top_margin: int = 5, hide_handle: bool = False) -> str:
+    """竖向滚动条样式。``top_margin`` 是滑槽距控件顶端的像素，用来避开表头。
+
+    单独抽成函数是因为：给某个滚动条设了 widget 级样式表之后，应用级 QSS 里
+    针对它的 ``::handle`` 规则就不再生效（滑块会变成没圆角的实心方块）。
+    所以这块样式必须整段复用，不能只在外面覆盖一个 margin。
+
+    ``hide_handle`` 给空表用：滚动条仍占着位置（这样视口不会盖住表格圆角），
+    但滑块透明，看起来就是「没有滚动条」。
+    """
+    handle_bg = "transparent" if hide_handle else "#55555f"
+    return f"""
+QScrollBar:vertical {{
+    /* 悬浮式：只留滑块，槽透明。槽带底色会糊住表格右上/右下角的 1px 边框 */
+    background: transparent;
+    width: 11px;
+    margin: {top_margin}px 2px 5px 2px;
+    border: none;
+}}
+QScrollBar::handle:vertical {{
+    background: {handle_bg};
+    border-radius: 4px;
+    min-height: 28px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: {"transparent" if hide_handle else "#6e6e7c"};
+}}
+QScrollBar::handle:vertical:pressed {{
+    background: {"transparent" if hide_handle else "#85859a"};
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+    height: 0;
+    background: none;
+}}
+"""
+
+
 QSS = f"""
 QWidget {{
     background: {BG};
@@ -21,7 +60,6 @@ QWidget {{
     font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
     font-size: 12px;
 }}
-
 QMainWindow {{
     background: transparent;
 }}
@@ -233,29 +271,7 @@ QWidget#barHolder {{
     background: transparent;
 }}
 
-QScrollBar:vertical {{
-    /* 常驻可见：太细太淡会看不见。宽度留给圆角滑块，上下留一点不让它顶满 */
-    background: rgba(255, 255, 255, 0.04);
-    width: 11px;
-    margin: 4px 2px;
-    border-radius: 5px;
-}}
-QScrollBar::handle:vertical {{
-    background: #55555f;
-    border-radius: 4px;
-    min-height: 28px;
-}}
-QScrollBar::handle:vertical:hover {{
-    background: #6e6e7c;
-}}
-QScrollBar::handle:vertical:pressed {{
-    background: #85859a;
-}}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
-    height: 0;
-    background: none;
-}}
+{scrollbar_qss()}
 QScrollBar:horizontal {{
     /* 横向滚动条在表格里是禁用的；这里给个实底，万一将来哪个控件用到，
        不会再出现「透明条透出桌面」的白条 */
@@ -482,6 +498,24 @@ QListWidget#historyList::item:hover {{
 QListWidget#historyList::item:selected {{
     background: #34343d;
     color: #ffffff;
+}}
+
+/* 紧凑模式的下载队列：单行停靠条 + 点开的明细浮层 */
+QWidget#miniQueueDock {{
+    background: #202024;
+    border: none;
+    border-top: 1px solid #2c2c33;
+}}
+QFrame#queueSheet {{
+    background: #232327;
+    border: 1px solid #3a3a42;
+    border-radius: 8px;
+}}
+/* 浮层里的行/文字必须透明：全局 QWidget 规则会给每个子控件刷上更深的底色，
+   子控件不会被父级圆角裁切，左上角就会露出一块直角深色方块 */
+QFrame#queueSheet QWidget,
+QFrame#queueSheet QLabel {{
+    background: transparent;
 }}
 
 QMenu {{

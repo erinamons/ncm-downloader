@@ -13,10 +13,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 SRC = Path("pack/网易云下载器")
 OUT_DIR = Path("dist")
-EXCLUDE_NAMES = {"config.json", "settings.ini", "app.log", "app.log.1", "app.log.2"}
+EXCLUDE_NAMES = {
+    "config.json",
+    "settings.ini",
+    "app.log",
+    "app.log.1",
+    "app.log.2",
+    # 上一运行是否正常退出的状态，属于本机数据
+    "run-state.json",
+}
 # crash.log 是 windowed 模式的崩溃栈，随包发出去既没用又难看
 EXCLUDE_SUFFIXES = {".log"}
-EXCLUDE_DIRS = {"play-cache", "downloads"}
+EXCLUDE_DIRS = {"play-cache", "downloads", "diagnostics"}
 
 
 def main() -> int:

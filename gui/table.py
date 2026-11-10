@@ -19,6 +19,8 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from gui.style import scrollbar_qss
+
 MIN_FLUID = 160
 NAME_COLOR = "#d8d8dc"
 MUTED_COLOR = "#96969e"
@@ -127,54 +129,77 @@ class FluidTable(QTableWidget):
         self._sync_scrollbar()
 
     def _sync_scrollbar(self) -> None:
-        """空表不显示滚动条：范围是 0 时滑块会铺满整条槽，看着像根竖线。"""
-        policy = Qt.ScrollBarAlwaysOff if self.rowCount() == 0 else Qt.ScrollBarAlwaysOn
-        if self.verticalScrollBarPolicy() != policy:
-            self.setVerticalScrollBarPolicy(policy)
+        """滚动条常驻。
+
+        以前空表会把滚动条关掉，但视口随之变宽，会盖住表格右上角那圈圆角
+        （视口是方的，边框是圆的）。现在让滚动条一直占位，空表时靠
+        ``scrollbar_qss(hide_handle=True)`` 把滑块画成透明，视觉上一样是空的。
+        """
+        if self.verticalScrollBarPolicy() != Qt.ScrollBarAlwaysOn:
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
             # 滚动条显隐会改变视口宽度，弹性列得跟着重算
             self._fill_fluid()
         self._place_corner()
 
     def _place_corner(self) -> None:
-        """把滚动条压到表头下方，并用同色补丁补齐表头右侧那条竖缝。
+        """让竖滚动条从表头下方开始，并补齐表头与右边框之间的缝。
 
         Qt 默认让竖向滚动条贯穿整张表（连表头右侧都是它），看起来像「越界」。
-        盖一块补丁没用——滚动条容器是后绘制的，会压在补丁上面；直接改容器的
-        几何才稳。
+        试过三种做法：
+        - 改 ``qt_scrollarea_vcontainer`` 的几何：容器归 QAbstractScrollArea
+          自己排版，滚动/改策略时会被摆回去，还会留下没重绘的鬼影；
+        - 用子控件补丁盖：QAbstractScrollArea 每次 layoutChildren 都会把滚动条
+          raise 到补丁上面，盖不住；
+        - 给滚动条 setMask 切掉表头那段：能挡住，但切口是平的，像被削断。
+
+        最终用 QScrollBar 自己的 ``margin-top``：滑槽从表头下沿开始，滑块
+        整段落在内容区里，顶端还是它自己的圆角，位置是「真的」在下面而不是
+        被盖住。补丁只剩一个作用——用表头色补上「表头右端到边框」那条缝。
         """
         if not hasattr(self, "_corner"):
             return
         bar = self.verticalScrollBar()
         container = bar.parentWidget()
-        header_h = self.horizontalHeader().height()
+        header = self.horizontalHeader()
+        # 表头藏起来时（紧凑窗口的队列表）高度要按 0 算，否则滚动条会被盖掉一段
+        header_h = header.height() if header.isVisible() else 0
+        # 滚动条隐藏时 width() 可能是 0，退回 sizeHint，别让补丁宽度算成负的
+        bar_w = bar.width() or bar.sizeHint().width() or 11
 
-        # 先挪容器：这一步即使滚动条还没显示也要做，否则首帧还是贯穿的
-        width = bar.width()
         if container is not None and container is not self and container.objectName().startswith(
             "qt_scrollarea_vcontainer"
         ):
-            height = max(0, self.height() - header_h - 1)
-            target = (self.width() - width - 1, header_h, width, height)
-            if container.geometry().getRect() != target:
-                container.setGeometry(*target)
+            # 容器自带一层底色，正好糊住表格右下角那圈圆角弧线；清成透明，
+            # 让边框完整闭合（只作用于这个容器本身，不影响里面的滑块）
+            if not getattr(container, "_ncm_clear_bg", False):
+                container.setStyleSheet(
+                    "QWidget#qt_scrollarea_vcontainer { background: transparent; }"
+                )
+                container._ncm_clear_bg = True
 
-        if not bar.isVisible():
-            self._corner.hide()
-            return
+        # 贴着右边框内侧（右边留 1px 给边框），顶边也让 1px
+        rect = (max(1, self.width() - 1 - bar_w), 1, bar_w, max(1, header_h))
+        if self._corner.geometry().getRect() != rect:
+            self._corner.setGeometry(*rect)
+        if not self._corner.isVisible():
+            self._corner.show()
 
-        # 表头只铺到 viewport 宽度，右侧这条缝要用同色补上，否则露底色
-        self._corner.setGeometry(
-            self.width() - width - 1, 0, width + 1, header_h + 1
-        )
-        self._corner.show()
+        # 真正让滚动条「从表头下面开始」的是它自己的上边距：QScrollBar 的
+        # margin 决定了滑槽的起止，把上边距设成表头高度，滑块就整段落在表头
+        # 下方，位置是真的在下面而不是被盖住或削断。改容器几何会被 Qt 排版
+        # 摆回去，setMask 又会留下一个平口。
+        empty = self.rowCount() == 0
+        if getattr(bar, "_ncm_inset", None) != (header_h, empty):
+            bar.setStyleSheet(scrollbar_qss(header_h + 2, hide_handle=empty))
+            bar._ncm_inset = (header_h, empty)
 
     def scrollContentsBy(self, dx: int, dy: int) -> None:
         super().scrollContentsBy(dx, dy)
         self._place_corner()
 
     def paintEvent(self, event) -> None:
-        # 有些布局路径（换策略、动态调整视口边距）会悄悄把容器挪回去，
-        # 这里每次绘制前对一眼几何，不对就按回去，成本是四次整数比较
+        # 滚动条的 margin / 补丁几何都在 _place_corner 里对齐，绘制后再对一眼，
+        # 成本只是几次整数比较，却能兜住换策略、动态改视口边距这些路径
         super().paintEvent(event)
         self._place_corner()
 

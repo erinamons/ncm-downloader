@@ -838,6 +838,15 @@ class TopBar(QWidget):
     # ---------------- 窗口动作 ----------------
 
     def _toggle_max(self) -> None:
+        # 紧凑模式下点最大化 = 想用标准窗口：先把布局整体还原，再最大化。
+        # 只放大窗口不还原状态的话，窗口宽了、下载队列还是折叠面板那套，
+        # 看起来就像「标准窗口的队列被改坏了」。
+        if getattr(self._win, "_mini", False):
+            self._win.toggle_mini()
+            if not self._win.isMaximized():
+                self._win.showMaximized()
+            self.sync_window()
+            return
         if self._win.isMaximized():
             self._win.showNormal()
         else:
@@ -904,6 +913,11 @@ class TopBar(QWidget):
         # 拖动改宽度时每帧都判一次 940 阈值会让标题反复显隐、整条重排，
         # 看起来就是左右拉伸在闪——攒到停手后再切。
         self._layout_timer.start()
+
+    def set_title(self, text: str) -> None:
+        """改标题文字。开发者面板灌模拟数据时会在后面挂个标记。"""
+        self.name.setText(text)
+        self._sync_title_visibility()
 
     def _sync_title_visibility(self) -> None:
         self.name.setVisible(not self._compact and self.width() >= 940)

@@ -6,8 +6,6 @@
 from __future__ import annotations
 
 import logging
-import sys
-import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -21,10 +19,17 @@ _FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 def log_path() -> Path:
     return auth.config_dir() / "app.log"
 
+
 def setup_logging(level: int = logging.INFO) -> Path:
-    """挂上文件日志，并把未捕获异常也记进去。重复调用无副作用。"""
+    """挂上文件日志，并开启常驻记录。重复调用无副作用。"""
     path = log_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 常驻记录（环形缓冲 + 异常钩子 + Qt 告警 + 崩溃现场落盘）统一在这里开，
+    # 不依赖开发者面板是否打开；面板晚点打开时用它的 snapshot 补历史。
+    from ncm.runlog import runlog
+
+    runlog.install()
 
     root = logging.getLogger()
     for handler in root.handlers:
@@ -37,21 +42,4 @@ def setup_logging(level: int = logging.INFO) -> Path:
     )
     handler.setFormatter(logging.Formatter(_FORMAT, "%Y-%m-%d %H:%M:%S"))
     root.addHandler(handler)
-
-    def _hook(exc_type, exc, tb):
-        logging.getLogger("ncm").critical(
-            "未捕获异常", exc_info=(exc_type, exc, tb)
-        )
-        sys.__excepthook__(exc_type, exc, tb)
-
-    sys.excepthook = _hook
-
-    def _thread_hook(args):
-        logging.getLogger("ncm").critical(
-            "线程 %s 异常",
-            getattr(args.thread, "name", "?"),
-            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
-        )
-
-    threading.excepthook = _thread_hook
     return path

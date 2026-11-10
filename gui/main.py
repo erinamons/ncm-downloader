@@ -61,8 +61,10 @@ from PyQt5.QtWidgets import (
 )
 
 from ncm import LocalBackend, Store
+from ncm import __version__ as APP_VERSION
 from ncm import auth
 from ncm.trace import trace
+from ncm.runlog import runlog
 from ncm import archive as archive_mod
 from ncm import cache as cache_mod
 from ncm.downloader import (
@@ -93,11 +95,19 @@ from gui.combo import style_combo
 from gui.dialog import MessageDialog, RoundDialog
 from gui.help import HelpDialog
 from gui.inputs import HistoryLineEdit
+from gui.console import CommandConsole, ConsoleWindow
+from gui.mini_queue import MiniQueueDock, QueueHeader, QueueSheet
+from gui.mockdata import MockData
 from gui.shadow import clip_outside_window, render_shadow
 from gui.style import BG, MUTED, PANEL, QSS
 from gui.table import FluidTable, TwoLineNameDelegate
 from gui.player import BUFFERING, LOADING, PAUSED, PLAYING, PlayerEngine, TopBar
 from gui.workers import BatchTask, Task
+
+# GUI 一起进程就开始记：导入这个模块就意味着界面要起来了。放在这里而不是
+# MainWindow.__init__，是为了把「窗口构造之前」的日志（依赖初始化、后端探测）
+# 也收进环形缓冲，面板晚开时才能补出完整历史
+runlog.install()
 
 HEADERS = ["", "曲名", "艺人", "专辑", "时长", "音质", "进度"]
 
@@ -234,6 +244,17 @@ def _bar_qss(color: str) -> str:
         "QProgressBar { background: #2e2e34; border: none; border-radius: 3px; }"
         f"QProgressBar::chunk {{ background: {color}; border-radius: 3px; }}"
     )
+
+def _status_tone(text: str) -> str:
+    """队列状态词 -> 浮层里的颜色语气。"""
+    if text.startswith("完成"):
+        return "ok"
+    if text.startswith(("失败", "无版权")):
+        return "fail"
+    if text.startswith(("缓存", "仅试听")):
+        return "warn"
+    return "muted"
+
 
 
 class SettingsDialog(RoundDialog):
@@ -454,6 +475,22 @@ class SettingsDialog(RoundDialog):
         )
         style_combo(self.startup_view)
         form.addRow("启动视图", self.startup_view)
+
+        self.mini_queue = QComboBox()
+        self.mini_queue.addItem("折叠面板（底部，可收起）", "panel")
+        self.mini_queue.addItem("单行停靠（点开看全部）", "dock")
+        self.mini_queue.addItem("不显示", "off")
+        saved_queue = settings.value("mini_queue", "panel", type=str)
+        self.mini_queue.setCurrentIndex(
+            max(0, self.mini_queue.findData(saved_queue))
+        )
+        self.mini_queue.setToolTip(
+            "只影响紧凑模式（400px 窄窗口）；标准窗口里队列始终是完整表格。\n"
+            "折叠面板：占一块高度，标题行可直接收起，进度一直看得见。\n"
+            "单行停靠：只占一行，点一下弹出明细。"
+        )
+        style_combo(self.mini_queue)
+        form.addRow("紧凑队列", self.mini_queue)
 
         history_row = QHBoxLayout()
         history_row.setSpacing(8)
@@ -944,6 +981,15 @@ class MainWindow(QMainWindow):
         self._dl_totals: dict[int, int] = {}
         self._dl_sample = None
         self._scan_log_sig = None
+        # 紧凑模式的队列：折叠面板的展开状态、当前形态、待联网补下的曲目
+        self._mini_queue_open = True
+        self._mini_queue_mode = "panel"
+        self._cache_missing: list[Song] = []
+        self._mini_q_ts = 0.0
+        # 进紧凑模式前的分栏比例；_mini_transition 用于挡住切换过程中的
+        # resize 事件，不然「恢复标准窗口」会被当成用户把窗口拉宽而重入
+        self._splitter_sizes: list[int] | None = None
+        self._mini_transition = False
         self._pending_query = ""
         # 切到「仅本地缓存」时若正有任务在跑，扫描请求排队等任务槽空出来；
         # 以前直接丢掉，界面会停在「音源=缓存但列表还是搜索结果」的死状态
@@ -981,7 +1027,19 @@ class MainWindow(QMainWindow):
         # 用户既找不到也没法拉回来，索性每次从固定位置开始。
         self._center_window(1000, 740)
         self.setStyleSheet(QSS)
+        # 常驻记录：从这里开始（窗口还没建完）就有日志和事件进环形缓冲，
+        # 面板晚点再打开也能看到之前发生了什么
+        runlog.install(version=APP_VERSION)
+        runlog.window = self
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(runlog.mark_clean_exit)
         self._build_ui()
+        # 命令行：独立窗口 + 开发者面板共用同一份输出与历史
+        self.console = CommandConsole(self)
+        self._console_window = None
+        # 开发者面板的模拟数据（假搜索/假队列/假缓存）。只改界面，不落盘
+        self._mock = MockData(self)
         self._refresh_account_label()
         # 盯着缓存目录：在客户端边听边缓存时列表要跟着变，攒 2.5 秒再扫一次，
         # 因为播放过程中 .uc/.idx 是连续写入的，每次都扫会一直重排表格
@@ -1060,13 +1118,20 @@ class MainWindow(QMainWindow):
 
         outer.addLayout(self._build_search_bar())
 
-        splitter = QSplitter(Qt.Vertical)
-        splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._build_result_panel())
+        self.splitter = QSplitter(Qt.Vertical)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.addWidget(self._build_result_panel())
         self.queue_panel = self._build_queue_panel()
-        splitter.addWidget(self.queue_panel)
-        splitter.setSizes([340, 300])
-        outer.addWidget(splitter, 1)
+        self.splitter.addWidget(self.queue_panel)
+        self.splitter.setSizes(self.DEFAULT_SPLITTER_SIZES)
+        outer.addWidget(self.splitter, 1)
+
+        # 紧凑模式才用得到的两种轻量队列（标准窗口全部隐藏）
+        self.queue_dock = MiniQueueDock(body)
+        self.queue_dock.clicked.connect(self._toggle_queue_sheet)
+        self.queue_dock.hide()
+        outer.addWidget(self.queue_dock)
+        self.queue_sheet = QueueSheet(body)
 
         outer.addLayout(self._build_action_bar())
         stack.addWidget(body, 1)
@@ -1091,12 +1156,57 @@ class MainWindow(QMainWindow):
         self.tray.previous.connect(self._play_prev)
         self.tray.next.connect(self._play_next)
         self.tray.show_window.connect(self._restore_from_tray)
+        self.tray.console.connect(self.toggle_console)
         self.tray.quit_app.connect(self._quit_from_tray)
 
     def _restore_from_tray(self) -> None:
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        # 面板是独立窗口，收进托盘时一起藏了，恢复时按原状态带回来
+        if getattr(self, "_dev_was_visible", False):
+            self._dev_was_visible = False
+            dev = getattr(self, "_dev_window", None)
+            if dev is not None:
+                dev.show()
+                dev.raise_()
+        if getattr(self, "_console_was_visible", False):
+            self._console_was_visible = False
+            con = getattr(self, "_console_window", None)
+            if con is not None:
+                con.show()
+                con.raise_()
+
+    def toggle_console(self) -> None:
+        """开关独立命令行窗口。Esc 只是隐藏，输出和历史都留着。"""
+        win = self._console_window
+        if win is None:
+            win = ConsoleWindow(self.console)
+            self._console_window = win
+        if win.isVisible():
+            win.hide()
+            return
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        win.focus_input()
+
+    def refresh_dev_components(self) -> None:
+        """命令行改了设置时，开发者面板开着就顺手刷新组件页。"""
+        dev = getattr(self, "_dev_window", None)
+        if dev is not None:
+            dev._refresh_components()
+
+    def _hide_dev_with_window(self) -> None:
+        """主窗口收进托盘时，把独立出去的开发者面板一并藏起来。"""
+        dev = getattr(self, "_dev_window", None)
+        self._dev_was_visible = bool(dev is not None and dev.isVisible())
+        if self._dev_was_visible:
+            dev.hide()
+        con = getattr(self, "_console_window", None)
+        self._console_was_visible = bool(con is not None and con.isVisible())
+        if self._console_was_visible:
+            con.hide()
 
     def _quit_from_tray(self) -> None:
         if getattr(self, "tray", None) is not None:
@@ -1115,6 +1225,7 @@ class MainWindow(QMainWindow):
                 and getattr(self, "tray", None) is not None
                 and self.tray.available
             ):
+                self._hide_dev_with_window()
                 QTimer.singleShot(0, self.hide)
                 self.tray.notify("已收进托盘", "点托盘图标可以叫回来")
         super().changeEvent(event)
@@ -1190,10 +1301,23 @@ class MainWindow(QMainWindow):
             self._shadow_timer.start()
         if hasattr(self, "_compact_mode"):
             self._update_compact_mode()
+        # 紧凑模式被用户拉宽（或最大化）：窗口已经是标准尺寸了，队列却还是
+        # 折叠面板那套——必须一起还原，否则标准窗口里的下载队列「变了样」
+        if (
+            getattr(self, "_mini", False)
+            and not getattr(self, "_mini_transition", False)
+            and self.width() >= self.MIN_STANDARD_WIDTH
+        ):
+            self._exit_mini(restore_geometry=False)
 
     # 7 列完整布局的最小总宽约 764px（30+160+160+200+64+70+80），
     # 阈值要盖住它，否则 700~764 之间会出现横向滚动条
     COMPACT_WIDTH = 780
+    # 标准窗口的最小宽度（构造里的 setMinimumSize）。紧凑模式被拉到这个宽度
+    # 就说明用户想用标准窗口了，队列形态要跟着换回来
+    MIN_STANDARD_WIDTH = 840
+    # 结果区 / 队列区的默认高度比例（QSplitter 按总量等比缩放）
+    DEFAULT_SPLITTER_SIZES = (340, 300)
 
     def _update_compact_mode(self) -> None:
         """窗口过窄时切到紧凑列布局，变宽后切回完整 7 列。
@@ -1399,6 +1523,9 @@ class MainWindow(QMainWindow):
 
     def _poll_cache_dir(self) -> None:
         """兜底轮询：只比指纹，不扫内容。"""
+        # 模拟数据期间不能扫盘，否则真扫描会把假的缓存列表覆盖掉
+        if getattr(self, "_mock", None) is not None and self._mock.fake_cache:
+            return
         # 只要有缓存目录就检测，不管当前是否在缓存视图
         if self.task is not None:
             return  # 有任务在跑，等会儿再说
@@ -1441,6 +1568,8 @@ class MainWindow(QMainWindow):
 
     def _auto_refresh_cache(self) -> None:
         """缓存目录变了就静默重扫，但不打断用户正在做的事。"""
+        if getattr(self, "_mock", None) is not None and self._mock.fake_cache:
+            return
         if self.task is not None or self._current_source() != "cache":
             return
         if self._cache_scan_failed:
@@ -1589,6 +1718,10 @@ class MainWindow(QMainWindow):
 
     def _play_from_list(self, songs: list[Song], index: int) -> None:
         if not songs or not (0 <= index < len(songs)):
+            return
+        mock = getattr(self, "_mock", None)
+        if mock is not None and mock.covers(songs[index : index + 1]):
+            self.status_label.setText("这是模拟数据，没有真实音频可播；先执行「模拟数据 清除」")
             return
         self.playlist = list(songs)
         self.play_index = index
@@ -1762,14 +1895,30 @@ class MainWindow(QMainWindow):
         # 启动即紧凑时，_full_geometry 在构造里已经记好，这里不能再覆盖成紧凑尺寸
         if not keep_full_geometry:
             self._full_geometry = self.geometry()
+        # 记住标准窗口里「结果 / 队列」的分栏比例：退出时要原样还回去，
+        # 否则队列会被紧凑模式那段死高度带走，只剩两行半还被裁掉。
+        # 启动即紧凑时窗口已经是 400px，此刻量到的是紧凑尺寸，得用默认比例
+        sizes = self.splitter.sizes()
+        if keep_full_geometry or sum(sizes) <= 0 or sum(sizes) < 200:
+            sizes = list(self.DEFAULT_SPLITTER_SIZES)
+        self._splitter_sizes = sizes
         if self._was_maximized:
             self.showNormal()
         self._mini = True
+        self._mini_transition = True
 
-        self.queue_panel.hide()
         for col in (2, 3):
             self.result_table.setColumnHidden(col, True)
         self.result_table.setColumnWidth(4, 56)
+        # 400px 放不下队列的「大小」列，留着只会出横向滚动条；
+        # 表头也收掉，省下的 24px 刚好能多显示一行
+        self.queue_table.setColumnHidden(3, True)
+        self.queue_table.setColumnWidth(1, 84)
+        self.queue_table.setColumnWidth(2, 84)
+        # 紧凑窗口里进度条放前面、状态词收在右边缘，和结果表一样「先看进度再看结果」
+        self._reorder_queue_columns([0, 2, 1, 3])
+        self.queue_table.horizontalHeader().setVisible(False)
+        self.queue_table.verticalHeader().setDefaultSectionSize(26)
         self.result_table.refit()
         # 窗口尺寸还在收尾，等布局稳定后再拉一次，否则会差出一个滚动条的宽度
         QTimer.singleShot(80, self.result_table.refit)
@@ -1801,6 +1950,8 @@ class MainWindow(QMainWindow):
         self._apply_window_frame()
         self._rebuild_shadow()
         self.resize(400, max(520, min(self.height(), 620)))
+        self._apply_mini_queue()
+        self._mini_transition = False
         self.status_label.setText("紧凑模式 · Ctrl+M 还原")
 
     def _enter_mini_from_startup(self) -> None:
@@ -1808,12 +1959,28 @@ class MainWindow(QMainWindow):
         self._enter_mini(keep_full_geometry=True)
         self._center_window(self.width(), self.height())
 
-    def _exit_mini(self) -> None:
+    def _exit_mini(self, restore_geometry: bool = True) -> None:
+        """退出紧凑模式。
+
+        ``restore_geometry=False`` 用于「用户把窗口拉宽/最大化」这种被动退出：
+        窗口尺寸是他自己定的，再塞回原来的几何会跟拖拽打架。
+        """
         if not self._mini:
             return
         self._mini = False
+        self._mini_transition = True
 
         self.queue_panel.show()
+        self.queue_table.setColumnHidden(3, False)
+        self.queue_table.setColumnWidth(1, 84)
+        self.queue_table.setColumnWidth(2, 170)
+        # 紧凑时把「状态」挪到了「进度」后面，退出要挪回去
+        self._reorder_queue_columns([0, 1, 2, 3])
+        self.queue_table.horizontalHeader().setVisible(True)
+        self.queue_table.verticalHeader().setDefaultSectionSize(30)
+        self.queue_table.setMinimumHeight(0)
+        self.queue_table.setMaximumHeight(16777215)
+        self.queue_table.show()
         for col in (2, 3):
             self.result_table.setColumnHidden(col, False)
         self.result_table.setColumnWidth(2, 160)
@@ -1846,12 +2013,30 @@ class MainWindow(QMainWindow):
         self.SHADOW = 12
         self.setMinimumSize(840, 600)
         self._apply_window_frame()
-        if self._full_geometry is not None:
-            self.setGeometry(self._full_geometry)
-        if getattr(self, "_was_maximized", False):
-            self.showMaximized()
+        if restore_geometry:
+            if self._full_geometry is not None:
+                self.setGeometry(self._full_geometry)
+            if getattr(self, "_was_maximized", False):
+                self.showMaximized()
         self._rebuild_shadow()
+        self._apply_mini_queue()
+        # 队列列宽是紧凑模式按 400px 算过的，回到宽窗口必须重新拉一次弹性列，
+        # 否则「大小」列会被挤出可视区
+        self.queue_table.refit()
+        self._restore_splitter_sizes()
+        QTimer.singleShot(0, self.queue_table.refit)
+        # 分栏要在布局把窗口尺寸算完之后再摆一次，否则会被这次 resize 覆盖
+        QTimer.singleShot(0, self._restore_splitter_sizes)
+        self._mini_transition = False
         self.status_label.setText("已还原窗口")
+
+    def _restore_splitter_sizes(self) -> None:
+        """把进紧凑模式前记录的结果/队列分栏比例还原回去。"""
+        sizes = getattr(self, "_splitter_sizes", None)
+        if not sizes or len(sizes) != 2 or sum(sizes) <= 0:
+            return
+        if self.splitter.height() > 0:
+            self.splitter.setSizes(sizes)
 
     def _toggle_play(self) -> None:
         self.player.toggle()
@@ -1861,6 +2046,8 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("F1"), self, activated=self._open_help)
         QShortcut(QKeySequence("Esc"), self, activated=self._escape)
         QShortcut(QKeySequence("Ctrl+M"), self, activated=self.toggle_mini)
+        # Ctrl+` 开关命令行（和终端一致的键位）
+        QShortcut(QKeySequence("Ctrl+`"), self, activated=self.toggle_console)
         QShortcut(QKeySequence("Ctrl+Left"), self, activated=self._play_prev)
         QShortcut(QKeySequence("Ctrl+Right"), self, activated=self._play_next)
 
@@ -2052,9 +2239,18 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(6)
         self.queue_info = QLabel("下载队列")
         self.queue_info.setObjectName("muted")
-        layout.addWidget(self.queue_info)
+        head.addWidget(self.queue_info, 1)
+        # 紧凑模式专用：红色徽标 + 「2/5 · 62%」+ 小三角，整行可点
+        self.mini_header = QueueHeader(panel)
+        self.mini_header.clicked.connect(self._toggle_mini_queue)
+        self.mini_header.hide()
+        head.addWidget(self.mini_header, 1)
+        layout.addLayout(head)
 
         self.queue_table = FluidTable(0, 4, fluid_col=0)
         self.queue_table.setHorizontalHeaderLabels(["曲名", "状态", "进度", "大小"])
@@ -2064,7 +2260,7 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(2, QHeaderView.Fixed)
         header.setSectionResizeMode(3, QHeaderView.Fixed)
         self.queue_table.setColumnWidth(0, 300)
-        self.queue_table.setColumnWidth(1, 70)
+        self.queue_table.setColumnWidth(1, 84)
         self.queue_table.setColumnWidth(2, 170)
         self.queue_table.setColumnWidth(3, 80)
         self._align_header(self.queue_table, {3})
@@ -2075,6 +2271,157 @@ class MainWindow(QMainWindow):
         self.queue_table.doubleClicked.connect(self._play_queue_row)
         layout.addWidget(self.queue_table, 1)
         return panel
+
+    # ---------------- 紧凑模式的队列 ----------------
+
+    def _reorder_queue_columns(self, order: list[int]) -> None:
+        """把队列表格的可视列顺序摆成 order（逻辑列号列表）。
+
+        QHeaderView.moveSection 的 from/to 都是可视位置，直接写死数字在
+        反复进出紧凑模式时会错位，这里按目标顺序逐个摆正。
+        """
+        header = self.queue_table.horizontalHeader()
+        for position, section in enumerate(order):
+            current = header.visualIndex(section)
+            if current != position:
+                header.moveSection(current, position)
+
+    def _apply_mini_queue(self) -> None:
+        """按设置切换紧凑模式的队列形态：折叠面板 / 单行停靠 / 不显示。"""
+        mode = self.settings.value("mini_queue", "panel", type=str)
+        if mode not in ("panel", "dock", "off"):
+            mode = "panel"
+        self._mini_queue_mode = mode
+
+        if not self._mini:
+            # 标准窗口里永远是那个完整表格
+            self.queue_sheet.hide()
+            self.queue_dock.hide()
+            self.mini_header.hide()
+            self.queue_info.show()
+            self.queue_panel.show()
+            self.queue_panel.setMaximumHeight(16777215)
+            return
+
+        if mode == "off":
+            self.queue_sheet.hide()
+            self.queue_dock.hide()
+            self.mini_header.hide()
+            self.queue_panel.hide()
+            return
+
+        if mode == "dock":
+            self.queue_panel.hide()
+            self.mini_header.hide()
+            self.queue_panel.setMaximumHeight(16777215)
+            self.queue_dock.show()
+            self._update_mini_queue(force=True)
+            return
+
+        # panel：底部折叠面板
+        self.queue_dock.hide()
+        self.queue_sheet.hide()
+        self.queue_panel.show()
+        self.queue_info.hide()
+        self.mini_header.show()
+        self._apply_mini_queue_collapse()
+        self._update_mini_queue(force=True)
+
+    def _apply_mini_queue_collapse(self) -> None:
+        # 高度按行数算死：留半行会像被裁掉，看起来像 bug
+        rows = max(1, min(3, len(self._queue_songs) or 1))
+        row_h = self.queue_table.verticalHeader().defaultSectionSize()
+        table_h = rows * row_h + 2
+        head_h = self.mini_header.height() + 6
+        self.queue_table.setFixedHeight(table_h)
+        total = self.splitter.height() or 430
+        if self._mini_queue_open:
+            self.queue_table.show()
+            self.queue_panel.setMaximumHeight(16777215)
+            self.splitter.setSizes([max(160, total - head_h - table_h), head_h + table_h])
+        else:
+            # 表格有固定高度，光靠 maximumHeight 压不住：子控件会溢出到操作栏上，
+            # 所以收起时直接 hide，展开再 show
+            self.queue_table.hide()
+            self.queue_panel.setMaximumHeight(head_h)
+            self.splitter.setSizes([max(160, total - head_h), head_h])
+        self.mini_header.set_open(self._mini_queue_open)
+
+    def _toggle_mini_queue(self) -> None:
+        if not (self._mini and self._mini_queue_mode == "panel"):
+            return
+        self._mini_queue_open = not self._mini_queue_open
+        self._apply_mini_queue_collapse()
+
+    def _toggle_queue_sheet(self) -> None:
+        if not (self._mini and self._mini_queue_mode == "dock"):
+            return
+        if self.queue_sheet.isVisible():
+            self.queue_sheet.hide()
+            self.queue_dock.set_open(False)
+            return
+        self.queue_sheet.show_for(self.queue_dock, self._queue_snapshot())
+        self.queue_dock.set_open(True)
+
+    def _queue_snapshot(self) -> list[dict]:
+        """把队列表格里的状态抄成浮层要用的轻量结构。"""
+        rows: list[dict] = []
+        for song in self._queue_songs:
+            row = self.queue_rows.get(song.id)
+            text, tone = "等待", "muted"
+            if row is not None:
+                item = self.queue_table.item(row, 1)
+                if item is not None:
+                    text = item.text() or "等待"
+                    tone = _status_tone(text)
+            pct = None
+            bar = self.bars.get(song.id)
+            if bar is not None and bar.maximum() > 0:
+                pct = int(bar.value() * 100 / bar.maximum())
+            rows.append({"name": song.name, "pct": pct, "status": text, "tone": tone})
+        return rows
+
+    def _update_mini_queue(self, force: bool = False) -> None:
+        """刷新停靠条/折叠标题。进度回调很密，这里按 0.25 秒节流。"""
+        if not self._mini:
+            return
+        now = time.monotonic()
+        if not force and now - self._mini_q_ts < 0.25:
+            return
+        self._mini_q_ts = now
+
+        total = self._batch_total or len(self._queue_songs)
+        done = self._batch_done
+        busy = self.batch is not None
+        current = ""
+        active = 0
+        for song in self._queue_songs:
+            bar = self.bars.get(song.id)
+            if bar is not None and bar.maximum() > 0 and 0 < bar.value() < bar.maximum():
+                active += 1
+                if not current:
+                    current = song.name
+        if busy and not active:
+            # 刚起任务、还没收到第一段进度：徽标至少显示 1，别看起来像没在跑
+            active = 1
+        pct = 0
+        if self._dl_totals:
+            all_bytes = sum(self._dl_totals.values())
+            got = sum(self._dl_progress.values())
+            if all_bytes:
+                pct = min(100, int(got * 100 / all_bytes))
+        elif total:
+            pct = min(100, int(done * 100 / total))
+
+        if self._mini_queue_mode == "dock":
+            self.queue_dock.update_state(current, pct, done, total, busy)
+        elif self._mini_queue_mode == "panel":
+            self.mini_header.update_state(
+                done, total, pct, active, self._mini_queue_open
+            )
+
+        if self.queue_sheet.isVisible():
+            self.queue_sheet.refresh(self._queue_snapshot())
 
     def _play_queue_row(self, index) -> None:
         row = index.row()
@@ -2193,6 +2540,18 @@ class MainWindow(QMainWindow):
         self.account_label = QLabel("")
         self.account_label.setObjectName("muted")
         bar.addWidget(self.status_label, 1)
+        # 命令行入口和小图标按钮保持一致（图标 + 22×20 + helpBtn 样式），
+        # 不用「>_」文字：字号和旁边图标对不齐，看着像漏排的字符
+        self.btn_console = QPushButton()
+        self.btn_console.setObjectName("helpBtn")
+        self.btn_console.setIcon(icons.stateful("terminal", "#8b8b95", "#ffffff", 14))
+        self.btn_console.setIconSize(QSize(14, 14))
+        self.btn_console.setFixedSize(22, 20)
+        self.btn_console.setToolTip("命令行（Ctrl+`）")
+        self.btn_console.setCursor(Qt.PointingHandCursor)
+        self.btn_console.setFocusPolicy(Qt.NoFocus)
+        self.btn_console.clicked.connect(self.toggle_console)
+        bar.addWidget(self.btn_console)
         bar.addWidget(self.account_label)
         bar.addWidget(self.summary_label)
         # 汇总里的「完成 N」「失败 N」是可点的
@@ -2295,6 +2654,14 @@ class MainWindow(QMainWindow):
         if win is None:
             win = DevWindow(self)
             self._dev_window = win
+        # 面板是独立窗口，不会自动跟着主窗口居中，第一次打开时手动摆到中间
+        if not win.property("placed"):
+            geo = self.frameGeometry()
+            win.move(
+                geo.center().x() - win.width() // 2,
+                geo.center().y() - win.height() // 2,
+            )
+            win.setProperty("placed", True)
         win.show()
         win.raise_()
         win.activateWindow()
@@ -2319,6 +2686,8 @@ class MainWindow(QMainWindow):
             self._replay_song(force_remote=True)
         elif link == "remote":
             self._replay_song(force_remote=True)
+        elif link == "netdl":
+            self._redownload_missing_cache()
         elif link == "compat":
             # 用户点了「开启兼容播放」：写回设置并立刻重试当前这首。
             # 该格式已经在失败时记进 _bad_formats，重试会直接转换，不再失败一次
@@ -2326,6 +2695,32 @@ class MainWindow(QMainWindow):
             self.player.compat_play = True
             self.status_label.setText("已开启兼容播放，正在重试…")
             self._replay_song()
+
+    def _redownload_missing_cache(self) -> None:
+        """把「缓存没有 / 缓存不完整」的那些歌改用联网音源重下一遍。
+
+        只重下这几首，不碰整批；音源选择器跟着切到「自动」，免得界面上还写着
+        「仅本地缓存」，下次点下载又是一样的结果。
+        """
+        songs = list(getattr(self, "_cache_missing", []))
+        if not songs:
+            return
+        if self.batch is not None:
+            self.status_label.setText("还有下载任务在跑，等它结束再补齐")
+            return
+        # 界面下拉里只有 客户端 / 网页 / 仅缓存，没有「自动」；从缓存切走时落到客户端
+        if self._current_source() == "cache":
+            idx = self.source_box.findData("client")
+            if idx >= 0:
+                # 不触发 on_source_changed：那会把列表切回搜索结果，正在看的缓存列表就没了
+                self.source_box.blockSignals(True)
+                self.source_box.setCurrentIndex(idx)
+                self.source_box.blockSignals(False)
+                self.settings.setValue("source", "client")
+                self._update_download_button()
+        self._cache_missing = []
+        self.status_label.setText(f"正在联网补齐 {len(songs)} 首…")
+        self._start_batch(songs)
 
     def _on_summary_link(self, link: str) -> None:
         if link == "retry":
@@ -2606,6 +3001,10 @@ class MainWindow(QMainWindow):
         return text.isdigit() or "music.163.com" in text or "163cn.tv" in text
 
     def _search(self, keyword: str) -> None:
+        # 真搜索一开始，之前在调试里灌的模拟数据就作废，别让人分不清
+        mock = getattr(self, "_mock", None)
+        if mock is not None:
+            mock.on_real_action()
         self._record_history(keyword)
         self._search_keyword = keyword
         self._search_offset = 0
@@ -3439,6 +3838,11 @@ class MainWindow(QMainWindow):
         return False
 
     def _start_batch(self, songs: list[Song]) -> None:
+        # 模拟数据只在界面上存在：真去下载/导出只会拿一堆「失败」，先拦住
+        mock = getattr(self, "_mock", None)
+        if mock is not None and mock.covers(songs):
+            self.status_label.setText("当前是模拟数据，不能真的下载/导出；先执行「模拟数据 清除」")
+            return
         if not self._has_disk_space(songs):
             return
         source = self.source_box.currentData()
@@ -3582,7 +3986,21 @@ class MainWindow(QMainWindow):
         self.queue_info.setText("下载队列")
         self.summary_label.setText("")
         self.status_label.setText("已清空下载队列")
+        # 紧凑模式的停靠条/折叠标题是独立渲染的，不跟着归零就会一直挂
+        # 着上一批的「6/6 · 100%」
+        self._batch_total = 0
+        self._batch_done = 0
+        self._dl_progress = {}
+        self._dl_totals = {}
+        self._close_queue_sheet()
+        self._update_mini_queue(force=True)
         self._update_download_button()
+
+    def _close_queue_sheet(self) -> None:
+        """队列清空后把浮层收起：留一个空面板在屏幕上没有意义。"""
+        if self.queue_sheet.isVisible():
+            self.queue_sheet.hide()
+        self.queue_dock.set_open(False)
 
     def _resume_rest(self) -> list[Song]:
         """这批里还没跑完的曲目（取消掉的多半是没来得及开始的）。"""
@@ -3614,6 +4032,25 @@ class MainWindow(QMainWindow):
         self._failed = []
         self.status_label.setText(f"重试 {len(songs)} 首…")
         self._start_batch(songs)
+
+    def _close_pending_rows(self, text: str) -> int:
+        """把队列里还挂着「等待」的行改成给定状态，返回改了多少行。"""
+        changed = 0
+        color = QColor(MUTED)
+        for row in range(self.queue_table.rowCount()):
+            item = self.queue_table.item(row, 1)
+            if item is None or item.text() != "等待":
+                continue
+            item.setText(text)
+            item.setForeground(color)
+            holder = self.queue_table.cellWidget(row, 2)
+            bar = holder.findChild(QProgressBar) if holder is not None else None
+            if bar is not None:
+                # 等待时是无限滚动的忙碌条，收尾后要停成空条
+                bar.setRange(0, 1000)
+                bar.setValue(0)
+            changed += 1
+        return changed
 
     def _prepare_queue(self, songs: list[Song]) -> None:
         table = self.queue_table
@@ -3658,11 +4095,18 @@ class MainWindow(QMainWindow):
 
         self.queue_info.setText(f"下载队列 · {len(songs)} 首")
         self.summary_label.setText("")
+        self._cache_missing = []
+        # 开始下载时把折叠面板拉开，别让用户以为没在动
+        if self._mini and self._mini_queue_mode == "panel" and not self._mini_queue_open:
+            self._mini_queue_open = True
+            self._apply_mini_queue_collapse()
+        self._update_mini_queue(force=True)
 
     def _row_of(self, song_id: int) -> int | None:
         return self.queue_rows.get(song_id)
 
     def _on_song_start(self, song: Song) -> None:
+        self._update_mini_queue()
         row = self._row_of(song.id)
         if row is None:
             return
@@ -3683,6 +4127,7 @@ class MainWindow(QMainWindow):
             self._update_speed_text()
         else:
             bar.setRange(0, 0)
+        self._update_mini_queue()
 
     def _update_speed_text(self) -> None:
         """按 0.8 秒采样算总速度和剩余时间；只改状态栏，不碰表格。"""
@@ -3726,10 +4171,21 @@ class MainWindow(QMainWindow):
             return
         status = self.queue_table.item(row, 1)
         if status:
-            status.setText(STATUS_TEXT[res.status])
+            text = STATUS_TEXT[res.status]
+            tip = res.message or ""
+            if res.status == CACHE_MISS:
+                # 「无缓存」太笼统：一种是根本没有，一种是只写了一半，解法不一样
+                if "未下完" in tip:
+                    text = "缓存不完整"
+                    tip = "客户端只写了半截缓存。底部「联网下载补齐」可以取完整版。"
+                else:
+                    text = "缓存没有"
+                    tip = "客户端缓存里没有这首歌，可能没在客户端播放过。底部「联网下载补齐」可以联网取。"
+            status.setText(text)
             status.setForeground(QColor(STATUS_COLOR.get(res.status, MUTED)))
-            if res.message:
-                status.setToolTip(res.message)
+            if tip:
+                status.setToolTip(tip)
+        self._update_mini_queue(force=True)
 
         bar = self.bars.get(res.song.id)
         if bar is not None:
@@ -3801,6 +4257,12 @@ class MainWindow(QMainWindow):
             if r.status == CACHE_MISS and "缓存未下完" in (r.message or "")
         ]
 
+        # 取消/暂停时，还在排队（甚至正在跑）的曲目不会有结果回调：把还写着
+        # 「等待」的行收个尾，否则队列永远停在等待，看着像还在下
+        pending = self._close_pending_rows("已暂停" if self._paused else "已取消")
+        if pending and not self._paused:
+            cancelled += pending
+
         stats = Counter(r.status for r in results)
         total_bytes = sum(
             r.path.stat().st_size
@@ -3833,6 +4295,26 @@ class MainWindow(QMainWindow):
         )
         self.summary_label.setText(" · ".join(parts) + size_text)
         self._fade_in(self.summary_label, duration=220, start=0.3)
+
+        # 缓存没拿到 / 只拿到半截：状态栏给一句能照着做的提示，点一下就能联网补齐
+        cache_miss = [r for r in results if r.status == CACHE_MISS]
+        self._cache_missing = [r.song for r in cache_miss]
+        cache_link = ""
+        if cache_miss:
+            partial_n = sum(1 for r in cache_miss if "缓存未下完" in (r.message or ""))
+            plain_n = len(cache_miss) - partial_n
+            if partial_n == 0:
+                core = f"{len(cache_miss)} 首缓存没有"
+            elif plain_n == 0:
+                core = f"{len(cache_miss)} 首缓存不完整"
+            else:
+                core = f"{len(cache_miss)} 首缓存不完整或没有缓存"
+            tail = " · 联网补齐" if self._mini else "，切换联网下载补齐"
+            cache_link = (
+                f'<a href="netdl" style="color:#d9a13b;text-decoration:none">'
+                f"{core}{tail}</a>"
+            )
+
         failed = [r for r in results if r.status == FAILED]
         reason = self._failure_hint(failed)
         if self._paused:
@@ -3842,10 +4324,13 @@ class MainWindow(QMainWindow):
                 f"已暂停 · 剩 {left} 首未完成，点「继续{verb}」接着下"
             )
         else:
-            self.status_label.setText(
-                f"本批 {len(results)} 首处理完毕" + (f"　{reason}" if reason else "")
-            )
+            text = f"本批 {len(results)} 首处理完毕" + (f"　{reason}" if reason else "")
+            if cache_link:
+                # 紧凑模式一行放不下两句，只留可点的缓存提示
+                text = cache_link if self._mini else text + "　" + cache_link
+            self.status_label.setText(text)
         self.queue_info.setText(f"下载队列 · 已完成 {len(results)} 首")
+        self._update_mini_queue(force=True)
 
         log.info("批量完成：%s，共 %.1f MB", dict(stats), total_bytes / 1048576)
         # 增量更新结果表：只动本批成功的行，不重建表格（不丢勾选与滚动位置）。
@@ -3947,6 +4432,10 @@ class MainWindow(QMainWindow):
             self.settings.setValue("out_dir", str(self.out_dir))
             keep_before = self.settings.value("keep_cache", False, type=bool)
             self.settings.setValue("startup_view", dialog.startup_view.currentData())
+            self.settings.setValue("mini_queue", dialog.mini_queue.currentData())
+            if self._mini:
+                # 形态换了立刻生效，不用退出紧凑模式
+                self._apply_mini_queue()
             self.settings.setValue("keep_cache", dialog.keep_cache.isChecked())
             self.settings.setValue("compat_play", dialog.compat_play.isChecked())
             self.player.compat_play = dialog.compat_play.isChecked()

@@ -9,7 +9,6 @@ import logging
 import os
 import platform
 import queue
-import re
 import shutil
 import subprocess
 import threading
@@ -48,8 +47,10 @@ from PyQt5.QtWidgets import (
 )
 
 from gui import icons
+from gui.console import ConsolePanel
 from gui.dialog import RoundDialog, SHADOW
 from gui.style import QSS
+from ncm import runlog as runlog_mod
 from ncm import trace as trace_mod
 from ncm.paths import data_dir
 
@@ -63,13 +64,11 @@ ERROR_BANNER_SEC = 300
 
 _STATUS = {"ok": "完成", "fail": "失败", "skip": "跳过", "run": "进行中"}
 _LEVEL_NAME = {logging.INFO: "信息", logging.WARNING: "警告", logging.ERROR: "错误"}
+# 设置页要打码的键名（脱敏正则本身在 ncm/runlog.py）
 _SECRET_KEY = ("cookie", "token", "music_u", "csrf", "password", "auth", "session")
-_SECRET_TEXT = (
-    re.compile(r"MUSIC_U=[^;\s\"']+", re.I),
-    re.compile(r"__csrf=[^;\s\"']+", re.I),
-    re.compile(r"(?i)(cookie|token|authorization)\s*[:=]\s*\S+"),
-)
 _SCOPES = ("全部", "搜索", "缓存", "下载", "播放", "接口", "任务")
+# 日志页里标出「面板打开前」和「实时」的分界
+_HISTORY_SEP = "──── 以上为启动以来的记录 · 以下实时 ────"
 
 _DEV_CSS = """
 QTreeWidget, QPlainTextEdit {
@@ -124,15 +123,16 @@ class _QueueHandler(logging.Handler):
             pass
 
 
-def _redact(text: str) -> str:
-    for pattern in _SECRET_TEXT:
-        text = pattern.sub("***", text)
-    return text
+# 脱敏规则只有一份，在 ncm/runlog.py；日志、面板、诊断包共用
+_redact = runlog_mod.redact
 
 
 class DevWindow(RoundDialog):
     def __init__(self, window):
-        super().__init__(window, "开发者面板")
+        # 父窗口传 None：QDialog 一旦有 owner，在 Windows 上就是「被拥有的窗口」，
+        # 会永远压在主窗口上面——点主窗口也翻不到前面。这里做成独立顶层窗口，
+        # 主窗口激活时它能正常退到后面；位置由 open_devtools 负责居中。
+        super().__init__(None, "开发者面板")
         self._win = window
         self.setStyleSheet(QSS + _DEV_CSS)
         self.resize(1120 + SHADOW * 2, 680 + SHADOW * 2)
@@ -140,6 +140,13 @@ class DevWindow(RoundDialog):
         self._logs: deque[tuple[int, str, str, float]] = deque(maxlen=MAX_LOG)
         self._errors: deque[str] = deque(maxlen=MAX_ERRORS)
         self._steps: deque[dict] = deque(maxlen=1500)
+        # 面板关着的时候 runlog 照样在记：打开时按时间戳把「没见过的」补进来，
+        # 这些水位线也保证反复开关面板不会重复灌同一条记录
+        self._seen_log_ts = 0.0
+        self._seen_event_ts = 0.0
+        self._seen_error_ts = 0.0
+        self._attach_ts = 0.0
+        self._sep_done = False
         self._log_q: queue.Queue = queue.Queue()
         self._event_q: queue.Queue = queue.Queue()
         self._groups: dict[str, QTreeWidgetItem] = {}
@@ -252,6 +259,30 @@ class DevWindow(RoundDialog):
         ev = QVBoxLayout(err_panel)
         ev.setContentsMargins(0, 0, 0, 0)
         ev.setSpacing(4)
+        # 「上次异常退出」横幅：常驻记录发现上次没收干净时提示，配合崩溃现场文件
+        self.err_banner = QLabel("")
+        self.err_banner.setWordWrap(True)
+        self.err_banner.setStyleSheet(
+            "QLabel { background:#2a2023; border:1px solid #5a3a3a; border-radius:6px;"
+            " color:#e8a09a; padding:6px 10px; }"
+        )
+        self.err_banner.hide()
+        ev.addWidget(self.err_banner)
+        err_bar = QHBoxLayout()
+        err_bar.setSpacing(6)
+        err_hint = QLabel("警告以上会进这里；程序启动即开始采集，面板晚开也能看到之前的问题。")
+        err_hint.setStyleSheet("color:#7f7f88;")
+        err_hint.setWordWrap(True)
+        err_bar.addWidget(err_hint, 1)
+        btn_copy_ctx = QPushButton("复制现场")
+        btn_copy_ctx.setToolTip("版本、音源、勾选、队列、最近事件——贴出来就能复现大半问题")
+        btn_copy_ctx.clicked.connect(self._copy_context)
+        err_bar.addWidget(btn_copy_ctx)
+        btn_open_dump = QPushButton("打开崩溃现场")
+        btn_open_dump.setToolTip("打开 diagnostics 目录里的 last-crash-*.txt")
+        btn_open_dump.clicked.connect(self._open_crash_dump)
+        err_bar.addWidget(btn_open_dump)
+        ev.addLayout(err_bar)
         self.err_list = QListWidget()
         self.err_list.currentRowChanged.connect(self._show_error_detail)
         self.err_view = self._make_view()
@@ -273,7 +304,7 @@ class DevWindow(RoundDialog):
                 ("日志", self.log_view),
                 ("问题", err_panel),
                 ("组件", self._build_components()),
-                ("指令", self._build_console()),
+                ("命令行", self._build_console()),
                 ("环境", self.env_view),
             )
         ):
@@ -302,7 +333,7 @@ class DevWindow(RoundDialog):
         rv.addWidget(self.stack, 1)
         self.stack.currentChanged.connect(lambda _i: self._refresh_status())
 
-        # QDialog 里回车会点中 autoDefault 按钮：在指令页按回车执行命令的同时，
+        # QDialog 里回车会点中 autoDefault 按钮：在命令行页按回车执行命令的同时，
         # 还会把「导入回放」点一下。命令行的按钮一律不当默认按钮
         for btn in self.findChildren(QPushButton):
             btn.setAutoDefault(False)
@@ -352,11 +383,16 @@ class DevWindow(RoundDialog):
         self._status_timer.start()
         self._attach()
         self._refresh_env()
+        self._refresh_crash_banner()
 
     # ---------------- 挂载 ----------------
 
     def _attach(self) -> None:
         """挂到 root logger 和 trace 上；重复调用无副作用。"""
+        from ncm.runlog import runlog
+
+        runlog.install()
+        self._seed(runlog)
         if self._handler is None:
             self._handler = _QueueHandler(self._log_q)
             self._handler.setFormatter(
@@ -369,10 +405,40 @@ class DevWindow(RoundDialog):
         if not self._status_timer.isActive():
             self._status_timer.start()
 
+    def _seed(self, runlog) -> None:
+        """把面板没开时攒下的历史灌进来，并留一条分隔线标出「实时」从哪里开始。"""
+        snap = runlog.snapshot(0.0)
+        logs = [item for item in snap["logs"] if item[3] > self._seen_log_ts]
+        events = [item for item in snap["events"] if item.get("t", 0) > self._seen_event_ts]
+        errors = [text for ts, text in snap["errors"] if ts > self._seen_error_ts]
+        if logs:
+            self._seen_log_ts = max(self._seen_log_ts, logs[-1][3])
+        if events:
+            self._seen_event_ts = max(self._seen_event_ts, events[-1]["t"])
+        if errors:
+            self._seen_error_ts = time.time()
+        if not (logs or events or errors):
+            return
+        self._logs.extend(logs)
+        self._errors.extend(errors)
+        self._steps.extend(events)
+        # 分隔线只在「本次面板第一次打开」处画一次；之后关掉再开补进来的记录
+        # 本来就比它新，会落在它下面，不用再画第二条
+        if not self._attach_ts:
+            self._attach_ts = time.time()
+        self._sep_done = False
+        self._rebuild_log()
+        self._rebuild_errors()
+        if not self._replaying:
+            self._rebuild_steps()
+        self.count_label.setText(f"{len(self._steps)} 步")
+        self._update_problem_badge(len(self._errors))
+
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
         self._attach()
         self._refresh_env()
+        self._refresh_crash_banner()
         # 按钮挂进 QDialog 的那一刻 Qt 会把 autoDefault 重新打开（实测），回车
         # 就会点中「导入回放」这类按钮。布局挂完之后这里再关一遍才真正生效
         for btn in self.findChildren(QPushButton):
@@ -499,6 +565,11 @@ class DevWindow(RoundDialog):
         self._errors.clear()
         self._steps.clear()
         self._groups.clear()
+        # 清空只清「已显示的」，水位线推到当前，历史不会被再灌回来
+        now = time.time()
+        self._seen_log_ts = self._seen_event_ts = self._seen_error_ts = now
+        self._attach_ts = 0.0
+        self._sep_done = False
         self.tree.clear()
         self.log_view.clear()
         self.err_view.clear()
@@ -516,7 +587,10 @@ class DevWindow(RoundDialog):
             except queue.Empty:
                 break
             self._logs.append((level, name, message, created))
+            # 水位线跟上实时流，之后再打开面板不会把这段重复补一遍
+            self._seen_log_ts = max(self._seen_log_ts, created)
             if level >= logging.WARNING:
+                self._seen_error_ts = max(self._seen_error_ts, created)
                 line = f"{time.strftime('%H:%M:%S', time.localtime(created))} {_LEVEL_NAME.get(level, '信息')} {name}: {message}"
                 self._errors.append(_redact(line))
                 self._last_error_ts = time.time()
@@ -530,15 +604,21 @@ class DevWindow(RoundDialog):
                         self.err_list.takeItem(0)
                 dirty_err = True
             if self._match(level, message) and not self._paused:
+                if self._attach_ts and not self._sep_done:
+                    # 第一条实时记录之前，把「历史 / 实时」的分界画出来
+                    self.log_view.appendPlainText(_HISTORY_SEP)
+                    self._sep_done = True
                 self.log_view.appendPlainText(self._fmt(level, name, message, created))
                 dirty_log = True
         if dirty_err:
             self._update_problem_badge(len(self._errors))
         while True:
             try:
-                self.cmd_out.appendPlainText(self._cmd_q.get_nowait())
+                text = self._cmd_q.get_nowait()
             except queue.Empty:
                 break
+            # 命令行输出统一走共享的 console，面板和独立窗口都能看到
+            self._win.console.emit_block(text)
         while True:
             try:
                 callback = self._ui_q.get_nowait()
@@ -557,6 +637,7 @@ class DevWindow(RoundDialog):
                 except queue.Empty:
                     break
                 self._steps.append(event)
+                self._seen_event_ts = max(self._seen_event_ts, event.get("t", 0.0))
                 if self._step_match(event):
                     self._append_step(event)
                     appended = True
@@ -599,9 +680,19 @@ class DevWindow(RoundDialog):
 
     def _rebuild_log(self) -> None:
         self.log_view.clear()
-        lines = [self._fmt(lv, nm, msg, ts) for lv, nm, msg, ts in self._logs if self._match(lv, msg)]
-        if lines:
-            self.log_view.setPlainText("\n".join(lines[-MAX_LOG:]))
+        rows: list[str] = []
+        marked = not self._attach_ts
+        for lv, nm, msg, ts in self._logs:
+            if not self._match(lv, msg):
+                continue
+            if not marked and ts >= self._attach_ts:
+                # 这条之后是打开面板时才实时收到的，与历史分开
+                rows.append(_HISTORY_SEP)
+                marked = True
+                self._sep_done = True
+            rows.append(self._fmt(lv, nm, msg, ts))
+        if rows:
+            self.log_view.setPlainText("\n".join(rows[-MAX_LOG:]))
             self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
 
     def _rebuild_errors(self) -> None:
@@ -614,6 +705,44 @@ class DevWindow(RoundDialog):
     def _show_error_detail(self, row: int) -> None:
         lines = [line for line in self._errors if not self._keyword or self._keyword.lower() in line.lower()]
         self.err_view.setPlainText(lines[row] if 0 <= row < len(lines) else "")
+
+    def _copy_context(self) -> None:
+        """把当前现场 + 最近问题复制走，方便直接贴给我或记进 issue。"""
+        from ncm.runlog import runlog
+
+        parts = [runlog.context(), "", "== 最近问题 =="]
+        parts.extend(list(self._errors)[-12:] or ["（无）"])
+        QApplication.clipboard().setText(_redact("\n".join(parts)))
+        self.status.setText("现场已复制到剪贴板（含 %d 条问题）" % len(self._errors))
+
+    def _open_crash_dump(self) -> None:
+        """打开最近一份崩溃现场；没有就打开目录并说明。"""
+        folder = data_dir() / "diagnostics"
+        try:
+            files = sorted(folder.glob("last-crash-*.txt"))
+        except OSError:
+            files = []
+        if not files:
+            self.status.setText("还没有崩溃现场（正常退出不会生成）")
+            self._open_dir(folder)
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(files[-1])))
+        self.status.setText(f"已打开 {files[-1].name}")
+
+    def _refresh_crash_banner(self) -> None:
+        from ncm.runlog import runlog
+
+        prev = runlog.previous
+        if not prev or prev.get("clean"):
+            self.err_banner.hide()
+            return
+        started = float(prev.get("started_at") or 0)
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(started)) if started else "未知时间"
+        self.err_banner.setText(
+            "上次运行没有正常退出（启动于 %s，版本 %s）。点「打开崩溃现场」看当时的日志与调用栈。"
+            % (when, prev.get("version") or "?")
+        )
+        self.err_banner.show()
 
     def _update_problem_badge(self, count: int) -> None:
         """「问题」按钮兼当徽标：有未处理错误时整个按钮变红，不用翻页也能看见。"""
@@ -1220,173 +1349,20 @@ class DevWindow(RoundDialog):
         self._win.player.compat_play = enabled
         self.status.setText("兼容播放已" + ("开启" if enabled else "关闭"))
 
-    # ---------------- 指令台 ----------------
+    # ---------------- 命令行 ----------------
 
     def _build_console(self) -> QWidget:
-        page = QWidget()
-        lay = QVBoxLayout(page)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
-        hint = QLabel("输入 help 查看可用命令；命令直接作用在当前窗口上，危险操作会二次确认。")
-        hint.setStyleSheet("color:#96969e;")
-        hint.setWordWrap(True)
-        lay.addWidget(hint)
-        self.cmd_out = self._make_view()
-        lay.addWidget(self.cmd_out, 1)
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        self.cmd_in = QLineEdit()
-        self.cmd_in.setPlaceholderText("命令，如：url 585404")
-        self.cmd_in.returnPressed.connect(self._run_command)
-        row.addWidget(self.cmd_in, 1)
-        btn_run = QPushButton("执行")
-        btn_run.clicked.connect(self._run_command)
-        row.addWidget(btn_run)
-        btn_clear = QPushButton("清空")
-        btn_clear.clicked.connect(lambda: self.cmd_out.clear())
-        row.addWidget(btn_clear)
-        lay.addLayout(row)
-        return page
-
-    def _commands(self) -> dict:
-        return {
-            "help": (self._cmd_help, "列出命令"),
-            "status": (lambda a: self._status_text(), "打印当前状态"),
-            "scan": (lambda a: self._cmd_scan(), "重新扫描缓存"),
-            "cache": (self._cmd_cache, "cache clear：清空播放缓存"),
-            "compat": (self._cmd_compat, "compat on|off"),
-            "backend": (lambda a: self._cmd_backend(), "显示后端与格式能力"),
-            "source": (self._cmd_source, "source client|web|cache"),
-            "log": (self._cmd_log, "log debug|info"),
-            "diag": (lambda a: self._cmd_diag(), "导出诊断包"),
-            "open": (self._cmd_open, "open cache|download|data|log"),
-            "url": (self._cmd_url, "url <歌曲id>：打印取址结果"),
-            "clear": (lambda a: self.cmd_out.clear() or "", "清空输出"),
-        }
-
-    def _cmd_help(self, _args) -> str:
-        return "\n".join(f"{name:<8}{desc}" for name, (_fn, desc) in self._commands().items())
-
-    def _run_command(self) -> None:
-        text = self.cmd_in.text().strip()
-        if not text:
-            return
-        self.cmd_in.clear()
-        self.cmd_out.appendPlainText(f"> {text}")
-        parts = text.split()
-        name, args = parts[0].lower(), parts[1:]
-        entry = self._commands().get(name)
-        if entry is None:
-            self.cmd_out.appendPlainText("未知命令，输入 help 查看")
-            return
-        try:
-            out = entry[0](args)
-        except Exception as exc:  # noqa: BLE001
-            out = f"执行失败：{type(exc).__name__}: {exc}"
-        if out:
-            self.cmd_out.appendPlainText(out)
+        """命令行页 = 共享的 ConsolePanel，和独立窗口是同一份输出与历史。"""
+        return ConsolePanel(self._win.console, self)
 
     def _status_text(self) -> str:
-        # 不走 _refresh_status：它有「只在状态页刷新」的节流，从指令页调
-        # status 会拿到空文本
         self._render_status()
         return self._status_plain
 
-    def _cmd_scan(self) -> str:
-        self._win.on_load_cache()
-        return "已触发缓存重扫"
+    def reload_style(self) -> None:
+        """命令行 reload 之后把面板自己的样式表也重套一遍。"""
+        self.setStyleSheet(QSS + _DEV_CSS)
 
-    def _cmd_cache(self, args) -> str:
-        if args and args[0] != "clear":
-            return "用法：cache clear"
-        from ncm import cache as cache_mod
-
-        count, freed = cache_mod.clear_player_cache()
-        return f"已清理播放缓存 {count} 个（{freed / 1048576:.0f} MB）"
-
-    def _cmd_compat(self, args) -> str:
-        if not args or args[0] not in ("on", "off"):
-            return f"当前：{'开' if self._win.player.compat_play else '关'}；用法：compat on|off"
-        enabled = args[0] == "on"
-        self._win.settings.setValue("compat_play", enabled)
-        self._win.player.compat_play = enabled
-        self._refresh_components()
-        return "兼容播放已" + ("开启" if enabled else "关闭")
-
-    def _cmd_backend(self) -> str:
-        import os as _os
-
-        backend = _os.environ.get("QT_MULTIMEDIA_PREFERRED_PLUGINS", "默认")
-        bad = sorted(getattr(self._win.player, "_bad_formats", []) or [])
-        return (
-            f"后端 {backend}\n无法直接播放的格式：{', '.join(bad) if bad else '无'}\n"
-            f"ffmpeg：{self._ffmpeg_line()}"
-        )
-
-    def _ffmpeg_line(self) -> str:
-        try:
-            from ncm import transcode
-
-            return transcode.ffmpeg_path() or "未找到"
-        except Exception:  # noqa: BLE001
-            return "未知"
-
-    def _cmd_source(self, args) -> str:
-        if not args:
-            return f"当前音源 {self._win._current_source()}"
-        mapping = {"client": "client", "web": "web", "cache": "cache"}
-        if args[0] not in mapping:
-            return "用法：source client|web|cache"
-        idx = self._win.source_box.findData(mapping[args[0]])
-        if idx < 0:
-            return "界面里没有这个音源"
-        self._win.source_box.setCurrentIndex(idx)
-        return f"已切到 {args[0]}"
-
-    def _cmd_log(self, args) -> str:
-        if not args or args[0] not in ("debug", "info"):
-            return f"当前 {logging.getLevelName(logging.getLogger().level)}；用法：log debug|info"
-        logging.getLogger().setLevel(logging.DEBUG if args[0] == "debug" else logging.INFO)
-        return f"日志级别改为 {args[0]}"
-
-    def _cmd_diag(self) -> str:
-        self._export_diagnostics()
-        return self.status.text()
-
-    def _cmd_open(self, args) -> str:
-        if not args:
-            return "用法：open cache|download|data|log"
-        key = args[0]
-        if key == "cache":
-            self._open_dir(getattr(self._win, "cache_dir", None))
-        elif key == "download":
-            self._open_dir(getattr(self._win, "out_dir", None))
-        elif key == "data":
-            self._open_dir(data_dir())
-        elif key == "log":
-            self._open_log_file()
-        else:
-            return "用法：open cache|download|data|log"
-        return f"已打开 {key}"
-
-    def _cmd_url(self, args) -> str:
-        if not args:
-            return "用法：url <歌曲id>"
-        try:
-            sid = int(args[0])
-        except ValueError:
-            return "歌曲 id 必须是数字"
-        level = args[1] if len(args) > 1 else (self._win.level_box.currentData() or "exhigh")
-        threading.Thread(target=self._url_worker, args=(sid, level), daemon=True).start()
-        return f"查询中：{sid}（{level}）"
-
-    def _url_worker(self, sid: int, level: str) -> None:
-        try:
-            src = self._win.backend.song_url(sid, level)
-            text = f"{sid}: ext={src.ext} br={src.br} size={src.size}\n  {src.url[:160]}"
-        except Exception as exc:  # noqa: BLE001
-            text = f"{sid}: 失败 {type(exc).__name__}: {exc}"
-        self._cmd_q.put(text)
 
     # ---------------- 回放 ----------------
 
@@ -1595,9 +1571,15 @@ class DevWindow(RoundDialog):
             path = target_dir / f"诊断包-{time.strftime('%Y%m%d-%H%M%S')}.zip"
             with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("env.txt", self._env_full_text())
+                # 现场：版本、音源、勾选、队列、最近事件。面板只开了几分钟也能带上
+                zf.writestr("context.txt", runlog_mod.runlog.context())
                 zf.writestr("settings.txt", self._settings_text())
                 zf.writestr("steps.txt", self._steps_text())
                 zf.writestr("errors.txt", "\n".join(self._errors) + "\n")
+                # 上一次崩溃的现场（如果有）
+                dumps = sorted((data_dir() / "diagnostics").glob("last-crash-*.txt"))
+                if dumps:
+                    zf.write(dumps[-1], "last-crash.txt")
                 log_file = Path(log_path())
                 if log_file.exists():
                     # 日志可能已经几十 MB，只带尾部 512 KB，够定位问题又不至于传不动

@@ -50,6 +50,7 @@ class Tray(QObject):
     previous = pyqtSignal()
     next = pyqtSignal()
     show_window = pyqtSignal()
+    console = pyqtSignal()
     quit_app = pyqtSignal()
 
     def __init__(self, window, icon: QIcon):
@@ -80,6 +81,7 @@ class Tray(QObject):
         menu.addAction("上一首", self.previous.emit)
         menu.addAction("下一首", self.next.emit)
         menu.addSeparator()
+        menu.addAction("命令行…", self.console.emit)
         menu.addAction("退出", self.quit_app.emit)
         return menu
 

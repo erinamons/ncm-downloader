@@ -45,6 +45,8 @@ console = Console()
 # 这样外部的自动化（脚本、助手）可以直接 json.loads(stdout)，不会被进度条和历史遗留的
 # 中文提示干扰。
 _JSON = False
+# 已经往 stdout 写过 JSON 吗：用法错误兜底时不能补第二行，否则不再是单行 JSON
+_EMITTED = False
 
 
 def _use_json(enabled: bool) -> None:
@@ -56,10 +58,12 @@ def _use_json(enabled: bool) -> None:
 
 def _emit(payload: dict) -> None:
     """输出结构化结果；非 --json 模式下静默，由人类可读的表格负责。"""
+    global _EMITTED
     if not _JSON:
         return
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
+    _EMITTED = True
 
 
 def _json_error(exc: Exception | str, code: int = 2, **extra) -> typer.Exit:
@@ -298,15 +302,20 @@ def cmd_login(
 
 
 @app.command("logout")
-def cmd_logout() -> None:
+def cmd_logout(
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
+) -> None:
     """清除本地登录态。"""
+    _use_json(json_out)
     from . import auth
 
     if not auth.load_cookie():
         console.print("[dim]当前未登录[/dim]")
+        _emit({"ok": True, "logged_in": False, "note": "本来就没登录"})
         raise typer.Exit()
     auth.clear_login()
     console.print("已清除本地登录态")
+    _emit({"ok": True, "logged_in": False, "note": "已清除登录态"})
 
 
 @app.command("whoami")
@@ -468,6 +477,9 @@ def cmd_url(
             "expires_in": src.expi,
         }
     )
+    if not src.url:
+        # 拿不到地址属于失败：退出码要能区分，外部脚本不会只盯着 ok 字段
+        raise typer.Exit(1)
 
 
 @app.command("dl")
@@ -966,8 +978,11 @@ def cmd_cache(
 
 
 @app.command("qualities")
-def cmd_qualities() -> None:
+def cmd_qualities(
+    json_out: bool = typer.Option(False, "--json", help="输出 JSON"),
+) -> None:
     """列出可选音质档位。"""
+    _use_json(json_out)
     table = Table(box=None, show_header=True, header_style="bold")
     table.add_column("档位")
     table.add_column("名称")
@@ -982,10 +997,30 @@ def cmd_qualities() -> None:
     for level in QUALITY_ORDER:
         table.add_row(level, QUALITY_LABEL[level], notes[level])
     console.print(table)
+    _emit(
+        {
+            "ok": True,
+            "levels": [
+                {"level": level, "label": QUALITY_LABEL[level], "note": notes[level]}
+                for level in QUALITY_ORDER
+            ],
+        }
+    )
 
 
 def main() -> None:
-    app()
+    # 只要命令行里出现 --json，stdout 就保证是 JSON：连「命令/参数写错」这种
+    # 框架级错误也补一行 {"ok": false}，外部脚本不必区分来源。
+    request_json = "--json" in sys.argv[1:]
+    if request_json:
+        _use_json(True)
+    try:
+        app()
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 2
+        if request_json and code and not _EMITTED:
+            _emit({"ok": False, "error": "命令或参数不正确，用 --help 查看用法"})
+        raise
 
 
 if __name__ == "__main__":

@@ -23,6 +23,8 @@ test-gui/
 test-cancel*/
 play-cache/
 diagnostics/
+run-state.json
+run-state.json.tmp
 .write-test
 
 # 下载残留与索引

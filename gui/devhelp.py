@@ -36,7 +36,7 @@ HELP_ITEMS: list[dict] = [
         "group": "概览",
         "name": "导航按钮",
         "where": "右侧顶部一行",
-        "desc": "状态 / 日志 / 问题 / 组件 / 指令 / 环境 六个页面互斥切换。"
+        "desc": "状态 / 日志 / 问题 / 组件 / 命令行 / 环境 六个页面互斥切换。"
         "「问题」上有未处理的警告或错误时，按钮会变红并显示条数。",
         "keys": "页签 切换 导航 问题徽标 红色 计数",
     },
@@ -193,6 +193,41 @@ HELP_ITEMS: list[dict] = [
         "desc": "有任何警告或错误时整个按钮变红并显示条数，不用点进去也能发现出过问题。",
         "keys": "徽标 红色 计数 提醒",
     },
+    {
+        "group": "问题页",
+        "name": "常驻记录",
+        "where": "程序启动即生效",
+        "desc": "日志、流程事件、警告和异常从程序启动就开始采集，不需要先打开面板。"
+        "打开面板时会把这段时间的历史补进日志页，用一条分隔线标出「以下是实时」；"
+        "页面上限内的记录不会重复显示，反复开关面板也一样。",
+        "usage": "日志页：──── 以上为启动以来的记录 · 以下实时 ────\n"
+        "问题页：警告以上（含未捕获异常、Qt 自身的告警）",
+        "notes": "缓冲上限：日志 800 条、事件 400 条、问题 200 条，超出后丢最早的。"
+        "同一条消息 5 秒内重复只记一次，避免绘制异常把缓冲刷满。"
+        "文件日志 app.log 一直在写，和面板开关无关。",
+        "keys": "常驻 记录 历史 面板没打开 启动 采集 异常 回溯 补记录",
+    },
+    {
+        "group": "问题页",
+        "name": "复制现场",
+        "where": "问题页右上按钮",
+        "desc": "把「当前现场」复制到剪贴板：版本、运行时长、音源、音质、列表与勾选数、"
+        "队列行数、批次是否在跑、紧凑模式、进过哪些模拟数据，再加最近 12 条流程事件"
+        "和最近问题。贴出来就能复现大半问题。",
+        "usage": "点一下 → 剪贴板里是一段纯文本",
+        "notes": "cookie / token 一类字段已打码，可以直接贴到公开的地方。",
+        "keys": "复制 现场 快照 上报 反馈 context copy",
+    },
+    {
+        "group": "问题页",
+        "name": "打开崩溃现场",
+        "where": "问题页右上按钮",
+        "desc": "打开 diagnostics\\last-crash-*.txt：出现未捕获异常或 Qt 致命错误时"
+        "自动落盘的文件，含现场、最近 80 条日志、最近 40 条问题。"
+        "「上次运行没有正常退出」的横幅就是靠运行时状态文件判断的。",
+        "notes": "最多保留最近 3 份；正常退出不会生成。没有文件时按钮会打开 diagnostics 目录。",
+        "keys": "崩溃 崩溃现场 闪退 last-crash diagnostics 上次异常退出",
+    },
     # ---- 组件页 ----
     {
         "group": "组件页",
@@ -248,80 +283,6 @@ HELP_ITEMS: list[dict] = [
         "desc": "本进程里已经确认无法直接播放的格式列表。空着说明到现在为止都还顺利。",
         "keys": "解码 能力 格式 无法直接播放 m4a flac",
     },
-    # ---- 指令页 ----
-    {
-        "group": "指令页",
-        "name": "执行命令",
-        "where": "指令页底部输入框",
-        "desc": "输入后按回车或点「执行」。输出在上方独立的框里，不会和日志混在一起。"
-        "回车只执行当前命令，不会误触其他按钮。",
-        "keys": "指令 命令 回车 执行 console",
-    },
-    {
-        "group": "指令页",
-        "name": "help",
-        "where": "指令",
-        "desc": "列出全部命令和一行说明。忘了命令名就敲它。",
-        "keys": "help 帮助 命令列表",
-    },
-    {
-        "group": "指令页",
-        "name": "status",
-        "where": "指令",
-        "desc": "把状态页的内容原样打印到输出框，方便复制给别人。",
-        "keys": "status 状态 打印 复制",
-    },
-    {
-        "group": "指令页",
-        "name": "scan / cache clear",
-        "where": "指令",
-        "desc": "scan 触发一次客户端缓存重扫；cache clear 清空 play-cache 里的解码与转码产物。",
-        "keys": "scan 扫描 cache clear 清理 播放缓存",
-    },
-    {
-        "group": "指令页",
-        "name": "compat on|off",
-        "where": "指令",
-        "desc": "开关兼容播放，和组件页的勾选框是同一个设置。不带参数时只显示当前状态。",
-        "keys": "compat 兼容播放 on off 开关",
-    },
-    {
-        "group": "指令页",
-        "name": "backend",
-        "where": "指令",
-        "desc": "显示当前播放后端、无法直接播放的格式、ffmpeg 路径。",
-        "keys": "backend 后端 解码 格式 ffmpeg",
-    },
-    {
-        "group": "指令页",
-        "name": "source client|web|cache",
-        "where": "指令",
-        "desc": "切换音源，等价于点主界面的音源下拉框。不带参数时显示当前音源。",
-        "keys": "source 音源 client web cache 切换",
-    },
-    {
-        "group": "指令页",
-        "name": "log debug|info",
-        "where": "指令",
-        "desc": "临时调整日志级别。debug 会多出很多细节，排完记得改回 info。",
-        "keys": "log 日志级别 debug info",
-    },
-    {
-        "group": "指令页",
-        "name": "url <歌曲id> [音质]",
-        "where": "指令",
-        "desc": "查某首歌的取址结果：容器、实际码率、大小、URL 前 160 字。"
-        "在后台线程执行，不卡界面。用来判断「为什么这首下不了」。",
-        "keys": "url 取址 地址 码率 大小 歌曲 id 探针",
-    },
-    {
-        "group": "指令页",
-        "name": "diag / open",
-        "where": "指令",
-        "desc": "diag 导出诊断包（等同右下角按钮）；open cache|download|data|log "
-        "打开对应目录或日志文件。",
-        "keys": "diag 诊断包 open 打开 目录 日志",
-    },
     # ---- 环境页 ----
     {
         "group": "环境页",
@@ -372,7 +333,8 @@ HELP_ITEMS: list[dict] = [
         "group": "快捷操作与诊断",
         "name": "导出诊断包",
         "where": "右下角按钮",
-        "desc": "生成 zip：env.txt、settings.txt、steps.txt、errors.txt、app.log（尾部 512 KB），"
+        "desc": "生成 zip：env.txt、context.txt（现场）、settings.txt、steps.txt、"
+        "errors.txt、last-crash.txt（有崩溃时）、app.log（尾部 512 KB），"
         "导出后自动打开所在文件夹。敏感字段已脱敏。",
         "keys": "导出 诊断包 zip 上报 反馈 diag",
     },
@@ -380,8 +342,9 @@ HELP_ITEMS: list[dict] = [
         "group": "快捷操作与诊断",
         "name": "关闭面板",
         "where": "右下角按钮 / 标题栏 ×",
-        "desc": "关闭面板时日志 Handler 和事件监听会一起摘掉，app.log 照常写。"
-        "下次打开会重新挂上，不会漏事件。",
+        "desc": "关闭面板只是把面板自己的实时 Handler 摘掉，省点开销；"
+        "常驻记录（环形缓冲 + 异常钩子 + app.log）一直在跑，下次打开会把这段时间"
+        "补回日志页，不会漏事件。",
         "keys": "关闭 退出 x 面板",
     },
     # ---- 操作提示 ----
@@ -408,11 +371,393 @@ HELP_ITEMS: list[dict] = [
     },
 ]
 
+# 命令行手册：一条命令一张卡，写法照编程语言文档来——语法 / 示例 / 注意。
+# 这里的文案和 devtools._commands() 一一对应，改命令时两边一起改。
+COMMAND_DOCS = [
+    {
+        "name": "怎么用命令行",
+        "desc": "两种入口共用同一份输出与历史：① 独立窗口（Ctrl+` 或状态栏右侧的 >_ 按钮、"
+        "托盘「命令行…」）；② 开发者面板的「命令行」页。输入框敲命令，回车或点「执行」。",
+        "usage": "Ctrl+`            开关独立窗口（Esc 隐藏，不销毁）\n"
+        "? / F1            打开命令帮助（窗口右上角问号，只列命令与设置项）\n"
+        "↑ / ↓             翻历史命令\n"
+        "Tab               补全命令名\n"
+        "history clear     清空历史（历史会存到下次启动）",
+        "example": "> 音质 无损\n音质已切到 lossless",
+        "notes": "窗口右上角有「置顶」开关；所有命令都作用在主窗口上，等价于点界面；"
+        "清空队列这类操作必须显式确认（queue clear yes / 队列 清空 确认）。",
+        "keys": "命令行 独立窗口 快捷键 ctrl 反引号 置顶 补全 tab 历史 中文",
+    },
+    {
+        "name": "中文写法",
+        "desc": "命令名、设置键、参数值都能用中文写，不用记英文；大小写不敏感，"
+        "全角空格也能识别。下面是最常用的对照。",
+        "usage": "统计 / 概览            stats\n"
+        "队列 / 播放 3 / 停止    queue / play / stop\n"
+        "音量 40 / 音质 无损     volume / level\n"
+        "兼容播放 开             compat on\n"
+        "并发 3                  workers 3\n"
+        "音源 缓存               source cache\n"
+        "设置 音质 极高          set level exhigh\n"
+        "模拟数据 队列           mock queue\n"
+        "帮助 队列               help queue",
+        "example": "> 设置 文件名 歌曲名\nname_pattern = 'title'\n> 设置 分类 按歌手\nfolder_pattern = 'artist'",
+        "notes": "音质档位可写：标准 / 较高 / 极高 / 无损 / 高清；队列形态可写：面板 / 停靠 / 不显示；"
+        "开关类可写：开 / 关 / 是 / 否。也可以中英混着写，例如 设置 level 无损。",
+        "keys": "中文 别名 对照 设置 音质 并发 队列 开关",
+    },
+    {
+        "name": "help",
+        "desc": "列出全部命令；带参数时只显示那一条的语法和说明。",
+        "usage": "help\nhelp <命令>",
+        "example": "> help queue\nqueue\n  queue [retry|clear yes]：队列",
+        "notes": "忘了命令名就敲 help，搜索框里也能搜到这一页。",
+        "keys": "help 帮助 命令列表",
+    },
+    {
+        "name": "status",
+        "desc": "把「状态」页的内容原样打印到输出框，方便整段复制给别人。",
+        "usage": "status",
+        "example": "> status\n== 播放器 ==\n…（与状态页一致）",
+        "notes": "只读；不会刷新状态页的节流计时。",
+        "keys": "status 状态 打印",
+    },
+    {
+        "name": "stats",
+        "desc": "一行一个维度的概览：列表与勾选数、队列进度、缓存扫描条数、"
+        "下载索引条数、播放缓存占用、当前音源与音质。",
+        "usage": "stats",
+        "example": "> stats\n列表      39 首（勾选 0）\n队列      4 首 / 进行中 4，已完成 0，失败 0",
+        "notes": "播放缓存那行会真的遍历目录算体积，目录很大时慢一点。",
+        "keys": "stats 统计 概览 缓存 索引 占用",
+    },
+    {
+        "name": "queue",
+        "desc": "查看下载队列明细（前 20 首，带状态和百分比）；"
+        "retry 重试失败的曲目；clear 清空队列。",
+        "usage": "queue\nqueue retry\nqueue clear yes",
+        "example": "> queue\n队列 4 首（完成 0）\n   1. Song 1   等待 0%",
+        "notes": "clear 必须写成 queue clear yes 才会执行；正在下载时 retry / clear 都会被拒绝。",
+        "keys": "queue 队列 明细 重试 retry 清空 clear",
+    },
+    {
+        "name": "play",
+        "desc": "播放搜索结果里的第 N 行（行号从 1 开始，和表格左侧的顺序一致）。",
+        "usage": "play <行号>",
+        "example": "> play 3\n开始播放第 3 行：夜に駆ける",
+        "notes": "优先播本地缓存/已下载文件；资源不在本地时按播放器的兜底逻辑走。",
+        "keys": "play 播放 行号",
+    },
+    {
+        "name": "stop",
+        "desc": "停止播放并清掉「正在播放」状态，顶栏回到未播放。",
+        "usage": "stop",
+        "example": "> stop\n已停止播放",
+        "notes": "等价于点顶栏的停止按钮。",
+        "keys": "stop 停止 播放",
+    },
+    {
+        "name": "volume",
+        "desc": "设置音量；不带参数时只显示当前音量。",
+        "usage": "volume\nvolume <0-100>",
+        "example": "> volume 40\n音量 40",
+        "notes": "超出范围会被夹到 0-100，并同步写进设置。",
+        "keys": "volume 音量 声音",
+    },
+    {
+        "name": "level",
+        "desc": "切换下载音质；不带参数时显示当前音质。",
+        "usage": "level\nlevel standard|higher|exhigh|hires|lossless",
+        "example": "> level exhigh\n音质已切到 exhigh",
+        "notes": "实际可用音质还受账号权限限制；切完等价于改下拉框。",
+        "keys": "level 音质 码率 standard exhigh hires lossless",
+    },
+    {
+        "name": "pause / resume",
+        "desc": "暂停或继续当前的下载批次。",
+        "usage": "pause\nresume",
+        "example": "> pause\n已请求暂停",
+        "notes": "没有批次时 pause 会提示「当前没有在下载」；"
+        "resume 只在有剩余曲目时才真正开始。",
+        "keys": "pause 暂停 resume 继续 批次",
+    },
+    {
+        "name": "trace",
+        "desc": "打印最近的流程事件（scope/step、状态、耗时、关键参数）。",
+        "usage": "trace\ntrace <条数>",
+        "example": "> trace 3\n  缓存/扫描 [ok] 4ms files=5 complete=3",
+        "notes": "条数限制 1-200，默认 20；数据来自本次会话，重启后清空。",
+        "keys": "trace 事件 流程 轨迹 耗时",
+    },
+    {
+        "name": "mock / 模拟数据",
+        "desc": "造一批假数据练手：假搜索结果、假下载队列、假缓存列表。"
+        "只改界面——不联网、不读盘、不写文件、不写下载索引。",
+        "usage": "mock songs [数量]    假搜索结果（默认 12）\n"
+        "mock queue [数量]    假下载队列，自动跑进度（默认 6）\n"
+        "mock cache [数量]    假缓存列表（默认 8，含半截/未开始）\n"
+        "mock all             三样一起\n"
+        "mock stop            停掉自动进度，停在当前状态\n"
+        "mock clear           清除模拟数据，恢复真实列表",
+        "example": "> 模拟数据 队列\n已生成 6 首模拟下载队列，正在跑进度…\n"
+        "（第 4 首会假装失败、第 5 首假装跳过，用来验失败重试入口）",
+        "notes": "期间标题栏显示「模拟数据」，点下载/播放会被拦下而不是真的去请求；"
+        "真实搜索一开始，或者执行 mock clear，都会自动失效。",
+        "keys": "mock 模拟数据 假数据 测试 队列 缓存 搜索结果 演练",
+    },
+    {
+        "name": "scan",
+        "desc": "触发一次客户端缓存重扫，等价于点「重新扫描缓存」。",
+        "usage": "scan",
+        "example": "> scan\n已触发缓存重扫",
+        "notes": "扫描是异步的，结果会回到主窗口列表；本命令只负责发起。",
+        "keys": "scan 扫描 缓存 刷新",
+    },
+    {
+        "name": "cache clear",
+        "desc": "清空 play-cache 里的解码 / 转码产物，返回清理个数和释放空间。",
+        "usage": "cache clear",
+        "example": "> cache clear\n已清理播放缓存 12 个（86 MB）",
+        "notes": "只删播放缓存，不动下载目录里的成品；下次播放会按需重新生成。",
+        "keys": "cache clear 清理 播放缓存 空间",
+    },
+    {
+        "name": "compat",
+        "desc": "开关「兼容播放 → 放不了时自动转换」；不带参数时显示当前状态。",
+        "usage": "compat\ncompat on|off",
+        "example": "> compat off\n兼容播放已关闭",
+        "notes": "和组件页的勾选框是同一个设置，改完立刻写盘。",
+        "keys": "compat 兼容播放 转换 on off",
+    },
+    {
+        "name": "backend",
+        "desc": "显示当前播放后端、已经确认无法直接播放的格式、ffmpeg 路径。",
+        "usage": "backend",
+        "example": "> backend\n后端 windows,dsengine\nffmpeg：D:\\tools\\ffmpeg.exe",
+        "notes": "「无法直接播放的格式」只统计本进程遇到过的情况。",
+        "keys": "backend 后端 解码 格式 ffmpeg",
+    },
+    {
+        "name": "source",
+        "desc": "切换音源；不带参数时显示当前音源。",
+        "usage": "source\nsource client|web|cache",
+        "example": "> source cache\n已切到 cache",
+        "notes": "等价于主界面的音源下拉框；切到 cache 会立即触发本地扫描。",
+        "keys": "source 音源 client web cache",
+    },
+    {
+        "name": "workers",
+        "desc": "设置下载并发数；不带参数时显示当前值。",
+        "usage": "workers\nworkers <1-8>",
+        "example": "> workers 3\n并发改为 3（下一批生效）",
+        "notes": "只影响下一批任务，正在跑的批次不会中途改并发。",
+        "keys": "workers 并发 线程 下载",
+    },
+    {
+        "name": "get / set",
+        "desc": "读写白名单里的设置项。不带参数时 set 会列出可写键。",
+        "usage": "get <键>\nset <键> <值>\n可写：compat_play partial_fallback keep_cache to_mp3 workers level "
+        "name_pattern folder_pattern mini_queue",
+        "example": "> get compat_play\ncompat_play = False\n> set mini_queue dock\nmini_queue = 'dock'",
+        "notes": "true/false 会转成布尔、纯数字转成整数；level 与 mini_queue 会校验取值，"
+        "写错直接拒绝，不会把界面改成不认识的状态。",
+        "keys": "get set 设置 白名单 读取 修改",
+    },
+    {
+        "name": "log",
+        "desc": "临时调整日志级别；不带参数时显示当前级别。",
+        "usage": "log\nlog debug|info",
+        "example": "> log debug\n日志级别改为 debug",
+        "notes": "debug 会产生大量细节，排完记得 log info 改回来（重启也会恢复）。",
+        "keys": "log 日志 级别 debug info",
+    },
+    {
+        "name": "reload",
+        "desc": "重新载入样式表：改完 QSS 不用重启就能看到效果。",
+        "usage": "reload",
+        "example": "> reload\n样式表已重新载入",
+        "notes": "只重套样式，不重启界面逻辑；个别控件仍可能需要重开窗口才完全生效。",
+        "keys": "reload 样式 重载 qss 主题",
+    },
+    {
+        "name": "diag",
+        "desc": "导出诊断包（env / settings / steps / errors / app.log 尾部），"
+        "导出后自动打开所在目录。",
+        "usage": "diag",
+        "example": "> diag\n已导出：C:\\Users\\…\\diagnostics\\diag-20261110-0850.zip",
+        "notes": "cookie、token 这类字段已打码；等同右下角的「导出诊断包」。",
+        "keys": "diag 诊断包 导出 zip",
+    },
+    {
+        "name": "open",
+        "desc": "打开缓存 / 下载 / 配置目录，或直接打开日志文件。",
+        "usage": "open cache|download|data|log",
+        "example": "> open log\n已打开 log",
+        "notes": "缓存目录没设置时会提示；其它三项总是可用的。",
+        "keys": "open 打开 目录 日志 资源管理器",
+    },
+    {
+        "name": "url",
+        "desc": "查某首歌的取址结果：容器、实际码率、文件大小、URL 前 160 字。",
+        "usage": "url <歌曲id>\nurl <歌曲id> <音质>",
+        "example": "> url 585404 hires\n查询中：585404（hires）",
+        "notes": "在后台线程执行，不卡界面；结果稍后出现在输出框里。"
+        "用来判断「为什么这首下不了」。",
+        "keys": "url 取址 地址 码率 大小 探针",
+    },
+    {
+        "name": "copy / clear",
+        "desc": "copy 把整段输出复制到剪贴板；clear 清空输出框。",
+        "usage": "copy\nclear",
+        "example": "> copy\n输出已复制到剪贴板",
+        "notes": "贴反馈时先 copy，比截图好认。",
+        "keys": "copy 复制 剪贴板 clear 清空",
+    },
+]
+
+HELP_ITEMS.extend(
+    {
+        "group": "命令行手册",
+        "where": "命令行",
+        "name": doc["name"],
+        "desc": doc["desc"],
+        "usage": doc.get("usage", ""),
+        "example": doc.get("example", ""),
+        "notes": doc.get("notes", ""),
+        "keys": doc.get("keys", ""),
+    }
+    for doc in COMMAND_DOCS
+)
+
+# 设置项手册：set/get 能写的每个键是什么、可选值、默认值、对应界面哪里。
+# 键名和 devtools.SETTING_KEYS 保持一致。
+SETTING_DOCS = [
+    {
+        "name": "怎么改设置",
+        "desc": "命令行页用 get 读、set 写；下面每一项都对应「设置」窗口里的一个控件。"
+        "键名和值都能用中文，例如「设置 音质 无损」。",
+        "usage": "get <键>\nset <键> <值>",
+        "example": "> get workers\nworkers = 4\n> 设置 并发 3\nworkers = 3",
+        "notes": "改动立即写进 settings.ini；level / mini_queue 会当场反映到界面，"
+        "其余多数从下一批任务开始生效。每个键下面的「取值」都可以用中文写。",
+        "keys": "设置 修改 读取 get set 中文",
+    },
+    {
+        "name": "compat_play",
+        "desc": "兼容播放：系统解码器不全、m4a / flac 放不出来时，先用内置 ffmpeg "
+        "转成 WAV 再播。界面在「设置 → 兼容播放」。",
+        "usage": "取值：true | false\n默认：false",
+        "example": "> set compat_play true",
+        "notes": "转码不重新压缩，音质不变；首次播放慢 1~3 秒，并在 play-cache 里"
+        "临时占空间（约每分钟 10 MB）。默认关闭，关闭时播放失败只提示，不会偷偷转。",
+        "keys": "compat_play 兼容播放 转码 wav 无法播放",
+    },
+    {
+        "name": "partial_fallback",
+        "desc": "缓存没下完的歌，导出 / 下载时要不要联网补齐。界面在「设置 → 未缓存完」。",
+        "usage": "取值：true | false\n默认：true",
+        "example": "> set partial_fallback false",
+        "notes": "true：自动取完整版；false：直接跳过，不会生成半截文件。"
+        "客户端是边听边缓存的，没听完的歌只有半截。",
+        "keys": "partial_fallback 未缓存完 补齐 半截 跳过",
+    },
+    {
+        "name": "keep_cache",
+        "desc": "缓存存档：把扫描到的客户端缓存解密留一份到 cache-store，"
+        "客户端自己删掉之后仍能在「本地缓存」里看到并播放。界面在「设置 → 缓存存档」。",
+        "usage": "取值：true | false\n默认：false",
+        "example": "> set keep_cache true",
+        "notes": "占用磁盘，上限 2 GB，超出按最久未访问淘汰；关掉不会删除已存档内容，"
+        "要清空请用设置里的「清理」按钮。",
+        "keys": "keep_cache 缓存存档 保留 本地缓存",
+    },
+    {
+        "name": "to_mp3",
+        "desc": "下载完把 m4a / flac 转成 mp3。界面在「设置 → 输出格式」。",
+        "usage": "取值：true | false\n默认：false",
+        "example": "> set to_mp3 true",
+        "notes": "需要系统里有 ffmpeg，没有时设置里会直接标出来；"
+        "按源码率上浮一档转（如 96k AAC → 160k mp3），是有损转码，不是无损。",
+        "keys": "to_mp3 转码 mp3 输出格式 ffmpeg",
+    },
+    {
+        "name": "workers",
+        "desc": "同时下载几首。界面在「设置 → 并发数」。",
+        "usage": "取值：1-8\n默认：4",
+        "example": "> workers 3",
+        "notes": "只影响下一批任务，正在跑的批次不会中途改；网络不稳时降到 2 更稳。",
+        "keys": "workers 并发 线程 同时下载",
+    },
+    {
+        "name": "level",
+        "desc": "下载音质。界面在底部操作栏的音质下拉框，和它是同一个值。",
+        "usage": "取值：standard | higher | exhigh | hires | lossless\n默认：exhigh",
+        "example": "> level hires",
+        "notes": "实际能拿到哪一档取决于账号权限，超出权限会回退到可用档位；"
+        "下载时按这个值取地址。",
+        "keys": "level 音质 码率 standard higher exhigh hires lossless",
+    },
+    {
+        "name": "name_pattern",
+        "desc": "下载文件的命名模板。界面在「设置 → 文件名」。",
+        "usage": "取值：artist_title（歌手-歌曲名，默认）\n"
+        "　　　title（歌曲名）\n"
+        "　　　title_artist（歌曲名-歌手）",
+        "example": "> set name_pattern title",
+        "notes": "只影响之后新下载的文件，已经下好的不会重命名。",
+        "keys": "name_pattern 文件名 命名 模板 歌手 歌曲名",
+    },
+    {
+        "name": "folder_pattern",
+        "desc": "下载目录里的分类子文件夹。界面在「设置 → 分类」。",
+        "usage": "取值：artist_album（歌手/专辑，默认）\n"
+        "　　　artist（歌手）\n"
+        "　　　none（不分文件夹）",
+        "example": "> set folder_pattern none",
+        "notes": "只影响新下载的文件；换分类不会移动已经存在的文件。",
+        "keys": "folder_pattern 分类 文件夹 目录 歌手 专辑",
+    },
+    {
+        "name": "mini_queue",
+        "desc": "紧凑模式（400px 窄窗口）里下载队列长什么样。界面在「设置 → 紧凑队列」。",
+        "usage": "取值：panel（底部折叠面板，默认）\n"
+        "　　　dock（单行停靠，点开看全部）\n"
+        "　　　off（不显示）",
+        "example": "> set mini_queue dock",
+        "notes": "只影响紧凑模式；标准窗口的队列永远是完整表格。改完立刻生效，不用重启。",
+        "keys": "mini_queue 紧凑 队列 面板 停靠 隐藏",
+    },
+]
+
+HELP_ITEMS.extend(
+    {
+        "group": "设置项",
+        "where": "设置",
+        "name": doc["name"],
+        "desc": doc["desc"],
+        "usage": doc.get("usage", ""),
+        "example": doc.get("example", ""),
+        "notes": doc.get("notes", ""),
+        "keys": doc.get("keys", ""),
+    }
+    for doc in SETTING_DOCS
+)
+
 _CSS = """
 QLabel#helpName { color: #e8e8ea; font-size: 12px; }
 QLabel#helpWhere { color: #7a7a82; font-size: 11px; }
 QLabel#helpDesc { color: #b9b9c2; font-size: 12px; }
 QLabel#helpHead { color: #96969e; font-size: 11px; }
+QLabel#helpCode {
+    background: #1b1b1f; border: 1px solid #35353d; border-radius: 4px;
+    padding: 5px 7px; color: #d2d2da;
+    font-family: Consolas, "Cascadia Mono", monospace; font-size: 11px;
+}
+QLabel#helpExample {
+    color: #9aa3ad; font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 11px; padding-left: 2px;
+}
+QLabel#helpNotes { color: #7f7f88; font-size: 11px; }
 QLineEdit#helpSearch {
     background: #242428; color: #d8d8dc; border: 1px solid #3a3a42;
     border-radius: 5px; padding: 5px 8px;
@@ -421,10 +766,12 @@ QLineEdit#helpSearch {
 
 
 class DevHelpDialog(RoundDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent, "开发者面板 · 帮助")
+    def __init__(self, parent=None, title: str = "开发者面板 · 帮助", groups=None):
+        """``groups`` 给定时只展示这几组（命令行窗口的「?」只关心命令和设置项）。"""
+        super().__init__(parent, title)
         self._cards: list[dict] = []
         self._headers: dict[str, QLabel] = {}
+        self._only_groups = tuple(groups) if groups else ()
         self.setStyleSheet(QSS + _CSS)
         self.resize(780 + SHADOW * 2, 620 + SHADOW * 2)
 
@@ -440,7 +787,10 @@ class DevHelpDialog(RoundDialog):
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self._apply_filter)
         bar.addWidget(self.search, 1)
-        self.count = QLabel(f"{len(HELP_ITEMS)} 条")
+        total = len(
+            [i for i in HELP_ITEMS if not self._only_groups or i["group"] in self._only_groups]
+        )
+        self.count = QLabel(f"{total} 条")
         self.count.setStyleSheet("color:#96969e;")
         bar.addWidget(self.count)
         body.addLayout(bar)
@@ -467,16 +817,19 @@ class DevHelpDialog(RoundDialog):
 
     def _build_cards(self, layout: QVBoxLayout) -> None:
         current = None
-        for item in HELP_ITEMS:
+        items = [
+            item for item in HELP_ITEMS
+            if not self._only_groups or item["group"] in self._only_groups
+        ]
+        for item in items:
             if item["group"] != current:
                 current = item["group"]
-                if self._headers:
-                    # 分组之间留白，卡片挨着上一组的最后一条会看不清层级
-                    layout.addSpacing(6)
                 head = QLabel(current)
                 head.setObjectName("helpHead")
+                # 组间距用 label 自己的外边距，不用 addSpacing：过滤后整组隐藏时，
+                # addSpacing 留下的空档不会跟着收起来，列表顶上会空一大块
+                head.setContentsMargins(0, 12 if self._headers else 0, 0, 2)
                 layout.addWidget(head)
-                layout.addSpacing(2)
                 self._headers[current] = head
 
             card = QWidget()
@@ -509,9 +862,46 @@ class DevHelpDialog(RoundDialog):
             desc.setWordWrap(True)
             card_layout.addWidget(desc)
 
+            # 命令行手册才有：语法块 / 示例 / 注意，排布照编程语言文档来。
+            # 样式写在控件自己身上：祖先样式表里的通用 QWidget 规则会压过
+            # ID 选择器，只写在 _CSS 里底色不生效（卡片当初也是这么踩的）
+            if item.get("usage"):
+                code = QLabel(item["usage"])
+                code.setWordWrap(True)
+                code.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                code.setStyleSheet(
+                    "QLabel { background:#1b1b1f; border:1px solid #35353d;"
+                    " border-radius:4px; padding:5px 7px; color:#d2d2da;"
+                    " font-family:Consolas, 'Cascadia Mono', monospace; font-size:11px; }"
+                )
+                card_layout.addWidget(code)
+            if item.get("example"):
+                example = QLabel(item["example"])
+                example.setWordWrap(True)
+                example.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                example.setStyleSheet(
+                    "QLabel { color:#9aa3ad; padding-left:2px;"
+                    " font-family:Consolas, 'Cascadia Mono', monospace; font-size:11px; }"
+                )
+                card_layout.addWidget(example)
+            if item.get("notes"):
+                notes = QLabel("注意：" + item["notes"])
+                notes.setWordWrap(True)
+                notes.setStyleSheet("QLabel { color:#7f7f88; font-size:11px; }")
+                card_layout.addWidget(notes)
+
             layout.addWidget(card)
             blob = " ".join(
-                (item["group"], item["name"], item["where"], item["desc"], item.get("keys", ""))
+                (
+                    item["group"],
+                    item["name"],
+                    item["where"],
+                    item["desc"],
+                    item.get("usage", "") or "",
+                    item.get("example", "") or "",
+                    item.get("notes", "") or "",
+                    item.get("keys", "") or "",
+                )
             ).lower()
             self._cards.append({"card": card, "group": item["group"], "blob": blob})
 

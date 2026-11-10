@@ -26,12 +26,20 @@ def _preferred_backend() -> str:
 
 os.environ.setdefault("QT_MULTIMEDIA_PREFERRED_PLUGINS", _preferred_backend())
 
+# 常驻记录要早过 gui.main 的导入：依赖模块在 import 阶段打的日志也要能回看。
+# 这里只开内存缓冲和异常钩子，文件日志在 main() 里由 setup_logging 补上。
+from ncm.runlog import runlog as _runlog  # noqa: E402
+
+_runlog.install()
+
 from PyQt5.QtCore import Qt  # noqa: E402
 from PyQt5.QtGui import QIcon  # noqa: E402
 from PyQt5.QtWidgets import QApplication  # noqa: E402
 
 from gui.main import MainWindow  # noqa: E402
+from ncm import __version__ as APP_VERSION  # noqa: E402
 from ncm.log import setup_logging  # noqa: E402
+from ncm.runlog import runlog  # noqa: E402
 
 
 def main() -> None:
@@ -43,11 +51,13 @@ def main() -> None:
     import logging
 
     log_file = setup_logging()
+    # 常驻记录要尽早挂上：窗口构造期间的错误也才有据可查
+    runlog.install(version=APP_VERSION)
     crash_fh = Path(log_file).with_name("crash.log").open(
         "a", encoding="utf-8", errors="replace"
     )
     faulthandler.enable(file=crash_fh)
-    logging.getLogger("ncm.gui").info("启动，日志位于 %s", log_file)
+    logging.getLogger("ncm.gui").info("启动 v%s，日志位于 %s", APP_VERSION, log_file)
 
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
